@@ -15,7 +15,8 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-POLICY = ROOT / "gem5-spr/configs/fastsim/collection.py"
+GEM5_ROOT = ROOT.parent / "gem5-deploy"
+POLICY = GEM5_ROOT / "configs/fastsim/collection.py"
 
 
 def load_policy():
@@ -40,6 +41,19 @@ class CollectionEntryTests(unittest.TestCase):
                        "--l1d-size", "--clk", "--mem-channels"):
             with self.subTest(option=option), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 self.args(option, "8")
+
+    def test_staged_checkpoint_requires_supported_launcher_protocol(self):
+        with self.assertRaisesRegex(ValueError, "rate launcher"):
+            self.policy.validate_options(self.args("--save-staged-checkpoint", "/example/cpt"))
+        with self.assertRaisesRegex(ValueError, "requires --save"):
+            self.policy.validate_options(self.args("--checkpoint-only"))
+        args=self.args("--rate-copies", "1", "--save-staged-checkpoint", "/example/cpt",
+                       "--checkpoint-only")
+        self.policy.validate_options(args)
+        self.assertEqual(args.save_boot_checkpoint, Path("/example/cpt"))
+        restored=self.args("--rate-copies", "1", "--restore-staged-checkpoint", "/example/cpt")
+        self.policy.validate_options(restored)
+        self.assertEqual(restored.restore_boot_checkpoint, Path("/example/cpt"))
 
     def test_source_companions_enabled_without_claiming_task_ownership(self):
         args = self.args()
@@ -77,7 +91,7 @@ class CollectionEntryTests(unittest.TestCase):
         self.assertIs(enabled["functional_translation_origins"], True)
         self.assertEqual({key: value for key, value in ordinary.items() if key != "functional_translation_origins"},
                          {key: value for key, value in enabled.items() if key != "functional_translation_origins"})
-        source = (ROOT / "gem5-spr/src/cpu/o3/probe/tao_trace.cc").read_text()
+        source = (GEM5_ROOT / "src/cpu/o3/probe/tao_trace.cc").read_text()
         start = source.index("    if (functional_translation_origins_ &&")
         # This guard owns one unbraced throw statement. Later observer guards
         # have independent permissions and are not part of the data flag.
@@ -97,7 +111,7 @@ class CollectionEntryTests(unittest.TestCase):
         self.assertIs(enabled["functional_core_facts"], True)
         self.assertEqual({key: value for key, value in ordinary.items() if key != "functional_core_facts"},
                          {key: value for key, value in enabled.items() if key != "functional_core_facts"})
-        native = ROOT / "gem5-spr/src/cpu/o3"
+        native = GEM5_ROOT / "src/cpu/o3"
         self.assertIn("bool coreFunctionalObservation = false;", (native / "cpu.hh").read_text())
         self.assertRegex((native / "probe/TaoTrace.py").read_text(),
                          r"functional_core_facts\s*=\s*Param.Bool\(False,")
@@ -316,7 +330,8 @@ class CollectionEntryTests(unittest.TestCase):
         stops, phases = [], []
         state = dict(switched=False, common_end=False, measurement_open=False)
         namespace = dict(args=NS(rate_copies=1, native_warmup_after_identities=True,
-            warmup_insts=500000), checkpoint_flow=RateCheckpointFlow("staged", False),
+            warmup_insts=500000, save_boot_checkpoint=None),
+            checkpoint_flow=RateCheckpointFlow("staged", False),
             state=state, milestone=phases.append,
             simulator=NS(switch_processor=lambda: None),
             warmup=BoundedWarmup(500000, defer_until_identities=True),

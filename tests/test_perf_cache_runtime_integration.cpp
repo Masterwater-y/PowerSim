@@ -48,6 +48,33 @@ void non_power_of_two_cha(){
     }
     require(cache_set_index(0,sets)==cache_set_index(sets,sets),
             "lines 0 and 106496 share the producer LLC set");
+    // Hash both bank and set from the same transformed physical line. A
+    // conflict must evict the original physical identity, including dirty
+    // writeback and transaction rollback paths.
+    SetAssociativeCache mixed_llc(c.llc, true);
+    CacheCounters mixed_counts;
+    std::uint64_t first_line = 0;
+    for (std::uint64_t i=0;i<16;++i) {
+        const auto mapped = 777 + i*sets;
+        const auto physical = spr_llc_unmix_line(mapped);
+        if (!i) first_line = physical;
+        require(spr_llc_mix_line(physical)==mapped,
+                "LLC line mix must be bijective");
+        const auto expected = (mapped%52) + 52*((mapped/52)%2048);
+        require(mixed_llc.prepare_lookup(physical).set==expected,
+                "mixed LLC set must agree with 52 bank/2048 set mapping");
+        const auto result = mixed_llc.access(physical, i==0, mixed_counts);
+        if (i==15) require(result.evicted && result.evicted_dirty &&
+                           result.evicted_line==first_line,
+                           "mixed LLC eviction must return original dirty physical line");
+    }
+    const auto present = spr_llc_unmix_line(777+sets);
+    auto tx = mixed_llc.begin_transaction();
+    bool was_dirty = true;
+    require(mixed_llc.invalidate(present, &was_dirty, &tx) && !was_dirty,
+            "mixed LLC must find the original physical line to invalidate");
+    mixed_llc.restore(tx);
+    require(mixed_llc.contains(present), "mixed LLC rollback restores original identity");
     for(unsigned cha_count:{52u,8u})for(bool hashed:{false,true}){
         c.cha_count=cha_count;
         c.cha_xor_hash=hashed;

@@ -1,5 +1,6 @@
 #include "fastsim/fst_mmu_control_v2_reader.hpp"
 #include "fst_bundle_input.hpp"
+#include <algorithm>
 #include <optional>
 namespace fastsim::fst {
 namespace {
@@ -39,6 +40,8 @@ struct MmuControlV2Reader::Impl {
   mmuctl_v2::Footer footer;
   std::unique_ptr<BundleInput> replay;
   std::optional<mmuctl_v2::Group> current;
+  mmuctl::State replay_state{};
+  bool current_state_visible = false;
   ArchitecturalBoundaryReader *boundaries = nullptr;
   std::vector<ArchitecturalBoundaryEvent> before, initial;
   bool initial_visible = true;
@@ -218,6 +221,7 @@ MmuControlV2Reader::MmuControlV2Reader(const std::string &path,
             p.replay->frame(Sizes) == encode(p.baseline),
         "v2 controls changed on reopen");
   fold(p.hash, encode(p.baseline));
+  p.replay_state = p.baseline.state;
 }
 void MmuControlV2Reader::observe(std::uint64_t ordinal, const void *hot) {
   using namespace mmuctl_v2;
@@ -231,6 +235,16 @@ void MmuControlV2Reader::observe(std::uint64_t ordinal, const void *hot) {
     auto ops = read_ops(*p.replay, owner.count, p.hash);
     check(owner.op_hash == operation_hash(ops), "v2 replay operation hash");
     if (owner.owner_kind != OwnerKind::RetiredInstruction) {
+      if (p.footer.status & Complete) {
+        for (const auto &op : ops)
+          if (const auto *w = std::get_if<Write>(&op)) {
+            check(w->before_known == 15 && w->after_known == 15 &&
+                      w->before == p.replay_state &&
+                      w->application != mmuctl::Application::External,
+                  "v2 replay boundary control state");
+            p.replay_state = w->after;
+          }
+      }
       if (owner.owner_kind == OwnerKind::ArchitecturalBoundary) {
         auto event = p.boundaries->replay_control_event(owner.owner_id);
         if (event.invocation && (event.invocation->known & 64))
@@ -245,6 +259,20 @@ void MmuControlV2Reader::observe(std::uint64_t ordinal, const void *hot) {
     }
     check(owner.owner_id == ordinal && owner.hot_hash == row_hash(hot),
           "v2 replay hot binding");
+    p.current_state_visible = (p.footer.status & Complete) &&
+        std::none_of(ops.begin(), ops.end(), [](const auto &op) {
+          return std::holds_alternative<Write>(op);
+        });
+    if (p.footer.status & Complete) {
+      for (const auto &op : ops)
+        if (const auto *w = std::get_if<Write>(&op)) {
+          check(w->before_known == 15 && w->after_known == 15 &&
+                    w->before == p.replay_state &&
+                    w->application != mmuctl::Application::External,
+                "v2 replay retained control state");
+          p.replay_state = w->after;
+        }
+    }
     p.current = Group{owner, std::move(ops)};
     ++p.next;
     break;
@@ -268,6 +296,7 @@ void MmuControlV2Reader::observe(std::uint64_t ordinal, const void *hot) {
 }
 void MmuControlV2Reader::clear_current() {
   impl_->current.reset();
+  impl_->current_state_visible = false;
   impl_->before.clear();
   impl_->initial_visible = false;
 }
@@ -285,6 +314,9 @@ const mmuctl_v2::Footer &MmuControlV2Reader::coverage() const {
 }
 bool MmuControlV2Reader::ready() const {
   return impl_->footer.status & mmuctl_v2::Complete;
+}
+const mmuctl::State *MmuControlV2Reader::current_state() const {
+  return impl_->current_state_visible ? &impl_->replay_state : nullptr;
 }
 } // namespace fastsim::fst
 

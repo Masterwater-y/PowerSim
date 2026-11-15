@@ -12,6 +12,54 @@ sys.path.insert(0, str(ROOT/'tools'))
 
 
 class RetiredCacheMissEstimates(unittest.TestCase):
+    def test_v2_certainty_sums_cannot_shift_between_cores(self):
+        from test_retired_cache_contract import RetiredCacheContract
+        c,model,_=RetiredCacheContract().fixture()
+        for block in [model,*model['per_core']]:
+            for row in block['scopes'].values():
+                bound=row['events']['retired_loads']['count']
+                for name in c.MISS_EVENTS:
+                    row['events'][name].update(estimated_count=0, estimate_policy=c.SPR_MISS_POLICY,
+                        estimate_fallback_loads=0, estimated_merged_loads=0,
+                        prediction_nonmember=bound, prediction_unknown=0,
+                        prediction_exact_count=0, prediction_estimated_count=0,
+                        prediction_exact_nonmember=bound, prediction_estimated_nonmember=0)
+        c.validate_miss_estimates(model)
+        bad=copy.deepcopy(model)
+        event=bad['scopes']['workload_task']['events'][c.MISS_EVENTS[0]]
+        event['prediction_exact_nonmember']-=1
+        event['prediction_estimated_nonmember']+=1
+        with self.assertRaisesRegex(ValueError, "per-core sum"):
+            c.validate_miss_estimates(bad)
+
+    def test_per_event_mode_reports_complete_l1_without_scoring_unknown_l2(self):
+        from test_retired_cache_contract import RetiredCacheContract
+        c, model, reference = RetiredCacheContract().fixture()
+        for block in [model, *model['per_core']]:
+            for row in block['scopes'].values():
+                for name in c.MISS_EVENTS:
+                    row['events'][name].update(estimated_count=1,
+                        estimate_policy='bounded-line-fill-v1',
+                        estimate_fallback_loads=0, estimated_merged_loads=0)
+        for block in [reference, *reference['per_core']]:
+            block['scopes']['workload_task']['events']['retired_l2_load_misses']['unknown'] = 1
+        result = c.compare_retired_cache(model, reference, misses_only=True,
+                                         allow_incomplete_events=True)
+        events = result['scopes']['workload_task']['events']
+        self.assertIsNotNone(events['retired_l1_load_misses']['absolute_error'])
+        self.assertIsNone(events['retired_l2_load_misses']['absolute_error'])
+        self.assertIsNone(events['retired_l2_load_misses']['reference_per_1k_inst'])
+        self.assertEqual(events['retired_l2_load_misses']['status'],
+                         'unavailable-native-unknown')
+        self.assertEqual(events['retired_l2_load_misses']['reference_unknown'], 1)
+        self.assertFalse(result['primary_complete'])
+        with tempfile.TemporaryDirectory(dir=ROOT/'tmp') as directory:
+            c.write_retired_cache_summary(Path(directory), [dict(
+                case_id='fixture', retired_cache_validation=result)])
+            text = (Path(directory)/'retired-cache-summary.md').read_text()
+            self.assertIn('unavailable-native-unknown', text)
+            self.assertIn('not all three primary events are complete', text)
+
     def test_production_shadow_and_macro_retirement(self):
         code = r'''
 #include "fastsim/retired_cache_miss_estimator.hpp"
@@ -23,12 +71,12 @@ int main() {
  auto primary=s.observe(64,10,30,7);
  assert(primary.misses==7 && !primary.merged);
  auto follower=s.observe(64,20,35,7);
- assert(follower.misses==0 && follower.merged);
+ assert(follower.misses==1 && follower.merged && follower.estimated_mask==7);
  assert(s.observe(64,30,50,3).misses==3); // half-open response edge
  assert(s.observe(64,5,15,1).fallback); // no future parent attachment
  assert(s.observe(128,31,60,7).fallback); // bounded collision is explicit
  assert(s.observe(128,32,61,7,true).misses==0); // forwarding issues no request
- assert(s.observe(192,40,80,7,false,true).misses==0); // modeled alias
+ assert(s.observe(192,40,80,7,false,true).misses==7); // alias needs actual fill evidence
  assert(s.observe(256,50,50,1).fallback); // invalid/empty window
  S collision(1);
  collision.observe(64,10,100,7);
@@ -53,6 +101,37 @@ int main() {
         with tempfile.TemporaryDirectory(dir=ROOT/'tmp') as directory:
             source=Path(directory)/'check.cc';exe=Path(directory)/'check'
             source.write_text(code)
+            build=subprocess.run(['/opt/gcc-11/bin/g++','-std=c++17','-static-libstdc++',
+                '-static-libgcc','-I',str(ROOT/'include'),str(source),'-o',str(exe)],capture_output=True,text=True)
+            self.assertEqual(build.returncode,0,build.stderr)
+            result=subprocess.run([str(exe)],capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+
+    def test_fallback_reason_masks_are_aggregated_per_retired_macro(self):
+        code = r'''
+#include "fastsim/retired_cache_miss_estimator.hpp"
+#include "fastsim/perf_retirement.hpp"
+#include <cassert>
+int main() {
+ using namespace fastsim;
+ RetiredCacheMissEstimator shadow(1);
+ shadow.observe(64,10,100,7);
+ auto future=shadow.observe(64,5,15,1);
+ auto collision=shadow.observe(128,20,30,7);
+ assert(future.fallback_reasons & kRetiredFallbackFutureParent);
+ assert(collision.fallback_reasons & kRetiredFallbackCollision);
+ PerfRetirementLedger ledger;
+ using P=PerfRetirementLedger;
+ ledger.accept(false,true,false,false,true,true,P::Miss,P::Miss,1,true,false,kRetiredFallbackMissingSharedClock);
+ ledger.accept(true,true,false,false,true,true,P::Miss,P::Miss,1,true,false,kRetiredFallbackCollision);
+ auto c=ledger.snapshot().workload_task;
+ assert(c.estimated_miss_fallback_loads==1);
+ assert(c.fallback_missing_shared_clock_loads==1 && c.fallback_collision_loads==1);
+ assert(c.fallback_missing_shared_clock_l1_misses==1 && c.fallback_collision_l1_misses==1);
+}
+'''
+        with tempfile.TemporaryDirectory(dir=ROOT/'tmp') as directory:
+            source=Path(directory)/'check.cc'; exe=Path(directory)/'check'; source.write_text(code)
             build=subprocess.run(['/opt/gcc-11/bin/g++','-std=c++17','-static-libstdc++',
                 '-static-libgcc','-I',str(ROOT/'include'),str(source),'-o',str(exe)],capture_output=True,text=True)
             self.assertEqual(build.returncode,0,build.stderr)
@@ -105,6 +184,16 @@ int main() {
             '--stats-dir','tmp/stats','--output-dir','tmp/output','--retired-cache-misses']):
             args=validator.parse_args()
         self.assertTrue(args.retired_cache and args.retired_cache_misses)
+
+    def test_cli_per_event_mode_keeps_three_miss_contract(self):
+        from unittest.mock import patch
+        import run_native_kernel_fastsim_validation as validator
+        with patch.object(sys, 'argv', ['validator', '--source-root', 'tmp/source',
+            '--stats-dir', 'tmp/stats', '--output-dir', 'tmp/output',
+            '--retired-cache-per-event']):
+            args = validator.parse_args()
+        self.assertTrue(args.retired_cache and args.retired_cache_misses and
+                        args.retired_cache_per_event)
 
     def test_primary_misses_require_zero_native_unknown(self):
         from test_retired_cache_contract import RetiredCacheContract

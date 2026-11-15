@@ -107,6 +107,23 @@ int main() {
  b.virtual_base=0x1600000000;b.request_physical_base=b.virtual_base;b.request_virtual_base=b.virtual_base;
  s.facts={{b.virtual_base,b.virtual_base,8,b}};
  assert(!pending.schedule(load(b.virtual_base),false,false,0,false,&s,nullptr,0x1000).dtlb_access);
+ // A paged fragment whose leaf is explicitly unknown is not a 4 KiB hit or
+ // miss. Account the whole mixed access as untracked and discard cached
+ // translation state that the unknown mapping could have changed.
+ IntervalCoreModel unknown(c);
+ assert(issue(unknown,s,0x400000,0x800000,12).dtlb_miss);
+ s.page(0x400000,0x800000,12);
+ auto unknown_fragment=s.facts.front();
+ unknown_fragment.virtual_address=0x401000;
+ unknown_fragment.mapping=fst::TranslationMapping{};
+ s.facts.push_back(unknown_fragment);
+ auto wide_unknown=load(0x800000);wide_unknown.size=16;
+ auto unknown_access=unknown.schedule(wide_unknown,false,false,0,false,&s,nullptr,0x1000);
+ assert(unknown_access.dtlb_access && unknown_access.dtlb_untracked &&
+        unknown_access.dtlb_timing_access && unknown_access.dtlb_timing_untracked &&
+        !unknown_access.dtlb_hit && !unknown_access.dtlb_miss &&
+        unknown_access.translation_accesses==0 && unknown_access.translation_walks.empty());
+ assert(issue(unknown,s,0x400000,0x800000,12).dtlb_miss);
  // A declared dynamic source may never quietly use the old 4KiB token fallback.
  s.facts.clear();bool rejected=false;
  try {(void)pending.schedule(load(0x9000),false,false,0,false,&s,nullptr,0x1000);}catch(const std::runtime_error&){rejected=true;}

@@ -1,5 +1,6 @@
 #include "fastsim/trace.hpp"
 #include "fastsim/fst_static_uops.hpp"
+#include "fastsim/spr_integer_family_input.hpp"
 #include <cassert>
 #include <filesystem>
 #include <iostream>
@@ -11,9 +12,9 @@ int main(){
     const auto dir=std::filesystem::path("tmp")/("static-uop-"+std::to_string(getpid()));std::filesystem::create_directories(dir);
     const auto path=(dir/"trace.fst").string();std::array<std::uint8_t,32> policy{};policy.fill(0x42);
     TraceRecord a{};a.pc=4096;a.op_class=1;a.n_dst=1;
-    TraceRecord b=a;b.pc=4100;b.n_src=1;b.n_dst=0;b.producer_dists[0]=1;b.producer_classes[0]=0;
+    TraceRecord b=a;b.pc=4100;b.op_class=3;b.n_src=1;b.n_dst=0;b.producer_dists[0]=1;b.producer_classes[0]=0;
     fst::StaticUopFactsRow fa;fa.flags=fst::kStaticExecutionKnown|fst::kStaticOperandRolesKnown;fa.integer_family=1;fa.candidate_ports=0x863;fa.destination_count=1;
-    auto fb=fa;fb.source_count=1;fb.destination_count=0;
+    auto fb=fa;fb.source_count=1;fb.destination_count=0;fb.integer_family=6;
     std::vector<fst::StaticUopOperand> none,operand{{1,0,1,0}};
     {BinaryTraceWriter w(path,0);w.enable_complete_dependencies();w.enable_static_uop_facts(policy);
      rejects([&]{w.append(a);});assert(w.record_count()==0);
@@ -21,10 +22,16 @@ int main(){
      auto bad=operand;bad[0].producer_distance=0;
      rejects([&]{w.append(b,nullptr,{},fst::MemoryRequestRole::Data,0,false,false,nullptr,&fb,&bad);});
      assert(w.record_count()==1);
+     auto unknown=fb;unknown.integer_family=7;
+     rejects([&]{w.append(b,nullptr,{},fst::MemoryRequestRole::Data,0,false,false,nullptr,&unknown,&operand);});
+     assert(w.record_count()==1);
      w.append(b,nullptr,{},fst::MemoryRequestRole::Data,0,false,false,nullptr,&fb,&operand);w.close();}
     {BinaryTraceSource s(path);TraceRecord r;assert(s.next(r));auto f=s.current_static_uop_facts();assert(f&&f->candidate_ports==0x863&&f->integer_family==1);
      assert(s.static_uop_policy_identity()=="4242424242424242424242424242424242424242424242424242424242424242");
-     assert(s.next(r));assert(s.current_static_uop_operands().size()==1&&s.current_static_uop_operands()[0].producer_distance==1);assert(!s.next(r));}
+     assert(s.next(r));assert(s.current_static_uop_operands().size()==1&&s.current_static_uop_operands()[0].producer_distance==1);
+     f=s.current_static_uop_facts();assert(f&&f->integer_family==6&&f->candidate_ports==0x863);
+     assert(SprIntegerFamilyInput::classify(f,true).status==SprIntegerFamilyInput::Status::Unknown);
+     assert(!s.next(r));}
     {InstructionSliceTraceSource s(std::make_unique<BinaryTraceSource>(path),1,1);TraceRecord r;assert(s.next(r)&&s.current_static_uop_facts()->record_ordinal==1);}
     // The compressed companion must reject cross-record swaps, forged RAW,
     // incomplete population and trailing payload rather than score a prefix.

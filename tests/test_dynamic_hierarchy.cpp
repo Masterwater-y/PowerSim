@@ -50,6 +50,51 @@ struct MergeSource : Source {
   return true;
  }
 };
+// Simulator-level alternating-page workload: with a one-entry DTLB the
+// third access misses L1 but can hit the D-only STLB proxy.
+struct StlbSource final : TraceSource {
+ unsigned at=0; bool bound_flush=false, missing=false; std::uint64_t diagnostics=0;
+ std::vector<fst::TranslationFragment> fragments;
+ fst::mmuctl_v2::Group control;
+ fst::mmuctl_v2::Footer footer;
+ fst::mmuctl::State control_state{0,0x1000,0,0};
+ explicit StlbSource(bool flush=false,bool absent=false,std::uint64_t unbound=0)
+   :bound_flush(flush),missing(absent),diagnostics(unbound) {footer.unbound_commands=unbound;}
+ bool dynamic_translations()const override{return true;}
+ unsigned mmu_control_version()const override{return missing?0:2;}
+ bool architectural_boundary_bundle_ready()const override{return !missing;}
+ const fst::mmuctl_v2::Group* current_mmu_controls_v2()const override{return missing?nullptr:&control;}
+ const fst::mmuctl::State* current_mmu_control_state_v2()const override{return missing?nullptr:&control_state;}
+ const fst::mmuctl_v2::Footer* mmu_control_v2_coverage()const override{return missing?nullptr:&footer;}
+ const std::vector<fst::TranslationFragment>& current_translation_fragments()const override{return fragments;}
+ std::uint64_t current_address_space_id()const override{return 0x1000;}
+ std::string description()const override{return "functional D-side STLB fixture";}
+ bool next(TraceRecord& r)override {
+  if(at==3)return false; const auto n=at++;
+  control={};control.owner.owner_kind=fst::mmuctl_v2::OwnerKind::RetiredInstruction;
+  control.owner.status=fst::mmuctl_v2::Sealed;
+  if(bound_flush && n==2)control.operations.emplace_back(fst::mmuctl::Command{});
+  const auto va=n==1?0x401000ull:0x400000ull;const auto pa=n==1?0x201000ull:0x200000ull;
+  r={};r.pc=0x4000+4*n;r.address=pa;r.size=8;r.op_class=56;r.flags=kRetires|kLoad|kPhysicalAddress;
+  if(n)r.producer_dists[0]=1;
+  fst::TranslationMapping m;m.address_space_id=0x1000;m.walk_root=0x1000;
+  m.virtual_base=va;m.physical_base=pa;m.page_bits=12;m.flags=fst::kTranslationLeafKnown;
+  fragments={{va,pa,8,m}};return true;
+ }
+};
+SimulationStats stlb_run(bool enabled,bool flush=false,bool missing=false,std::uint64_t diagnostics=0,
+                         unsigned hit_latency=6) {
+ SimulatorConfig c;c.cores=1;c.cha_count=c.dram.channels=c.dram.banks_per_channel=1;
+ c.core_model="interval_weave";c.interval_scheduler="time_epoch";
+ c.response_queue_feedback=c.response_sparse_scoreboard=true;c.interval_private_preview=false;
+ c.dtlb.enabled=true;c.dtlb.entries=1;c.dtlb.miss_model="timing_walk";
+ c.dtlb.page_walkers=1;c.dtlb.page_walk_latency=50;c.dtlb.coalesce_misses=false;
+ c.spr_dtlb_stlb_proxy=enabled;
+ c.spr_dtlb_stlb_hit_latency=hit_latency;
+ std::vector<std::unique_ptr<TraceSource>> traces;
+ traces.push_back(std::make_unique<StlbSource>(flush,missing,diagnostics));
+ Simulator sim(c,std::move(traces));return sim.run();
+}
 SimulationStats run(bool hierarchy,bool cross,unsigned profile=0,bool write=false,bool follower=false,bool coalesced=false,bool observe=true,bool atomic=false,unsigned repeats=1,bool block_summary=false) {
  SimulatorConfig c;c.cores=1;c.core_model="interval_weave";c.interval_scheduler="time_epoch";
  c.response_queue_feedback=c.response_sparse_scoreboard=true;c.interval_private_preview=false;
@@ -100,6 +145,30 @@ void causal(const SimulationStats& stats,bool follower,bool store) {
  assert(store_frames==(store?(follower?2u:1u):0u));
 }
 int main(){
+ {
+  const auto off=stlb_run(false), on=stlb_run(true), flushed=stlb_run(true,true);
+  const auto missing=stlb_run(true,false,true), diagnostics=stlb_run(true,false,false,121);
+  const auto slower=stlb_run(true,false,false,0,15);
+  assert(on.total_core().spr_dtlb_stlb_hits>0);
+  assert(on.total_core().spr_dtlb_stlb_misses>0);
+  assert(slower.total_core().spr_dtlb_stlb_hits==on.total_core().spr_dtlb_stlb_hits);
+  assert(slower.total_core().dtlb_timing.walk_delay_cycles ==
+         on.total_core().dtlb_timing.walk_delay_cycles +
+             9 * on.total_core().spr_dtlb_stlb_hits);
+  assert(flushed.total_core().spr_dtlb_stlb_flushes>0);
+  assert(flushed.total_core().spr_dtlb_stlb_hits<on.total_core().spr_dtlb_stlb_hits);
+  assert(missing.total_core().spr_dtlb_stlb_fallbacks>0 && missing.total_core().spr_dtlb_stlb_hits==0);
+  assert(missing.total_core().cycles==off.total_core().cycles);
+  assert(on.total_core().memory_accesses==off.total_core().memory_accesses);
+  assert(on.total_core().cycles==diagnostics.total_core().cycles &&
+         on.total_core().spr_dtlb_stlb_hits==diagnostics.total_core().spr_dtlb_stlb_hits);
+  SimulatorConfig invalid;invalid.spr_dtlb_stlb_proxy=true;
+  invalid.core_model="interval_weave";invalid.interval_scheduler="time_epoch";
+  invalid.dtlb.enabled=true;invalid.dtlb.miss_model="timing_walk";
+  invalid.dtlb.hierarchy_walk=true;
+  bool rejected=false;try {invalid.validate();}catch(const std::invalid_argument&){rejected=true;}
+  assert(rejected);
+ }
  for(unsigned p=0;p<3;++p){
   const auto fixed=run(false,false,p),walk=run(true,false,p);auto a=fixed.total_core(),b=walk.total_core();
   assert(b.retired_uops==1&&b.memory_accesses==1&&b.dtlb.misses==1);

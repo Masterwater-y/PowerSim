@@ -21,6 +21,21 @@ class RetiredCacheContract(unittest.TestCase):
                     for key in ('retired_macro_instructions','retired_uops'):
                         self.assertEqual(populations[str(core['core_id'])][scope][key],row[key])
 
+    def test_cache_population_rejects_uncertified_functional_ownership(self):
+        from copy import deepcopy
+        from unittest.mock import patch
+        from test_perf_cache_audit import fixture
+        from thread_state_graph import load_capture_evidence
+        import audit_perf_cache
+        root=Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(dir=root/'tmp') as directory:
+            trace=Path(directory);fixture(trace)
+            evidence=deepcopy(load_capture_evidence(trace))
+            evidence['graph']['summary']['ownership_status']='proxy'
+            with patch.object(audit_perf_cache,'load_capture_evidence',return_value=evidence):
+                with self.assertRaisesRegex(ValueError,'certified functional ownership'):
+                    audit_perf_cache.audit_request_population(trace)
+
     def fixture(self):
         import retired_cache_contract as c
         row=dict(retired_macro_instructions=10,retired_uops=20,incomplete_macros=0,

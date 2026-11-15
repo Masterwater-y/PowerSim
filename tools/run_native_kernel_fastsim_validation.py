@@ -324,6 +324,7 @@ def validation_fingerprint(case, args):
         "perf_cache_requested": cache_requested,
         "retired_cache_requested": retired_cache_requested,
         "retired_cache_misses_only": getattr(args,'retired_cache_misses',False),
+        "retired_cache_per_event": getattr(args,'retired_cache_per_event',False),
         "llc_fill_audit_requested": bool(os.environ.get("FASTSIM_LLC_AUDIT")),
         "llc_fill_audit_sampling": os.environ.get("FASTSIM_LLC_AUDIT_STRIDE","16"),
         "perf_cache_estimates_requested": getattr(args,"perf_cache_estimates",False),
@@ -869,7 +870,8 @@ def run_case(case, args):
             prediction.update(input_identity=identity['source_identity'])
             if getattr(args,'retired_cache_misses',False):
                 report['retired_cache_validation']=compare_retired_cache(
-                    prediction,fingerprint['current_retired_cache_evidence'],misses_only=True)
+                    prediction,fingerprint['current_retired_cache_evidence'],misses_only=True,
+                    allow_incomplete_events=getattr(args,'retired_cache_per_event',False))
             else:
                 report['retired_cache_validation']=compare_retired_cache(prediction,fingerprint['current_retired_cache_evidence'])
             checks['retired_cache_source_population_match']=True
@@ -1034,7 +1036,9 @@ def write_summary(args, discovered):
         ),
         "pmu_scope": pmu_scopes[0] if len(pmu_scopes) == 1 else "mixed" if pmu_scopes else "unavailable",
         "pmu_accuracy_by_scope": pmu_accuracy_by_scope,
-        "primary_pmu_namespace": "retired_cache" if getattr(args,"retired_cache",False) else "native_tag_miss_diagnostics",
+        "primary_pmu_namespace": "retired_cache" if getattr(args,"retired_cache",False) else None,
+        "primary_pmu_status": "requested" if getattr(args,"retired_cache",False) else "not-requested",
+        "native_tag_miss_namespace": "diagnostic",
         "primary_retired_cache_events": ['retired_l1_load_misses','retired_l2_load_misses','retired_l3_load_misses']
             if getattr(args,'retired_cache_misses',False) else None,
         "pmu_fields": list(PMU_FIELDS),
@@ -1228,7 +1232,7 @@ def write_summary(args, discovered):
     lines.extend(
         [
             "",
-            "## Native cache/branch diagnostics" if getattr(args,"retired_cache",False) else "## Cache/branch miss PMU accuracy",
+            "## Native cache/branch diagnostics",
             "",
             "| scope / counter | mapping | finite cases | MAPE | P50 | P90 | P99 | "
             "WAPE | bias | reference source |",
@@ -1252,6 +1256,10 @@ def write_summary(args, discovered):
     if getattr(args,"retired_cache",False):
         lines += ["", "## Primary retired-load cache PMU", "",
                   "See [retired-cache-summary.md](retired-cache-summary.md) for raw counts, unknown qualifications and provisional errors. Native tag misses above remain separate diagnostics."]
+        if getattr(args, 'retired_cache_per_event', False):
+            lines += ["Per-event mode scores only events with complete native membership; unavailable events are not included in error aggregates. It does not certify all three events."]
+    else:
+        lines += ["", "Retired-load cache PMU was not requested; native tag misses above are diagnostics, not MEM_LOAD_RETIRED miss accuracy."]
     (args.output_dir / "summary.md").write_text("\n".join(lines) + "\n")
     if getattr(args, "perf_retirement", False):
         perf_lines = ["# Retirement-event diagnostics", "", "Hardware perf equivalence: unverified. Each scope/event and raw/rate population is separate.", "",
@@ -1354,6 +1362,8 @@ def parse_args():
     parser.add_argument("--retired-cache",action="store_true",help="Compare retired load L1/L2/L3 cache events using native service facts; provisional errors retain unknown membership")
     parser.add_argument('--retired-cache-misses',action='store_true',
         help='Compare only three retired load miss point estimates; implies --retired-cache; no FB-hit accuracy gate')
+    parser.add_argument('--retired-cache-per-event',action='store_true',
+        help='Score complete retired-load miss events individually; events with native unknown membership remain unavailable')
     parser.add_argument("--perf-cache", action="store_true",
                         help="Audit ten hardware-bound cache event contracts and independent native request sidecars; no legacy fallback")
     parser.add_argument("--perf-cache-estimates",action="store_true",
@@ -1373,6 +1383,7 @@ def parse_args():
     parser.add_argument("--poll-seconds", type=int, default=30)
     parser.add_argument("--collection-exit-file", type=Path)
     args = parser.parse_args()
+    if args.retired_cache_per_event:args.retired_cache_misses=True
     if args.retired_cache_misses:args.retired_cache=True
     if args.perf_cache_estimates and not args.perf_cache:parser.error('--perf-cache-estimates requires --perf-cache')
     if args.perf_cache_incomplete_errors and not args.perf_cache_estimates:

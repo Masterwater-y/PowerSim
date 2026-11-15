@@ -1,5 +1,90 @@
 # FastSim Codebase repository and workflow
 
+Local status (2026-11-15): `calibration-spr-dev` incorporates upstream `f0920cf`
+and `ed87ff5` using the approved source adaptation plan.
+After static adaptation, the user authorized short functional tests and required
+a unique current version. The active `build -> build-calibration-spr` was rebuilt;
+`build/fastsim` SHA-256 is
+`28f06fd68871e9d0199361707a697fcf1961efc9ecdb254b476e367954852dac`.
+Fourteen targeted test invocations and six CLI checks passed (four successful
+runs and two required rejections). The prototypes were removed from their
+original paths; 66 historical candidate, prototype and unrebuilt ELF files were
+removed from the active build. The user's subsequent cleanup request deleted
+all local `tmp/` contents, including those archives, source snapshots, logs,
+temporary scripts and fixtures. Final test summary and JSON receipt remain at
+`/home/data00/xuhaoen/workspace_agent_env/fastsim-spr-唯一版本功能测试-20261115.*`.
+Rebuild additional executable targets before using them. No multi-version
+compatibility layer was added.
+Four redundant candidate build directories and historical build-local
+provenance/tmp/log artifacts were subsequently removed, together with stale
+objects for 56 removed executables and Python caches. Current build executables,
+static library and CMake metadata remain under `build-calibration-spr`.
+Full regression, collection, accuracy and throughput remain unverified;
+no commit or push was performed.
+The local framework profile inherits M2 with explicit calibration overrides;
+upstream model equivalence, accuracy and throughput evidence do not certify it.
+
+The dated upstream directives and historical ELF locations below describe the
+author's workspace. They do not assert local execution, installed binaries,
+running collectors or current CPU placement. Existing local authorization and
+repository identity govern operations; source
+`/home/data00/xuhaoen/.agent_cli_auth/env.sh` before local shell commands.
+For this GCC 11 build, prepend `/opt/gcc-11/lib64` to `LD_LIBRARY_PATH` at
+execution time; a managed TRAE shell's older C++ runtime otherwise wins over
+the executable's RUNPATH.
+Inputs with core/MMU/architectural-boundary companions require explicit
+`--preload-validated-input false`; streaming throughput remains
+validation-inclusive. CPU 52–63 placement must be requalified before local use.
+
+User directive (2026-11-12): primary host throughput excludes input
+initialization/preprocessing/source checks/integrity and validation work;
+report those costs and full-process wall time separately. The existing
+measurement timer already excludes startup prechecks but retains online
+companion validation. Do not publish a validation-excluded rate until the
+validation phase has been separated or its exclusion has independent
+wall-clock evidence; never subtract parallel CPU samples from wall time.
+Subsequent host evaluations bind to verified high-frequency CPUs. On this
+host use **52–63**, socket/NUMA node **1**, through
+`python3 scripts/run_high_frequency.py -- COMMAND ARGS...`.
+Check the existing frequency policy before execution and record working
+frequency in paired runs. Requalify placement on a changed host; no silent
+fallback to the historical 24–35 low-frequency set and no global governor
+changes.
+
+User directive (2026-11-11): freeze **SPR-M1 — Retired Prepare baseline** at
+R0/R1 `v2-wait` executable SHA-256
+`dad62e0d67bea89cd9c69a946a2bd5e1eac89b7e9f3edf54704c0f81f13dc905`.
+User directive (2026-11-12): subsequent SPR evaluations use
+`configs/spr-evaluation-default.cfg`, selecting **SPR-M2 — Retired Prepare +
+Rename Elimination**, `configs/spr-m2-rename-elimination.cfg`. The validated
+candidate executable `0b5aacd527e837771f2693ecfd8225ad2839950dfc33615944e861ea9da822b2`
+was installed as `build/fastsim` at that decision; frozen SPR-M1 remains at
+`tmp/spr-m1-20261111/fastsim` with its original immutable profile.
+Set `core.spr_rename_elimination=false` after the source-bound profile to
+disable the new approximation. This user-approved default change does not
+upgrade native PMU evidence or the two-pair throughput diagnostic.
+Keep retired-store prepare enabled,
+native L1D/private-L2 hardware prefetch and pre-retirement early prepare disabled,
+and FastSim prefetch extensions disabled. Retain software-prefetch instructions.
+Use each source's own target timing/geometry and thread-state plan; the alias
+does not certify or change native capture settings. Versioned milestone configs
+are immutable; later model milestones advance SPR-M3, SPR-M4, etc.
+
+User directive (2026-11-13): remove the third-round SPR config captures /
+Sequencer keys, FR-FCFS compact indices / FairEvent, and static lookup caches;
+also exclude unconfirmed borrowed views. Restore first/second-round host
+optimizations and install the ordinary Release build as `build/fastsim`.
+`simulate` enables supported validated input preload by default; use
+`--preload-validated-input false` or `FASTSIM_PRELOAD_VALIDATED=0` for streaming.
+CLI overrides env 0/1 and malformed settings reject. Streaming retains online
+validation and uses the legacy validation-inclusive throughput label. Unsupported
+core/MMU/architectural-boundary companions require this explicit streaming path.
+The SPR-M2 model profile stays unchanged; the immutable M2 ELF is archived at
+`tmp/host-throughput-default-20261113/spr-m2-frozen`. The
+[default rollout](../fastsim-host-default-rollout-20261113.md) binds the installed
+ELF, tested source, fresh Zstd pairs and inherited five-case evidence separately.
+Historical phase3 PGO remains a separate source/profile-bound candidate.
+
 User directive (2026-11-05): FastSim prioritizes high throughput over cycle
 accuracy and accepts bounded accuracy tradeoffs. Preserve the existing parallel
 two-stage framework; do not introduce a separate cycle-accurate pipeline or
@@ -17,12 +102,25 @@ calibration branch derives from that independent, parentless SPR history.
 SPR frontend work consumes retired instruction streams only; no speculative
 or wrong-path input/traffic is part of this branch's frontend contract.
 
-User directive (2026-11-05): build gem5-spr with `-j128` and do not impose an
+Upstream historical directive (2026-11-05): build gem5-spr with `-j128` and do not impose an
 arbitrary wall-clock limit on linking. In this workspace, with LTO disabled,
 `scons --linker=gold build/X86/gem5.opt -j128` supplies gold with `--threads
 --thread-count=128`. The configured thread count does not guarantee that every
 link phase uses 128 cores. Preserve a known good binary before overwriting it
 and restore it if linking fails.
+
+Build configuration migrated from the 2026-11-09 source changes: FastSim
+release links use parallel LTO.
+`FASTSIM_LTO_JOBS` defaults to 16 and propagates `-flto=16` to all consumers
+of `fastsim_lib`, including the main executable and tests. `make -j16` alone
+does not parallelize GCC LTRANS. Override with
+`cmake -S . -B build -DFASTSIM_LTO_JOBS=32` when a different link concurrency
+is needed. Keep the gem5 gold linker settings above separately.
+
+This workspace uses the sibling `../gem5-deploy` source tree for the shared
+retired-load miss policy and native-observer test headers. CMake owns this path
+through `FASTSIM_GEM5_SOURCE_DIR`; the affected Python producer tests use the
+same sibling workspace. Published submodule gitlinks remain unchanged.
 
 The independent `gem5-spr/` repository develops collection changes on its own
 local `yinhaolang` branch (source checkpoint `fb8ef0f162`; last previously native-qualified collection checkpoint `7e121b8a2e`), while this parent

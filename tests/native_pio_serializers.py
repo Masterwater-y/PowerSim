@@ -1,6 +1,6 @@
 """Build fixtures around literal native producer bodies, with no copied serializers."""
-def serializers(root, producer):
-    header=(root/'gem5-spr/src/cpu/o3/probe/tao_trace.hh').read_text()
+def serializers(gem5_root, producer):
+    header=(gem5_root/'src/cpu/o3/probe/tao_trace.hh').read_text()
     start=header.index('    struct NativeHierarchyAggregate {')
     structs=header[start:header.index('    struct NativeAnomalySample {',start)]
     start=producer.index('static void\nwriteNativeHierarchyJson(')

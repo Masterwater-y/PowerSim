@@ -1,0 +1,55 @@
+--- a/src/cpu/o3/probe/tao_trace.cc
++++ b/src/cpu/o3/probe/tao_trace.cc
+@@ -8619,8 +8619,12 @@
+ // These internal PCs are byte-proved by the same exact-build profile as the
+ // public entries. They never apply to another kernel or guessed layout.
+ bool
+-TaoTrace::isThreadStateHook(uint64_t pc) const
+-{
++TaoTrace::isThreadStateHook(uint64_t pc, uint64_t micro_pc) const
++{
++    // External-entry ROM retains the interrupted PC. Its last micro-op can
++    // therefore alias any audited hook without executing that instruction.
++    // Keep those records/owner accounting, but never interpret their ABI.
++    if (isRomMicroPC(micro_pc)) return false;
+     return pc == thread_state_marker_pc_ || pc == scheduler_switch_pc_ ||
+         pc == scheduler_wakeup_pc_ || pc == 0xffffffff81517740ULL ||
+         pc == 0xffffffff81517803ULL || pc == 0xffffffff81517851ULL ||
+@@ -8747,7 +8751,8 @@
+ {
+     if (!out_thread_state_ || !inst || !inst->tcBase()) return;
+     const uint64_t pc = inst->pcState().instAddr();
+-    if (thread_state_initial_owner_ && !isThreadStateHook(pc)) return;
++    const bool hook = isThreadStateHook(pc, inst->pcState().microPC());
++    if (thread_state_initial_owner_ && !hook) return;
+     auto *tc = inst->tcBase();
+     const bool user = isUserInstruction(inst);
+     const uint64_t asid = tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr3) & ~uint64_t(0xfff);
+@@ -8765,6 +8770,7 @@
+         return "core" + std::to_string(fst_core_id_) + ":e" + std::to_string(thread_state_events_);
+     };
+     ensureThreadStateOwner(inst, ordinal, measurement);
++    if (!hook) return;
+     // All hooks observe the last committed micro-op of the FIRST instruction
+     // at the audited entry PC. push %rbp/nop/mov %eax leave ABI args intact.
+     if (inst->staticInst->isMicroop() && !inst->staticInst->isLastMicroop()) return;
+@@ -9150,7 +9156,7 @@
+         observeTaskClockRetirement(fst_record_count_);
+     if (state_capture && fst_record_count_ == sync_ordinal &&
+         (!inst->staticInst->isMicroop() || inst->staticInst->isLastMicroop()) &&
+-        isThreadStateHook(inst->pcState().instAddr()))
++        isThreadStateHook(inst->pcState().instAddr(), inst->pcState().microPC()))
+         ++thread_state_unretained_hooks_;
+     pending_syscalls_.erase(inst->seqNum);
+ }
+--- a/src/cpu/o3/probe/tao_trace.hh
++++ b/src/cpu/o3/probe/tao_trace.hh
+@@ -743,7 +743,7 @@
+     static std::unordered_map<uint64_t, uint64_t> thread_state_runtime_tasks_;
+     static std::unordered_map<int32_t, StateRequest> thread_state_waits_;
+     static std::unordered_map<int32_t, StateRequest> thread_state_wakes_;
+-    bool isThreadStateHook(uint64_t pc) const;
++    bool isThreadStateHook(uint64_t pc, uint64_t micro_pc) const;
+     void openThreadState();
+     void emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measurement);
+     void ensureThreadStateOwner(const DynInstPtr &inst, uint64_t ordinal, bool measurement);

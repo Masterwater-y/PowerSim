@@ -1,0 +1,354 @@
+{
+  "schema": "fastsim-spr-milestone-v1",
+  "milestone": "SPR-M1",
+  "name": "Retired Prepare",
+  "date": "2026-11-11",
+  "implementation": "frozen R0/R1 v2-wait",
+  "binary": {
+    "sha256": "dad62e0d67bea89cd9c69a946a2bd5e1eac89b7e9f3edf54704c0f81f13dc905",
+    "preserved_path": "/data00/yinhaolang/FastSim/tmp/spr-m1-20261111/fastsim",
+    "source_archive": "/data00/yinhaolang/FastSim/tmp/parent-service-v2-r01-exclusive-20261110/source",
+    "source_manifest": "/data00/yinhaolang/FastSim/tmp/spr-m1-20261111/source-manifest.json",
+    "source_manifest_sha256": "7ee8e7adeb5ed646f4f004acba5c365a599f4ce59ecd59f4315bf0a63c0ea8a3"
+  },
+  "profile": {
+    "path": "configs/spr-m1-retired-prepare.cfg",
+    "sha256": "711561de8cbb306fcad72ae76b4ed7ab0e3ebb30601263b7467cce86519b310f",
+    "effective_key_count": 310
+  },
+  "evaluation_default": "configs/spr-evaluation-default.cfg",
+  "model": {
+    "unified_parent_service": "v2-wait",
+    "retired_store_prepare": true,
+    "prefetch_extensions": false,
+    "retired_functional_frontend": true
+  },
+  "native_collection": {
+    "l1d_enable_prefetch": false,
+    "private_l2_enable_prefetch": false,
+    "sprEarlyStorePrepare": false,
+    "software_prefetch_instructions": "preserved",
+    "retired_store_permission_acquisition": "preserved"
+  },
+  "source_binding": {
+    "geometry_and_timings": "from each matching config.ini/effective-target",
+    "thread_state_plan": "from each matching source",
+    "baseline_cores": 4,
+    "baseline_memory": "32GiB",
+    "baseline_warmup_user_uops": 500000,
+    "baseline_target_user_uops": 10000000
+  },
+  "inherited_accuracy": {
+    "cpi_mae_cycles_per_macro": 0.19159898226952946,
+    "cpi_mape_percent": 12.994957312853424,
+    "reference_summary": "/data00/yinhaolang/FastSim/tmp/restore-r01-main-20261111/validation-summary.json",
+    "reference_summary_sha256": "4063f5a54c376409315241736ccc21a073d5f9bd66ba288a538b85907aa7eca6",
+    "pmu_report": "fastsim-r01-retired-cache-miss-errors-including-unknown-20261111.md",
+    "prediction_changed": false,
+    "accuracy_rescored": false,
+    "throughput_remeasured": false
+  },
+  "verification": {
+    "five_case_effective_config_match": true,
+    "config_cases": [
+      {
+        "case": "c04-777.zstd_r",
+        "original_config": "/data00/yinhaolang/FastSim/tmp/restore-r01-main-20261111/replay/configs/c04-777.zstd_r.cfg",
+        "thread_state_plan": "/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-20261110/sources/c04-777.zstd_r/thread-state.plan",
+        "effective_non_source_keys": 310,
+        "effective_difference_count": 0,
+        "include_chain": [
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/restore-r01-main-20261111/replay/configs/c04-777.zstd_r.cfg",
+            "sha256": "8d3a1e701c64b9d1f783075d420091edcd5ff71c6f184aae1afb3e87284e832d"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/configs/c04-777.zstd_r/effective.cfg",
+            "sha256": "4eb38426d129539e5d3770bcf7fa2047e378742935b711bc1b785a91665c85f2"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-spr-retired.cfg",
+            "sha256": "ef7147a601964bcb6f93e8f2d49ee697131100d519a7c68ad57a9f51df61e63d"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-fs-native-kernel.cfg",
+            "sha256": "51f260db881e1f2fafe55cc96b2a29f64d1d7a8266cf77ffde7398a619c96701"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_9-fs-load-ready.cfg",
+            "sha256": "c5fc83011082ed463bb0e87cd3ddfcd8436107c97cd6278468ea9f03164bfef2"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_6-fs-materialized-kernel.cfg",
+            "sha256": "4f92a21b344edba16255b6672b0a272ceea5ff812ab4255dd5db99297e103a2e"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_5-fs-monotone-iq.cfg",
+            "sha256": "c6e5c92431275a9602b34f06824b1541f0f41ab61e0ed743d6feae7c9749994b"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_4-fs-modeled-ifetch.cfg",
+            "sha256": "7add7e9adb238e47e3009d65387708df0dacdf9adb30cb73beb881c697ad0e6f"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_2-fs-native-kernel.cfg",
+            "sha256": "49a107d11a34daf582f149e005d15a83f5067dbf4d286bf39d902a215f28aa7c"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_1-fs-native-kernel.cfg",
+            "sha256": "ab9344847827571adab0bfb1c776205de9aa432e662d8d7aedd9de37f2f3fff8"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_1-time-epoch.cfg",
+            "sha256": "a04557e7784a5e7fb8e15235afc3075b7e06ab57e970b0ac02a293ad786e28e9"
+          }
+        ]
+      },
+      {
+        "case": "c04-801.xz_s",
+        "original_config": "/data00/yinhaolang/FastSim/tmp/restore-r01-main-20261111/replay/configs/c04-801.xz_s.cfg",
+        "thread_state_plan": "/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-20261110/sources/c04-801.xz_s/thread-state.plan",
+        "effective_non_source_keys": 310,
+        "effective_difference_count": 0,
+        "include_chain": [
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/restore-r01-main-20261111/replay/configs/c04-801.xz_s.cfg",
+            "sha256": "9828c9c6ffa4c7cdc8435fd3f81a4c96a6c0276cc370201d693706e48c13e8bf"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/configs/c04-801.xz_s/effective.cfg",
+            "sha256": "4eb38426d129539e5d3770bcf7fa2047e378742935b711bc1b785a91665c85f2"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-spr-retired.cfg",
+            "sha256": "ef7147a601964bcb6f93e8f2d49ee697131100d519a7c68ad57a9f51df61e63d"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-fs-native-kernel.cfg",
+            "sha256": "51f260db881e1f2fafe55cc96b2a29f64d1d7a8266cf77ffde7398a619c96701"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_9-fs-load-ready.cfg",
+            "sha256": "c5fc83011082ed463bb0e87cd3ddfcd8436107c97cd6278468ea9f03164bfef2"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_6-fs-materialized-kernel.cfg",
+            "sha256": "4f92a21b344edba16255b6672b0a272ceea5ff812ab4255dd5db99297e103a2e"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_5-fs-monotone-iq.cfg",
+            "sha256": "c6e5c92431275a9602b34f06824b1541f0f41ab61e0ed743d6feae7c9749994b"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_4-fs-modeled-ifetch.cfg",
+            "sha256": "7add7e9adb238e47e3009d65387708df0dacdf9adb30cb73beb881c697ad0e6f"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_2-fs-native-kernel.cfg",
+            "sha256": "49a107d11a34daf582f149e005d15a83f5067dbf4d286bf39d902a215f28aa7c"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_1-fs-native-kernel.cfg",
+            "sha256": "ab9344847827571adab0bfb1c776205de9aa432e662d8d7aedd9de37f2f3fff8"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_1-time-epoch.cfg",
+            "sha256": "a04557e7784a5e7fb8e15235afc3075b7e06ab57e970b0ac02a293ad786e28e9"
+          }
+        ]
+      },
+      {
+        "case": "c04-817.flac_s",
+        "original_config": "/data00/yinhaolang/FastSim/tmp/restore-r01-main-20261111/replay/configs/c04-817.flac_s.cfg",
+        "thread_state_plan": "/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-20261110/sources/c04-817.flac_s/thread-state.plan",
+        "effective_non_source_keys": 310,
+        "effective_difference_count": 0,
+        "include_chain": [
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/restore-r01-main-20261111/replay/configs/c04-817.flac_s.cfg",
+            "sha256": "b4707f12716a3c6bb15985f6c8edaf30d4053234e6651a9a91ddb39dc9d1a20f"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/configs/c04-817.flac_s/effective.cfg",
+            "sha256": "4eb38426d129539e5d3770bcf7fa2047e378742935b711bc1b785a91665c85f2"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-spr-retired.cfg",
+            "sha256": "ef7147a601964bcb6f93e8f2d49ee697131100d519a7c68ad57a9f51df61e63d"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-fs-native-kernel.cfg",
+            "sha256": "51f260db881e1f2fafe55cc96b2a29f64d1d7a8266cf77ffde7398a619c96701"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_9-fs-load-ready.cfg",
+            "sha256": "c5fc83011082ed463bb0e87cd3ddfcd8436107c97cd6278468ea9f03164bfef2"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_6-fs-materialized-kernel.cfg",
+            "sha256": "4f92a21b344edba16255b6672b0a272ceea5ff812ab4255dd5db99297e103a2e"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_5-fs-monotone-iq.cfg",
+            "sha256": "c6e5c92431275a9602b34f06824b1541f0f41ab61e0ed743d6feae7c9749994b"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_4-fs-modeled-ifetch.cfg",
+            "sha256": "7add7e9adb238e47e3009d65387708df0dacdf9adb30cb73beb881c697ad0e6f"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_2-fs-native-kernel.cfg",
+            "sha256": "49a107d11a34daf582f149e005d15a83f5067dbf4d286bf39d902a215f28aa7c"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_1-fs-native-kernel.cfg",
+            "sha256": "ab9344847827571adab0bfb1c776205de9aa432e662d8d7aedd9de37f2f3fff8"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_1-time-epoch.cfg",
+            "sha256": "a04557e7784a5e7fb8e15235afc3075b7e06ab57e970b0ac02a293ad786e28e9"
+          }
+        ]
+      },
+      {
+        "case": "c04-854.graph500_s",
+        "original_config": "/data00/yinhaolang/FastSim/tmp/restore-r01-main-20261111/replay/configs/c04-854.graph500_s.cfg",
+        "thread_state_plan": "/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-20261110/sources/c04-854.graph500_s/thread-state.plan",
+        "effective_non_source_keys": 310,
+        "effective_difference_count": 0,
+        "include_chain": [
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/restore-r01-main-20261111/replay/configs/c04-854.graph500_s.cfg",
+            "sha256": "8bdf8423bdb99de5a884b46ceb73538e06c72006c3c3f2909cf02e086903a2e6"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/configs/c04-854.graph500_s/effective.cfg",
+            "sha256": "4eb38426d129539e5d3770bcf7fa2047e378742935b711bc1b785a91665c85f2"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-spr-retired.cfg",
+            "sha256": "ef7147a601964bcb6f93e8f2d49ee697131100d519a7c68ad57a9f51df61e63d"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-fs-native-kernel.cfg",
+            "sha256": "51f260db881e1f2fafe55cc96b2a29f64d1d7a8266cf77ffde7398a619c96701"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_9-fs-load-ready.cfg",
+            "sha256": "c5fc83011082ed463bb0e87cd3ddfcd8436107c97cd6278468ea9f03164bfef2"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_6-fs-materialized-kernel.cfg",
+            "sha256": "4f92a21b344edba16255b6672b0a272ceea5ff812ab4255dd5db99297e103a2e"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_5-fs-monotone-iq.cfg",
+            "sha256": "c6e5c92431275a9602b34f06824b1541f0f41ab61e0ed743d6feae7c9749994b"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_4-fs-modeled-ifetch.cfg",
+            "sha256": "7add7e9adb238e47e3009d65387708df0dacdf9adb30cb73beb881c697ad0e6f"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_2-fs-native-kernel.cfg",
+            "sha256": "49a107d11a34daf582f149e005d15a83f5067dbf4d286bf39d902a215f28aa7c"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_1-fs-native-kernel.cfg",
+            "sha256": "ab9344847827571adab0bfb1c776205de9aa432e662d8d7aedd9de37f2f3fff8"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_1-time-epoch.cfg",
+            "sha256": "a04557e7784a5e7fb8e15235afc3075b7e06ab57e970b0ac02a293ad786e28e9"
+          }
+        ]
+      },
+      {
+        "case": "c04-872.marian_s",
+        "original_config": "/data00/yinhaolang/FastSim/tmp/restore-r01-main-20261111/replay/configs/c04-872.marian_s.cfg",
+        "thread_state_plan": "/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-20261110/sources/c04-872.marian_s/thread-state.plan",
+        "effective_non_source_keys": 310,
+        "effective_difference_count": 0,
+        "include_chain": [
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/restore-r01-main-20261111/replay/configs/c04-872.marian_s.cfg",
+            "sha256": "42fabc7c725b547e2c24a0f73aaf9db0c856ee967fd94248978dcc86b29fe945"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/configs/c04-872.marian_s/effective.cfg",
+            "sha256": "4eb38426d129539e5d3770bcf7fa2047e378742935b711bc1b785a91665c85f2"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-spr-retired.cfg",
+            "sha256": "ef7147a601964bcb6f93e8f2d49ee697131100d519a7c68ad57a9f51df61e63d"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-fs-native-kernel.cfg",
+            "sha256": "51f260db881e1f2fafe55cc96b2a29f64d1d7a8266cf77ffde7398a619c96701"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_9-fs-load-ready.cfg",
+            "sha256": "c5fc83011082ed463bb0e87cd3ddfcd8436107c97cd6278468ea9f03164bfef2"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_6-fs-materialized-kernel.cfg",
+            "sha256": "4f92a21b344edba16255b6672b0a272ceea5ff812ab4255dd5db99297e103a2e"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_5-fs-monotone-iq.cfg",
+            "sha256": "c6e5c92431275a9602b34f06824b1541f0f41ab61e0ed743d6feae7c9749994b"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_4-fs-modeled-ifetch.cfg",
+            "sha256": "7add7e9adb238e47e3009d65387708df0dacdf9adb30cb73beb881c697ad0e6f"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_2-fs-native-kernel.cfg",
+            "sha256": "49a107d11a34daf582f149e005d15a83f5067dbf4d286bf39d902a215f28aa7c"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_1-fs-native-kernel.cfg",
+            "sha256": "ab9344847827571adab0bfb1c776205de9aa432e662d8d7aedd9de37f2f3fff8"
+          },
+          {
+            "path": "/home/data00/yinhaolang/FastSim/tmp/spr-no-prefetch-no-early-prepare-c4-validation-20261110/frozen-configs/gem5-v28_1-time-epoch.cfg",
+            "sha256": "a04557e7784a5e7fb8e15235afc3075b7e06ab57e970b0ac02a293ad786e28e9"
+          }
+        ]
+      }
+    ],
+    "native_policy_logic_checks": [
+      {
+        "cores": 4,
+        "enabled": false,
+        "passed": true
+      },
+      {
+        "cores": 8,
+        "enabled": false,
+        "passed": true
+      },
+      {
+        "cores": 4,
+        "enabled": true,
+        "passed": true
+      }
+    ],
+    "actual_native_new_capture": "not run",
+    "cpp_config_check_passed": true,
+    "cpp_config_check": "/data00/yinhaolang/FastSim/tmp/spr-m1-20261111/check-config.log",
+    "standard_tests_passed": true,
+    "standard_test_log": "/data00/yinhaolang/FastSim/tmp/spr-m1-20261111/fastsim_tests.log"
+  },
+  "entrypoints": {
+    "configs/gem5-spr-retired.cfg": "ec7cd9cbd05420bf9c2fd778115acc1f1a39e9fcf6c969f776217ae596b512aa",
+    "configs/spr-evaluation-default.cfg": "a52446f77e6ad648e89fe6dd3a50355d7ab4934a08e7891db43217a1b07121ab",
+    "tools/run_uarch_fastsim.py": "e94fd1459534983a2917a6de6a4cf9fdc6833839093bb7354a07c3bea31d51aa",
+    "scripts/launch_spec2026_uarch_exploration_v2.sh": "337b4ae9f9b16a53db10a265ee0e236af832eea58d1a67b9930967db7362bd88",
+    "gem5-spr/configs/fastsim/collection.py": "015fb44fda145d7a760bbdcb6aeb860968e9851a0441b7c8742438678ac6b5e4",
+    "gem5-spr/configs/fastsim/fs_capture.py": "3b9d990a79697394ff80324a86198ada6c5f500fd01bac9bfa6198ea886faf47"
+  },
+  "git_tag_created": false,
+  "committed": false,
+  "pushed": false
+}

@@ -14,7 +14,8 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-PROBE = ROOT / "gem5-spr/src/cpu/o3/probe"
+GEM5_ROOT = ROOT.parent / "gem5-deploy"
+PROBE = GEM5_ROOT / "src/cpu/o3/probe"
 sys.path.insert(0, str(ROOT / "tools"))
 from fst_retirement_eligibility import load_retirement_eligibility
 
@@ -34,6 +35,7 @@ def definition(source, signature):
 
 
 PREAMBLE = r'''
+#include <algorithm>
 #include <cassert>
 #include <cctype>
 #include <cstdio>
@@ -47,6 +49,8 @@ PREAMBLE = r'''
 #include "cpu/o3/probe/perf_retirement.hh"
 #include "cpu/o3/probe/fst_dependencies.hh"
 #include "cpu/o3/probe/fst_memory_requests.hh"
+#include "cpu/o3/probe/fst_store_requests.hh"
+#include "fastsim/fst_translation_facts.hpp"
 #include "cpu/o3/probe/fst_retirement.hh"
 using namespace gem5::o3;
 constexpr uint64_t MicroPCRomBit=0x8000;
@@ -67,11 +71,36 @@ struct StaticInst {
 namespace X86ISA { struct MicroDebug:StaticInst{}; }
 struct PC { uint64_t pc=4096,upc=0; uint64_t instAddr()const{return pc;}
  uint64_t microPC()const{return upc;} };
+struct Request {
+ static constexpr uint64_t NO_ACCESS=1,STORE_NO_DATA=2,PREFETCH=4,INST_FETCH=8,PT_WALK=16;
+ bool hasPaddr()const{return false;} bool hasVaddr()const{return false;}
+ bool hasContextId()const{return false;} bool isMasked()const{return false;}
+ bool isAtomic()const{return false;} bool isLLSC()const{return false;}
+ bool isSecure()const{return false;} bool isUncacheable()const{return false;}
+ bool isStrictlyOrdered()const{return false;} bool hasNoAddr()const{return false;}
+ bool isReadModifyWrite()const{return false;} bool isSwap()const{return false;}
+ bool isMemMgmt()const{return false;} bool isRelease()const{return false;}
+ bool isLocalAccess()const{return false;} bool isCacheMaintenance()const{return false;}
+ uint64_t getFlags()const{return 0;} uint64_t getPaddr()const{return 0;}
+ uint64_t getVaddr()const{return 0;} uint32_t getSize()const{return 0;}
+ uint32_t contextId()const{return 0;} uint32_t requestorId()const{return 0;}
+ const std::vector<bool>& getByteEnable()const{static const std::vector<bool> empty;return empty;}
+};
+using RequestPtr=std::shared_ptr<Request>;
+struct SavedRequest {
+ bool isSplit()const{return false;} RequestPtr mainReq()const{return {};}
+ RequestPtr req(unsigned)const{return {};}
+};
 struct Inst { std::shared_ptr<StaticInst> staticInst,macroop; PC state;
  uint64_t seqNum=0;uint32_t context=0;bool user=true;
  uint64_t memReqFlags=0;bool isDataPrefetch()const{return false;}
+ bool isAtomic()const{return false;} bool isStoreConditional()const{return false;}
+ bool inHtmTransactionalState()const{return false;}
+ bool isReadBarrier()const{return false;} bool isWriteBarrier()const{return false;}
+ bool isStore()const{return false;} bool isLoad()const{return false;}
+ SavedRequest* savedRequest=nullptr;
+ std::vector<fastsim::fst::TranslationFragment> functionalTranslations;
  const PC& pcState()const{return state;} };
-namespace Request { constexpr uint64_t NO_ACCESS=1; }
 using DynInstPtr=std::shared_ptr<Inst>;
 struct TaoTraceParams {
  bool functional_retirement=false,functional_include_kernel=true;
@@ -80,7 +109,9 @@ struct TaoTraceParams {
 };
 std::string toLower(std::string s){for(auto&c:s)c=std::tolower((unsigned char)c);return s;}
 struct TaoTrace {
- bool functional_retirement_=true;
+ bool functional_retirement_=true,functional_task_clock_=false,fst_translations_=false;
+ struct {void macro(bool,bool){}} native_task_clock_;
+ std::FILE* out_fst_store_requests_=nullptr;uint64_t fst_store_request_rows_=0;
  retirement::Ledger functional_retirement_ledger_,perf_retirement_;
  std::FILE *out_fst_retirement_=nullptr,*out_fst_memory_requests_=nullptr;
  uint64_t fst_memory_request_hash_=fastsim::fst::kRequestStreamHashSeed;
@@ -188,13 +219,14 @@ class SprFunctionalRetirementCaptureTests(unittest.TestCase):
             cpp = p / "capture.cc"
             cpp.write_text(preamble + wire + functions + callsite_driver + DRIVER)
             built = subprocess.run([
-                "/opt/gcc-11/bin/g++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                "-Wno-misleading-indentation", "-I", str(ROOT / "gem5-spr/src"),
+                os.environ.get("CXX", "g++"), "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                "-Wno-misleading-indentation", "-I", str(GEM5_ROOT / "src"),
+                "-I", str(ROOT / "include"),
                 str(cpp), "-o", str(p / "capture"),
             ], capture_output=True, text=True)
             self.assertEqual(built.returncode, 0, built.stderr)
             run = subprocess.run([str(p / "capture"), str(p)], capture_output=True,
-                                 text=True, env=dict(os.environ, LD_LIBRARY_PATH="/opt/gcc-11/lib64"))
+                                 text=True, env=os.environ)
             self.assertEqual(run.returncode, 0, run.stderr)
             data = (p / "hot.bin").read_bytes()
             self.assertEqual(len(data), 8 * 64)

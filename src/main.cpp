@@ -28,6 +28,56 @@ constexpr std::uint64_t kSyscallTransitionExtraUserUops = 24;
 constexpr const char* kPmuContractId =
     "perf-gem5-fastsim-x86-fs-v1";
 
+void write_legacy_prepare_diagnostics(std::ostream& out,
+                                      const fastsim::LegacyPrepareDiagnostics& d) {
+    const auto array=[&out](const auto& values) {
+        out << '[';
+        for(std::size_t i=0;i<values.size();++i) {if(i)out << ',';out << values[i];}
+        out << ']';
+    };
+    out << "{\"direct_at_own_eligible\":" << d.direct_at_own_eligible
+        << ",\"direct_scan_blocked\":" << d.direct_scan_blocked
+        << ",\"direct_scan_wait_cycles\":" << d.direct_scan_wait_cycles
+        << ",\"direct_extra_events\":" << d.direct_extra_events
+        << ",\"direct_extra_cycles\":" << d.direct_extra_cycles
+        << ",\"direct_saved_events\":" << d.direct_saved_events
+        << ",\"direct_saved_cycles\":" << d.direct_saved_cycles
+        << ",\"window_requests\":" << d.window_requests
+        << ",\"barrier_wait_events\":" << d.barrier_wait_events
+        << ",\"barrier_wait_cycles\":" << d.barrier_wait_cycles
+        << ",\"barrier_marginal_events\":" << d.barrier_marginal_events
+        << ",\"barrier_marginal_cycles\":" << d.barrier_marginal_cycles
+        << ",\"ordered_wait_events\":" << d.ordered_wait_events
+        << ",\"ordered_wait_cycles\":" << d.ordered_wait_cycles
+        << ",\"port_wait_events\":" << d.port_wait_events
+        << ",\"port_wait_cycles\":" << d.port_wait_cycles
+        << ",\"capacity_wait_events\":" << d.capacity_wait_events
+        << ",\"capacity_wait_cycles\":" << d.capacity_wait_cycles
+        << ",\"blocker_lifetime_cycles\":" << d.blocker_lifetime_cycles
+        << ",\"blocker_service_cycles\":" << d.blocker_service_cycles
+        << ",\"inherited_barrier_events\":" << d.inherited_barrier_events
+        << ",\"inherited_barrier_cycles\":" << d.inherited_barrier_cycles
+        << ",\"direct_levels\":";array(d.direct_levels);
+    out << ",\"barrier_kinds\":";array(d.barrier_kinds);
+    out << ",\"barrier_wait_by_kind\":";array(d.barrier_wait_by_kind);
+    out << ",\"barrier_marginal_by_kind\":";array(d.barrier_marginal_by_kind);
+    out << ",\"barrier_parent_roles\":";array(d.barrier_parent_roles);
+    out << ",\"barrier_wait_by_parent_role\":";array(d.barrier_wait_by_parent_role);
+    out << ",\"barrier_parent_paths\":";array(d.barrier_parent_paths);
+    out << ",\"barrier_wait_by_parent_path\":";array(d.barrier_wait_by_parent_path);
+    out << ",\"barrier_parent_queue_by_path\":";array(d.barrier_parent_queue_by_path);
+    out << ",\"barrier_parent_response_by_path\":";array(d.barrier_parent_response_by_path);
+    out << ",\"barrier_parent_service_by_path\":";array(d.barrier_parent_service_by_path);
+    out << ",\"blocker_levels\":";array(d.blocker_levels);
+    out << ",\"blocker_paths\":";array(d.blocker_paths);
+    out << ",\"blocker_wait_by_path\":";array(d.blocker_wait_by_path);
+    out << ",\"blocker_wait_by_level\":";array(d.blocker_wait_by_level);
+    out << ",\"blocker_roles\":";array(d.blocker_roles);
+    out << ",\"blocker_wait_by_role\":";array(d.blocker_wait_by_role);
+    out << ",\"blocker_lifetime_buckets\":";array(d.blocker_lifetime_buckets);
+    out << '}';
+}
+
 void write_perf_retirement_counts(std::ostream& out,
                                   const fastsim::PerfRetirementCounts& c,
                                   bool available) {
@@ -687,7 +737,20 @@ void write_user_memory_hierarchy(
 void write_committed_pipeline_audit(
     std::ostream& out,
     const fastsim::CommittedPipelineAuditCounters& audit) {
-    out << "{\"uops\": " << audit.uops
+    out << "{\"spr_rename_gpr_alias\": " << audit.spr_rename_gpr_alias
+        << ", \"spr_rename_xmm_alias\": " << audit.spr_rename_xmm_alias
+        << ", \"spr_rename_zero\": " << audit.spr_rename_zero
+        << ", \"spr_rename_missing\": " << audit.spr_rename_missing
+        << ", \"spr_rename_shape\": " << audit.spr_rename_shape
+        << ", \"spr_rename_pins\": " << audit.spr_rename_pins
+        << ", \"spr_rename_resources\": " << audit.spr_rename_resources
+        << ", \"spr_integer_managed\": " << audit.spr_integer_managed
+        << ", \"spr_integer_generic\": " << audit.spr_integer_generic
+        << ", \"spr_integer_unknown\": " << audit.spr_integer_unknown
+        << ", \"spr_integer_zero_fallback\": " << audit.spr_integer_zero_fallback
+        << ", \"spr_integer_move_fallback\": " << audit.spr_integer_move_fallback
+        << ", \"spr_integer_fusion_fallback\": " << audit.spr_integer_fusion_fallback
+        << ", \"uops\": " << audit.uops
         << ", \"destination_uops\": " << audit.destination_uops
         << ", \"destination_tokens\": " << audit.destination_tokens
         << ", \"destination_release_tokens\": "
@@ -1427,6 +1490,8 @@ std::string stats_json(
     const auto sequencer = stats.total_sequencer();
     fastsim::PendingFillCounters pending_fill;
     for (const auto& counters : stats.pending_fill) pending_fill += counters;
+    fastsim::UnifiedParentCounters unified_parent;
+    for (const auto& counters : stats.unified_parent) unified_parent += counters;
     fastsim::ChaCounters cha_total;
     for (const auto& cha : stats.cha) cha_total += cha;
     fastsim::ChaCounters instruction_cha_total;
@@ -1731,6 +1796,10 @@ std::string stats_json(
                "versus the last scored retirement in common reference time; "
                "does not certify all scored request returns or real workload "
                "termination\",\n"
+            << "    \"scored_uncore_response_scope\": \"accepted scored memory "
+               "events marked as uncore requests by the model; response is "
+               "the modeled shared response in reference time, not complete "
+               "CPU, prefetch, or architectural request coverage\",\n"
             << "    \"all_execution_covers_last_score\": "
             << (stats.all_execution_covers_last_score ? "true" : "false")
             << ",\n"
@@ -1758,6 +1827,15 @@ std::string stats_json(
                 << ", \"executed_user_uops\": " << c.executed_user_uops
                 << ", \"score_cycles\": " << c.score_cycles
                 << ", \"execution_cycles\": " << c.execution_cycles
+                << ", \"begin_retire_reference_q16\": " << c.begin_retire_reference_q16
+                << ", \"end_retire_reference_q16\": " << c.end_retire_reference_q16
+                << ", \"execution_end_reference_q16\": " << c.execution_end_reference_q16
+                << ", \"scored_uncore_requests\": " << c.scored_uncore_requests
+                << ", \"scored_uncore_response_unknown\": " << c.scored_uncore_response_unknown
+                << ", \"last_scored_uncore_response_reference_q16\": "
+                << c.last_scored_uncore_response_reference_q16
+                << ", \"execution_covers_scored_uncore_responses\": "
+                << (c.execution_covers_scored_uncore_responses ? "true" : "false")
                 << ", \"score_closed\": "
                 << (c.score_closed ? "true" : "false")
                 << ", \"execution_covers_last_score\": "
@@ -1878,6 +1956,121 @@ std::string stats_json(
         out << '}';
     }
     out << "]\n  },\n";
+    out << "  \"spr_store_group\": {\"pair_scan_policy\":\"bounded-gap-prefix-v2\",\"candidates\":" << stats.spr_store_group_candidates
+        << ",\"committed\":" << stats.spr_store_group_committed
+        << ",\"committed_members\":" << stats.spr_store_group_committed_members
+        << ",\"size2\":" << stats.spr_store_group_size2
+        << ",\"size3\":" << stats.spr_store_group_size3
+        << ",\"size4\":" << stats.spr_store_group_size4
+        << ",\"permission_fallbacks\":" << stats.spr_store_group_permission_fallbacks
+        << ",\"future_fallbacks\":" << stats.spr_store_group_future_fallbacks
+        << ",\"sync_skipped\":" << stats.spr_store_group_sync_skipped
+        << ",\"fr_discarded_passes\":" << stats.spr_store_group_fr_discarded_passes
+        << ",\"fr_discarded_accepted\":" << stats.spr_store_group_fr_discarded_accepted
+        << ",\"pair_same_core\":" << stats.spr_store_pair_same_core
+        << ",\"pair_both_write\":" << stats.spr_store_pair_both_write
+        << ",\"pair_same_line\":" << stats.spr_store_pair_same_line
+        << ",\"pair_first_uop\":" << stats.spr_store_pair_first_uop
+        << ",\"pair_uop_adjacent\":" << stats.spr_store_pair_uop_adjacent
+        << ",\"pair_gap_nonmemory\":" << stats.spr_store_pair_gap_nonmemory
+        << ",\"pair_same_chunk\":" << stats.spr_store_pair_same_chunk
+        << ",\"pair_ordinary\":" << stats.spr_store_pair_ordinary
+        << ",\"pair_known_facts\":" << stats.spr_store_pair_known_facts
+        << ",\"pair_line_uncontended\":" << stats.spr_store_pair_line_uncontended
+        << ",\"pair_budget_available\":" << stats.spr_store_pair_budget_available
+        << ",\"pair_reject_same_line\":" << stats.spr_store_pair_reject_same_line
+        << ",\"pair_reject_peer_special\":" << stats.spr_store_pair_reject_peer_special
+        << ",\"pair_peer_atomic\":" << stats.spr_store_pair_peer_atomic
+        << ",\"pair_peer_mmio\":" << stats.spr_store_pair_peer_mmio
+        << ",\"pair_peer_noaccess\":" << stats.spr_store_pair_peer_noaccess
+        << ",\"pair_peer_hardware\":" << stats.spr_store_pair_peer_hardware
+        << ",\"pair_peer_precise_fault\":" << stats.spr_store_pair_peer_precise_fault
+        << ",\"pair_peer_serialize\":" << stats.spr_store_pair_peer_serialize
+        << ",\"pair_peer_barrier\":" << stats.spr_store_pair_peer_barrier
+        << ",\"pair_peer_locked\":" << stats.spr_store_pair_peer_locked
+        << ",\"line_own_store\":" << stats.spr_store_line_own_store
+        << ",\"line_own_load\":" << stats.spr_store_line_own_load
+        << ",\"line_own_unknown\":" << stats.spr_store_line_own_unknown
+        << ",\"line_peer\":" << stats.spr_store_line_peer
+        << ",\"line_peer_store\":" << stats.spr_store_line_peer_store
+        << ",\"line_peer_load\":" << stats.spr_store_line_peer_load
+        << ",\"line_peer_unknown\":" << stats.spr_store_line_peer_unknown
+        << ",\"line_all_own_stores\":" << stats.spr_store_line_all_own_stores
+        << ",\"line_run_3\":" << stats.spr_store_line_run_3
+        << ",\"line_run_4\":" << stats.spr_store_line_run_4
+        << ",\"line_prefilter_peer\":" << stats.spr_store_line_prefilter_peer
+        << ",\"line_prefilter_peer_store\":" << stats.spr_store_line_prefilter_peer_store
+        << ",\"line_prefilter_peer_load\":" << stats.spr_store_line_prefilter_peer_load
+        << ",\"line_prefilter_peer_unknown\":" << stats.spr_store_line_prefilter_peer_unknown << "},\n";
+    out << "  \"spr_l1_prefetch\": {\"trained\":" << stats.spr_prefetch_trained
+        << ",\"issued\":" << stats.spr_prefetch_issued
+        << ",\"completed\":" << stats.spr_prefetch_completed
+        << ",\"evictions\":" << stats.spr_prefetch_evictions
+        << ",\"dirty_writebacks\":" << stats.spr_prefetch_dirty_writebacks
+        << ",\"unused_evictions\":" << stats.spr_prefetch_unused_evictions
+        << ",\"resource_wait_cycles\":" << stats.spr_prefetch_resource_wait_cycles
+        << ",\"resource_retries\":" << stats.spr_prefetch_resource_retries
+        << ",\"shared_parent_follows\":" << stats.spr_prefetch_shared_parent_follows
+        << ",\"late_followers\":" << stats.spr_prefetch_l1_late_followers
+        << ",\"unsupported_input\":" << stats.spr_prefetch_unsupported_input
+        << ",\"unsupported_l2_miss\":" << stats.spr_prefetch_unsupported_l2_miss
+        << ",\"cancelled_write\":" << stats.spr_prefetch_cancelled_write
+        << ",\"cancelled_eviction\":" << stats.spr_prefetch_cancelled_eviction
+        << ",\"cancelled_residency\":" << stats.spr_prefetch_cancelled_residency
+        << ",\"capacity_blocked\":" << stats.spr_prefetch_capacity_blocked
+        << ",\"queue_overflow\":" << stats.spr_prefetch_queue_overflow
+        << ",\"pending\":" << stats.spr_prefetch_pending
+        << ",\"queued_pending\":" << stats.spr_prefetch_queued_pending
+        << ",\"stream_hits\":" << stats.spr_prefetch_stream_hits
+        << ",\"stream_stale\":" << stats.spr_prefetch_stream_stale
+        << ",\"stream_replaced\":" << stats.spr_prefetch_stream_replaced
+        << ",\"stream_consumed_not_used\":" << stats.spr_prefetch_stream_consumed_not_used
+        << ",\"suppressed\":" << stats.spr_prefetch_suppressed
+        << ",\"source_unready\":" << stats.spr_prefetch_source_unready
+        << ",\"skipped_dirty_victim\":" << stats.spr_prefetch_dirty_victim
+        << ",\"dram_repair_skipped_epochs\":" << stats.spr_prefetch_dram_repair_skipped_epochs << "},\n";
+    out << "  \"spr_l2_shared_prefetch\": {\"trained\":" << stats.spr_l2_shared_prefetch_trained
+        << ",\"issued\":" << stats.spr_l2_shared_prefetch_issued
+        << ",\"dram_reads\":" << stats.spr_l2_shared_prefetch_dram_reads
+        << ",\"unused_evictions\":" << stats.spr_l2_prefetch_unused_evictions
+        << ",\"completed\":" << stats.spr_l2_shared_prefetch_completed
+        << ",\"followed\":" << stats.spr_l2_prefetch_followed
+        << ",\"llc_issued\":" << stats.spr_l2_prefetch_llc_issued
+        << ",\"demand_fill_dropped\":" << stats.spr_l2_prefetch_demand_fill_dropped
+        << ",\"source_waits\":" << stats.spr_l2_prefetch_source_waits
+        << ",\"source_unresolved_dropped\":" << stats.spr_l2_prefetch_source_unresolved_dropped
+        << ",\"store_line_skipped\":" << stats.spr_l2_prefetch_store_line_skipped
+        << ",\"suppressed\":" << stats.spr_l2_prefetch_suppressed
+        << ",\"cancelled_demand\":" << stats.spr_l2_shared_prefetch_cancelled_demand
+        << ",\"cancelled_state\":" << stats.spr_l2_shared_prefetch_cancelled_state
+        << ",\"cancelled_cross_core\":" << stats.spr_l2_shared_prefetch_cancelled_cross_core
+        << ",\"cancelled_write\":" << stats.spr_l2_shared_prefetch_cancelled_write
+        << ",\"dirty_writebacks\":" << stats.spr_l2_shared_prefetch_dirty_writebacks
+        << ",\"initial_pending\":" << stats.spr_l2_shared_prefetch_initial_pending
+        << ",\"pending\":" << stats.spr_l2_shared_prefetch_pending
+        << ",\"clamped_events\":" << stats.spr_l2_shared_prefetch_clamped_events
+        << ",\"skipped_past_frontier\":" << stats.spr_l2_shared_prefetch_skipped_past_frontier
+        << ",\"clamped_cycles\":" << stats.spr_l2_shared_prefetch_clamped_cycles
+        << ",\"unsupported_input\":" << stats.spr_l2_shared_prefetch_unsupported_input
+        << ",\"queue_overflow\":" << stats.spr_l2_shared_prefetch_queue_overflow
+        << ",\"queued_pending\":" << stats.spr_l2_shared_prefetch_queued_pending
+        << ",\"dropped\":" << stats.spr_l2_shared_prefetch_dropped << "},\n";
+    out << "  \"spr_l2_llc_resident_prefetch\": {\"issued\":" << stats.spr_l2_llc_prefetch_issued
+        << ",\"completed\":" << stats.spr_l2_llc_prefetch_completed
+        << ",\"skipped_llc_missing\":" << stats.spr_l2_llc_prefetch_missing
+        << ",\"skipped_uncertified\":" << stats.spr_l2_llc_prefetch_uncertified
+        << ",\"skipped_private\":" << stats.spr_l2_llc_prefetch_private
+        << ",\"skipped_duplicate\":" << stats.spr_l2_llc_prefetch_duplicate
+        << ",\"skipped_capacity\":" << stats.spr_l2_llc_prefetch_capacity
+        << ",\"skipped_dirty_victim\":" << stats.spr_l2_llc_prefetch_dirty_victim
+        << ",\"cancelled\":" << stats.spr_l2_llc_prefetch_cancelled
+        << ",\"cancelled_source\":" << stats.spr_l2_llc_prefetch_cancelled_source
+        << ",\"cancelled_permission\":" << stats.spr_l2_llc_prefetch_cancelled_permission
+        << ",\"cancelled_write\":" << stats.spr_l2_llc_prefetch_cancelled_write
+        << ",\"cancelled_demand\":" << stats.spr_l2_llc_prefetch_cancelled_demand
+        << ",\"initial_pending\":" << stats.spr_l2_llc_prefetch_initial_pending
+        << ",\"pending\":" << stats.spr_l2_llc_prefetch_pending
+        << ",\"dram_requests\":" << stats.spr_l2_llc_prefetch_dram_requests << "},\n";
     out << "  \"configuration\": {\n";
     out << "    \"measurement_scope\": \""
         << fastsim::measurement_scope_name(config.measurement_scope)
@@ -2008,6 +2201,55 @@ std::string stats_json(
         << config.fetch_queue_entries << ",\n";
     out << "    \"rob_entries\": " << config.rob_entries << ",\n";
     out << "    \"iq_entries\": " << config.iq_entries << ",\n";
+    out << "    \"spr_l1_prefetch_l2_only\": "
+        << (config.spr_l1_prefetch_l2_only ? "true" : "false") << ",\n";
+    out << "    \"spr_l1_prefetch_stream_hits\": "
+        << (config.spr_l1_prefetch_stream_hits ? "true" : "false") << ",\n";
+    out << "    \"spr_l1_prefetch_line_marks\": "
+        << (config.spr_l1_prefetch_line_marks ? "true" : "false") << ",\n";
+    out << "    \"spr_l1_prefetch_suppress_issue\": "
+        << (config.spr_l1_prefetch_suppress_issue ? "true" : "false") << ",\n";
+    out << "    \"spr_l2_llc_resident_prefetch\": "
+        << (config.spr_l2_llc_resident_prefetch ? "true" : "false") << ",\n";
+    out << "    \"spr_resident_prefetch_preview_bypassed\": "
+        << (config.spr_l2_llc_resident_prefetch && config.interval_private_preview ? "true" : "false") << ",\n";
+    out << "    \"spr_prefetch_host_inflight_per_core\": " << config.spr_prefetch_host_inflight_per_core << ",\n";
+    out << "    \"spr_prefetch_host_queue_per_core\": " << config.spr_prefetch_host_queue_per_core << ",\n";
+    out << "    \"spr_store_window_feedback\": "
+        << (config.spr_store_window_feedback ? "true" : "false") << ",\n";
+    out << "    \"spr_store_group_merge\": "
+        << (config.spr_store_group_merge ? "true" : "false") << ",\n";
+    out << "    \"spr_store_multi_group\": "
+        << (config.spr_store_multi_group ? "true" : "false") << ",\n";
+    out << "    \"spr_dtlb_stlb_proxy\": "
+        << (config.spr_dtlb_stlb_proxy ? "true" : "false") << ",\n";
+    out << "    \"spr_id_stlb_retired_order\": "
+        << (config.spr_id_stlb_retired_order ? "true" : "false") << ",\n";
+    out << "    \"spr_id_stlb_allow_global\": "
+        << (config.spr_id_stlb_allow_global ? "true" : "false") << ",\n";
+    out << "    \"spr_id_stlb_allow_large\": "
+        << (config.spr_id_stlb_allow_large ? "true" : "false") << ",\n";
+    out << "    \"spr_itlb_stlb_hit_latency\": " << config.spr_itlb_stlb_hit_latency << ",\n";
+    out << "    \"spr_dtlb_stlb_hit_latency\": " << config.spr_dtlb_stlb_hit_latency << ",\n";
+    out << "    \"spr_stlb_index_shift\": " << config.spr_stlb_index_shift << ",\n";
+    out << "    \"spr_itlb_fixed_4k_entries\": 256,\n";
+    out << "    \"spr_itlb_fixed_4k_ways\": 8,\n";
+    out << "    \"spr_store_sq_join_credit_proxy\": "
+        << (config.spr_store_sq_join_credit_proxy ? "true" : "false") << ",\n";
+    out << "    \"spr_store_window_lines\": " << config.spr_store_window_lines << ",\n";
+    out << "    \"spr_load_bank_feedback\": "
+        << (config.spr_load_bank_feedback ? "true" : "false") << ",\n";
+    out << "    \"spr_load_port_fallback_proxy\": "
+        << (config.spr_load_port_fallback_proxy ? "true" : "false") << ",\n";
+    out << "    \"spr_load_fill_feedback\": "
+        << (config.spr_load_fill_feedback ? "true" : "false") << ",\n";
+    out << "    \"spr_l1d_fill_entries\": " << config.spr_l1d_fill_entries << ",\n";
+    out << "    \"spr_l2_fill_entries\": " << config.spr_l2_fill_entries << ",\n";
+    out << "    \"spr_partitioned_iq\": "
+        << (config.spr_partitioned_iq ? "true" : "false") << ",\n";
+    out << "    \"spr_execution_iq_entries\": " << config.spr_execution_iq_entries << ",\n";
+    out << "    \"spr_memory_iq_entries\": " << config.spr_memory_iq_entries << ",\n";
+    out << "    \"spr_store_data_iq_entries\": " << config.spr_store_data_iq_entries << ",\n";
     out << "    \"lq_entries\": " << config.lq_entries << ",\n";
     out << "    \"sq_entries\": " << config.effective_sq_entries() << ",\n";
     out << "    \"configured_sq_entries\": " << config.sq_entries << ",\n";
@@ -2108,6 +2350,8 @@ std::string stats_json(
         << ",\n";
     out << "    \"response_pending_fill\": "
         << (config.response_pending_fill ? "true" : "false") << ",\n";
+    out << "    \"unified_parent_service\": \"" << config.unified_parent_service << "\",\n";
+    out << "    \"unified_parent_service_capacity\": " << config.unified_parent_service_capacity << ",\n";
     out << "    \"response_pending_fill_wait\": "
         << (config.response_pending_fill_wait ? "true" : "false") << ",\n";
     out << "    \"response_pending_fill_load_admission\": "
@@ -2181,6 +2425,10 @@ std::string stats_json(
     out << "    \"buffer_tso_prepare_lifecycle\": "
         << (config.buffer_tso_prepare_lifecycle ? "true" : "false")
         << ",\n";
+    out << "    \"legacy_prepare_timing\": " << (config.legacy_prepare_timing_enabled() ? "true" : "false") << ",\n";
+    out << "    \"legacy_prepare_timing_policy\": \"" << (config.legacy_prepare_timing.has_value() ? "explicit" : "auto-compatible") << "\",\n";
+    out << "    \"legacy_prepare_credits\": " << config.legacy_prepare_credits << ",\n";
+    out << "    \"legacy_prepare_contract\": \"timing-only-single-cache-replay\",\n";
     out << "    \"store_private_callback_timing\": "
         << (config.store_private_callback_timing ? "true" : "false")
         << ",\n";
@@ -2190,6 +2438,21 @@ std::string stats_json(
         << ",\n";
     out << "    \"spr_shared_fu\": "
         << (config.spr_shared_fu ? "true" : "false") << ",\n";
+    out << "    \"spr_shared_fu_generic_latency\": "
+        << (config.spr_shared_fu_generic_latency ? "true" : "false") << ",\n";
+    out << "    \"spr_shared_fu_gap_aware\": "
+        << (config.spr_shared_fu_gap_aware ? "true" : "false") << ",\n";
+    out << "    \"spr_shared_fu_round_robin\": "
+        << (config.spr_shared_fu_round_robin ? "true" : "false") << ",\n";
+    out << "    \"spr_integer_family_enabled\": "
+        << (config.spr_integer_family_enabled ? "true" : "false") << ",\n";
+    out << "    \"spr_rename_elimination\": "
+        << (config.spr_rename_elimination ? "true" : "false") << ",\n"
+        << "    \"spr_rename_policy_sha256\": \"" << config.spr_rename_policy_sha256 << "\",\n";
+    out << "    \"spr_integer_family_resources_verified\": "
+        << (config.spr_integer_family_resources_verified ? "true" : "false") << ",\n";
+    out << "    \"spr_integer_family_policy_sha256\": \""
+        << config.spr_integer_family_policy_sha256 << "\",\n";
     out << "    \"integer_alu_units\": "
         << config.integer_alu_units << ",\n";
     out << "    \"integer_multiply_units\": "
@@ -2320,6 +2583,8 @@ std::string stats_json(
     out << "    \"ruby_sequencer_load_admission\": "
         << (config.ruby_sequencer_load_admission ? "true" : "false")
         << ",\n";
+    out << "    \"ruby_sequencer_ifetch_admission\": "
+        << (config.ruby_sequencer_ifetch_admission ? "true" : "false") << ",\n";
     out << "    \"memory_exposure\": " << config.memory_exposure << ",\n";
     out << "    \"mlp_exposure_relief\": " << config.mlp_exposure_relief
         << ",\n";
@@ -2515,6 +2780,7 @@ std::string stats_json(
         << (config.dram.frfcfs_causal_selection ? "true" : "false")
         << ", \"frfcfs_passes\": "
         << config.dram.frfcfs_passes
+        << ", \"frfcfs_passes_policy\": \"single-forecast; legacy buffer-service work budget may still use configured value\""
         << ", \"frfcfs_arrival_bucket_cycles\": "
         << config.dram.frfcfs_arrival_bucket_cycles
         << ", \"max_accesses_per_row\": "
@@ -2598,6 +2864,27 @@ std::string stats_json(
         << stats.functional_warmup_memory_events << ",\n";
     out << "    \"functional_warmup_barrier_cycles\": "
         << stats.functional_warmup_barrier_cycles << ",\n";
+    out << "    \"functional_warmup_spr_store_group_candidates\": "
+        << stats.functional_warmup_spr_store_group_candidates << ",\n";
+    out << "    \"functional_warmup_spr_store_group_committed\": "
+        << stats.functional_warmup_spr_store_group_committed << ",\n";
+    out << "    \"functional_warmup_spr_store_group_future_fallbacks\": "
+        << stats.functional_warmup_spr_store_group_future_fallbacks << ",\n";
+    out << "    \"functional_warmup_store_credits_live\": "
+        << stats.functional_warmup_store_credits_live << ",\n";
+    out << "    \"functional_warmup_store_credit_next_release\": "
+        << stats.functional_warmup_store_credit_next_release << ",\n";
+    out << "    \"functional_warmup_store_credits_live_by_core\": [";
+    for (std::size_t i=0; i<stats.functional_warmup_store_credits_live_by_core.size(); ++i) {
+        if (i) out << ',';
+        out << stats.functional_warmup_store_credits_live_by_core[i];
+    }
+    out << "],\n    \"functional_warmup_store_credit_next_release_by_core\": [";
+    for (std::size_t i=0; i<stats.functional_warmup_store_credit_next_release_by_core.size(); ++i) {
+        if (i) out << ',';
+        out << stats.functional_warmup_store_credit_next_release_by_core[i];
+    }
+    out << "],\n";
     out << "    \"measurement_boundary_memory_state_enabled\": "
         << (stats.measurement_boundary_memory_state_enabled
                 ? "true"
@@ -2616,6 +2903,14 @@ std::string stats_json(
     out << "    \"buffer_tso_prepares\": " << total.buffer_tso_prepares << ",\n";
     out << "    \"buffer_tso_head_demands\": " << total.buffer_tso_head_demands << ",\n";
     out << "    \"buffer_tso_merged_demands\": " << total.buffer_tso_merged_demands << ",\n";
+    out << "    \"legacy_prepare_accepted_estimate\": " << total.legacy_prepare_accepted << ",\n";
+    out << "    \"legacy_prepare_dropped_estimate\": " << total.legacy_prepare_dropped << ",\n";
+    out << "    \"legacy_prepare_direct_estimate\": " << total.legacy_prepare_direct << ",\n";
+    out << "    \"legacy_prepare_takeover_estimate\": " << total.legacy_prepare_takeover << ",\n";
+    out << "    \"legacy_prepare_ready_estimate\": " << total.legacy_prepare_ready << ",\n";
+    out << "    \"legacy_prepare_diagnostics\": ";
+    write_legacy_prepare_diagnostics(out,total.legacy_prepare_diagnostics);
+    out << ",\n";
     out << "    \"forwarded_loads\": " << total.forwarded_loads << ",\n";
     out << "    \"mmio_escape_accesses\": "
         << total.mmio_escape_accesses << ",\n";
@@ -3464,6 +3759,7 @@ std::string stats_json(
     out << "    \"l1d_prepare_misses\": " << total.l1d_prepare_misses << ",\n";
     out << "    \"l1d_evictions\": " << total.l1d.evictions << ",\n";
     out << "    \"l1d_writebacks\": " << total.l1d.writebacks << ",\n";
+    out << "    \"l1d_unused_prefetch_evictions\": " << total.l1d.unused_prefetch_evictions << ",\n";
     out << "    \"instruction_l2_accesses\": "
         << total.instruction_l2.accesses << ",\n";
     out << "    \"instruction_l2_hits\": "
@@ -3497,6 +3793,7 @@ std::string stats_json(
         << total.perf_deferred_install_timing_events << ",\n";
     out << "    \"l2_evictions\": " << total.l2.evictions << ",\n";
     out << "    \"l2_writebacks\": " << total.l2.writebacks << ",\n";
+    out << "    \"l2_unused_prefetch_evictions\": " << total.l2.unused_prefetch_evictions << ",\n";
     out << "    \"dtlb_accesses\": " << total.dtlb.accesses << ",\n";
     out << "    \"dtlb_hits\": " << total.dtlb.hits << ",\n";
     out << "    \"dtlb_misses\": " << total.dtlb.misses << ",\n";
@@ -3507,6 +3804,16 @@ std::string stats_json(
         << (total.dtlb.conserved() ? "true" : "false") << ",\n";
     out << "    \"dtlb_timing_accesses\": "
         << total.dtlb_timing.accesses << ",\n";
+    out << "    \"spr_dtlb_stlb_hits\": " << total.spr_dtlb_stlb_hits << ",\n";
+    out << "    \"spr_dtlb_stlb_misses\": " << total.spr_dtlb_stlb_misses << ",\n";
+    out << "    \"spr_dtlb_stlb_fallbacks\": " << total.spr_dtlb_stlb_fallbacks << ",\n";
+    out << "    \"spr_dtlb_stlb_flushes\": " << total.spr_dtlb_stlb_flushes << ",\n";
+    out << "    \"spr_dtlb_stlb_missing_controls\": " << total.spr_dtlb_stlb_missing_controls << ",\n";
+    out << "    \"spr_dtlb_stlb_unqualified_boundary\": " << total.spr_dtlb_stlb_unqualified_boundary << ",\n";
+    out << "    \"spr_itlb_hits\": " << total.spr_itlb_hits << ",\n";
+    out << "    \"spr_itlb_stlb_hits\": " << total.spr_itlb_stlb_hits << ",\n";
+    out << "    \"spr_itlb_stlb_misses\": " << total.spr_itlb_stlb_misses << ",\n";
+    out << "    \"spr_itlb_unknown\": " << total.spr_itlb_unknown << ",\n";
     out << "    \"dtlb_timing_hits\": "
         << total.dtlb_timing.hits << ",\n";
     out << "    \"dtlb_timing_misses\": "
@@ -3574,6 +3881,30 @@ std::string stats_json(
         << total.dtlb_timing.walk_delay_cycles << ",\n";
     out << "    \"o3_iq_full_events\": "
         << o3.iq_full_events << ",\n";
+    out << "    \"spr_load_port_fallbacks\": " << o3.spr_load_port_fallbacks << ",\n";
+    out << "    \"spr_load_port_packets\": " << o3.spr_load_port_packets << ",\n";
+    out << "    \"spr_load_port_waits\": " << o3.spr_load_port_waits << ",\n";
+    out << "    \"spr_load_port_proxy_fragments\": " << o3.spr_load_port_proxy_fragments << ",\n";
+    out << "    \"spr_load_port_proxy_waits\": " << o3.spr_load_port_proxy_waits << ",\n";
+    out << "    \"spr_bank_packets\": " << o3.spr_bank_packets << ",\n";
+    out << "    \"spr_bank_waits\": " << o3.spr_bank_waits << ",\n";
+    out << "    \"spr_load_port_bank_wait_cycles\": " << o3.spr_load_port_bank_wait_cycles << ",\n";
+    out << "    \"spr_bank_fallbacks\": " << o3.spr_bank_fallbacks << ",\n";
+    out << "    \"spr_store_window_admitted\": " << o3.spr_store_window_admitted << ",\n";
+    out << "    \"spr_prefetch_store_frontier_clamps\": " << o3.spr_prefetch_store_frontier_clamps << ",\n";
+    out << "    \"spr_prefetch_store_frontier_cycles\": " << o3.spr_prefetch_store_frontier_cycles << ",\n";
+    out << "    \"spr_store_budget_waits\": " << o3.spr_store_budget_waits << ",\n";
+    out << "    \"spr_store_budget_wait_cycles\": " << o3.spr_store_budget_wait_cycles << ",\n";
+    out << "    \"spr_store_budget_frontier_clamps\": " << o3.spr_store_budget_frontier_clamps << ",\n";
+    out << "    \"spr_store_window_fallbacks\": " << o3.spr_store_window_fallbacks << ",\n";
+    out << "    \"spr_store_sq_joined\": " << o3.spr_store_sq_joined << ",\n";
+    out << "    \"spr_store_sq_credit_saved_cycles\": " << o3.spr_store_sq_credit_saved_cycles << ",\n";
+    out << "    \"spr_fill_uncertified_fallbacks\": " << o3.spr_fill_uncertified_fallbacks << ",\n";
+    out << "    \"spr_fill_candidates\": " << o3.spr_fill_candidates << ",\n";
+    out << "    \"spr_fill_calendar_fallbacks\": " << o3.spr_fill_calendar_fallbacks << ",\n";
+    out << "    \"spr_fill_extension_conflicts\": " << o3.spr_fill_extension_conflicts << ",\n";
+    out << "    \"spr_l1_fill_waits\": " << o3.spr_l1_fill_waits << ",\n";
+    out << "    \"spr_l2_fill_waits\": " << o3.spr_l2_fill_waits << ",\n";
     out << "    \"o3_iq_stall_cycles\": "
         << o3.iq_stall_cycles << ",\n";
     out << "    \"o3_iq_max_occupancy\": "
@@ -3658,6 +3989,11 @@ std::string stats_json(
         << sequencer.buffer_full_stalls << ",\n";
     out << "    \"ruby_sequencer_stall_cycles\": "
         << sequencer.stall_cycles << ",\n";
+    out << "    \"ruby_sequencer_ifetch_requests\": " << sequencer.ifetch_requests << ",\n";
+    out << "    \"ruby_sequencer_ifetch_buffer_full_stalls\": " << sequencer.ifetch_buffer_full_stalls << ",\n";
+    out << "    \"ruby_sequencer_ifetch_stall_cycles\": " << sequencer.ifetch_stall_cycles << ",\n";
+    out << "    \"ruby_sequencer_acceptance_frontier_clamps\": " << sequencer.acceptance_frontier_clamps << ",\n";
+    out << "    \"ruby_sequencer_acceptance_frontier_clamp_cycles\": " << sequencer.acceptance_frontier_clamp_cycles << ",\n";
     out << "    \"ruby_sequencer_max_outstanding\": "
         << sequencer.max_outstanding << ",\n";
     out << "    \"ruby_sequencer_coalesced_requests\": "
@@ -3800,6 +4136,77 @@ std::string stats_json(
         << ", \"stores_waiting_for_fill\": " << pending_fill.stores_waiting_for_fill
         << ", \"carried_parents\": " << pending_fill.carried_parents
         << ", \"max_entries\": " << pending_fill.max_entries << "},\n";
+    out << "  \"unified_parent_service\": {"
+        << "\"schema\": \"fastsim-parent-service-private-v2-r01\""
+        << ", \"scope\": \"certified-local-read-and-selected-prepare-service\""
+        << ", \"lease_policy\": \"legacy-checkpoint-and-certified-service-owned-tbe-fill\""
+        << ", \"transaction_policy\": \"bounded-index-page-copy-on-write-record-block-copy-on-write\""
+        << ", \"record_bytes\": " << sizeof(fastsim::ParentServicePool::Record)
+        << ", \"time_policy\": \"reference-frequency-selected-integer-boundaries\""
+        << ", \"lower_completion_split\": \"certified-prepare-only\""
+        << ", \"resource_admission\": \"frozen-monotone-fit-or-explicit-source-fallback\""
+        << ", \"shared_owner_migrated\": false"
+        << ", \"prefetch_owner_migrated\": false"
+        << ", \"requests\": " << unified_parent.requests
+        << ", \"ordinary_reads\": " << unified_parent.ordinary_reads
+        << ", \"services\": " << unified_parent.services
+        << ", \"certified_services\": " << unified_parent.certified_services
+        << ", \"followers\": " << unified_parent.followers
+        << ", \"waits\": " << unified_parent.waits
+        << ", \"wait_cycles\": " << unified_parent.wait_cycles
+        << ", \"max_wait_cycles\": " << unified_parent.max_wait_cycles
+        << ", \"future_fallbacks\": " << unified_parent.future_fallbacks
+        << ", \"source_fallbacks\": " << unified_parent.source_fallbacks
+        << ", \"special_fallbacks\": " << unified_parent.special_fallbacks
+        << ", \"capacity_fallbacks\": " << unified_parent.capacity_fallbacks
+        << ", \"carried\": " << unified_parent.carried
+        << ", \"max_records\": " << unified_parent.max_records
+        << ", \"prepare_fetches\": " << unified_parent.prepare_fetches
+        << ", \"prepare_upgrades\": " << unified_parent.prepare_upgrades
+        << ", \"prepare_no_transaction\": " << unified_parent.prepare_no_transaction
+        << ", \"prepare_unknown\": " << unified_parent.prepare_unknown
+        << ", \"prepare_attaches\": " << unified_parent.prepare_attaches
+        << ", \"store_takeovers\": " << unified_parent.store_takeovers
+        << ", \"controller_waits\": " << unified_parent.controller_waits
+        << ", \"controller_wait_cycles\": " << unified_parent.controller_wait_cycles
+        << ", \"data_waits\": " << unified_parent.data_waits
+        << ", \"data_wait_cycles\": " << unified_parent.data_wait_cycles
+        << ", \"legacy_coupled_services\": " << unified_parent.legacy_coupled_services
+        << ", \"split_services\": " << unified_parent.split_services
+        << ", \"resource_source_fallbacks\": " << unified_parent.resource_source_fallbacks
+        << ", \"tbe_allocations\": " << unified_parent.tbe_allocations
+        << ", \"fill_allocations\": " << unified_parent.fill_allocations
+        << ", \"credit_releases\": " << unified_parent.credit_releases
+        << ", \"copied_record_blocks\": " << unified_parent.copied_record_blocks
+        << ", \"copied_index_pages\": " << unified_parent.copied_index_pages
+        << ", \"copied_index_directories\": " << unified_parent.copied_index_directories
+        << ", \"copied_index_bytes\": " << unified_parent.copied_index_bytes
+        << ", \"line_index_rebuilds\": " << unified_parent.line_index_rebuilds
+        << ", \"hit_fast_returns\": " << unified_parent.hit_fast_returns
+        << ", \"index_copy_scope\": \"committed-feedback-branch-only\""
+        << ", \"estimated_time_edges_active\": false"
+        << ", \"source_ledger\": {\"scope\": \"new-service-source-candidates-excludes-existing-attachments\""
+        << ", \"roles\": [\"load\", \"prepare\", \"store\"]"
+        << ", \"actions\": [\"unknown\", \"none\", \"fetch_shared\", \"fetch_exclusive\", \"upgrade\", \"reserved\"]"
+        << ", \"decisions\": [\"accepted\", \"target_unknown\", \"action_unknown\", \"carried\", \"admission_mismatch\","
+           "\"lower_missing\", \"before_admission\", \"after_legacy_done\", \"unsupported_action\","
+           "\"callback_before_selected\", \"resource_nonmonotone\", \"resource_capacity\", \"host_capacity\"]"
+        << ", \"counts\": [";
+    for (std::size_t role=0;role<3;++role) {
+        if (role) out << ',';
+        out << '[';
+        for (std::size_t action=0;action<6;++action) {
+            if (action) out << ',';
+            out << '[';
+            for (std::size_t decision=0;decision<fastsim::UnifiedParentCounters::source_decisions;++decision) {
+                if (decision) out << ',';
+                out << unified_parent.source_ledger[role][action][decision];
+            }
+            out << ']';
+        }
+        out << ']';
+    }
+    out << "]}},\n";
     out << "  \"causal_frontier\": {\n";
     out << "    \"chunks_consumed\": " << stats.chunks_consumed << ",\n";
     out << "    \"frontier_waits\": " << stats.frontier_waits << ",\n";
@@ -4132,8 +4539,17 @@ std::string stats_json(
         << stats.dram_frfcfs_effective_selection_window << ",\n";
     out << "    \"dram_frfcfs_stable_epochs\": "
         << stats.dram_frfcfs_stable_epochs << ",\n";
+    out << "    \"dram_frfcfs_stable_semantics\": \"accepted-single-pass-forecast-not-convergence\",\n";
+    out << "    \"dram_frfcfs_single_pass_epochs\": "
+        << stats.dram_frfcfs_single_pass_epochs << ",\n";
     out << "    \"dram_frfcfs_fallback_epochs\": "
         << stats.dram_frfcfs_fallback_epochs << ",\n";
+    out << "    \"dram_frfcfs_fallback_nonreplayable_epochs\": "
+        << stats.dram_frfcfs_fallback_nonreplayable_epochs << ",\n";
+    out << "    \"dram_frfcfs_fallback_credit_epochs\": "
+        << stats.dram_frfcfs_fallback_credit_epochs << ",\n";
+    out << "    \"dram_frfcfs_fallback_visibility_epochs\": "
+        << stats.dram_frfcfs_fallback_visibility_epochs << ",\n";
     out << "    \"dram_frfcfs_requests\": "
         << stats.dram_frfcfs_requests << ",\n";
     out << "    \"dram_frfcfs_passes\": "
@@ -4521,7 +4937,14 @@ std::string stats_json(
             << ", \"buffer_tso_prepares\": " << c.buffer_tso_prepares
             << ", \"buffer_tso_head_demands\": " << c.buffer_tso_head_demands
             << ", \"buffer_tso_merged_demands\": " << c.buffer_tso_merged_demands
-            << ", \"forwarded_loads\": " << c.forwarded_loads
+            << ", \"legacy_prepare_accepted_estimate\": " << c.legacy_prepare_accepted
+            << ", \"legacy_prepare_dropped_estimate\": " << c.legacy_prepare_dropped
+            << ", \"legacy_prepare_direct_estimate\": " << c.legacy_prepare_direct
+            << ", \"legacy_prepare_takeover_estimate\": " << c.legacy_prepare_takeover
+            << ", \"legacy_prepare_ready_estimate\": " << c.legacy_prepare_ready
+            << ", \"legacy_prepare_diagnostics\": ";
+        write_legacy_prepare_diagnostics(out,c.legacy_prepare_diagnostics);
+        out << ", \"forwarded_loads\": " << c.forwarded_loads
             << ", \"perf_deferred_install_timing_events\": "
             << c.perf_deferred_install_timing_events
             << ", \"mmio_escape_accesses\": "
@@ -5116,6 +5539,16 @@ std::string stats_json(
             << (c.dtlb.conserved() ? "true" : "false")
             << ", \"dtlb_timing_accesses\": "
             << c.dtlb_timing.accesses
+            << ", \"spr_dtlb_stlb_hits\": " << c.spr_dtlb_stlb_hits
+            << ", \"spr_dtlb_stlb_misses\": " << c.spr_dtlb_stlb_misses
+            << ", \"spr_dtlb_stlb_fallbacks\": " << c.spr_dtlb_stlb_fallbacks
+            << ", \"spr_dtlb_stlb_flushes\": " << c.spr_dtlb_stlb_flushes
+            << ", \"spr_dtlb_stlb_missing_controls\": " << c.spr_dtlb_stlb_missing_controls
+            << ", \"spr_dtlb_stlb_unqualified_boundary\": " << c.spr_dtlb_stlb_unqualified_boundary
+            << ", \"spr_itlb_hits\": " << c.spr_itlb_hits
+            << ", \"spr_itlb_stlb_hits\": " << c.spr_itlb_stlb_hits
+            << ", \"spr_itlb_stlb_misses\": " << c.spr_itlb_stlb_misses
+            << ", \"spr_itlb_unknown\": " << c.spr_itlb_unknown
             << ", \"dtlb_timing_hits\": " << c.dtlb_timing.hits
             << ", \"dtlb_timing_misses\": " << c.dtlb_timing.misses
             << ", \"dtlb_timing_merged_misses\": "
@@ -5160,6 +5593,30 @@ std::string stats_json(
             << ", \"dtlb_walk_delay_cycles\": "
             << c.dtlb_timing.walk_delay_cycles
             << ", \"o3_iq_full_events\": " << q.iq_full_events
+            << ", \"spr_load_port_fallbacks\": " << q.spr_load_port_fallbacks
+            << ", \"spr_load_port_packets\": " << q.spr_load_port_packets
+            << ", \"spr_load_port_waits\": " << q.spr_load_port_waits
+            << ", \"spr_load_port_proxy_fragments\": " << q.spr_load_port_proxy_fragments
+            << ", \"spr_load_port_proxy_waits\": " << q.spr_load_port_proxy_waits
+            << ", \"spr_bank_packets\": " << q.spr_bank_packets
+            << ", \"spr_bank_waits\": " << q.spr_bank_waits
+            << ", \"spr_load_port_bank_wait_cycles\": " << q.spr_load_port_bank_wait_cycles
+            << ", \"spr_bank_fallbacks\": " << q.spr_bank_fallbacks
+            << ", \"spr_store_window_admitted\": " << q.spr_store_window_admitted
+            << ", \"spr_prefetch_store_frontier_clamps\": " << q.spr_prefetch_store_frontier_clamps
+            << ", \"spr_prefetch_store_frontier_cycles\": " << q.spr_prefetch_store_frontier_cycles
+            << ", \"spr_store_budget_waits\": " << q.spr_store_budget_waits
+            << ", \"spr_store_budget_wait_cycles\": " << q.spr_store_budget_wait_cycles
+            << ", \"spr_store_budget_frontier_clamps\": " << q.spr_store_budget_frontier_clamps
+            << ", \"spr_store_window_fallbacks\": " << q.spr_store_window_fallbacks
+            << ", \"spr_store_sq_joined\": " << q.spr_store_sq_joined
+            << ", \"spr_store_sq_credit_saved_cycles\": " << q.spr_store_sq_credit_saved_cycles
+            << ", \"spr_fill_uncertified_fallbacks\": " << q.spr_fill_uncertified_fallbacks
+            << ", \"spr_fill_candidates\": " << q.spr_fill_candidates
+            << ", \"spr_fill_calendar_fallbacks\": " << q.spr_fill_calendar_fallbacks
+            << ", \"spr_fill_extension_conflicts\": " << q.spr_fill_extension_conflicts
+            << ", \"spr_l1_fill_waits\": " << q.spr_l1_fill_waits
+            << ", \"spr_l2_fill_waits\": " << q.spr_l2_fill_waits
             << ", \"o3_iq_stall_cycles\": " << q.iq_stall_cycles
             << ", \"o3_iq_max_occupancy\": "
             << q.iq_max_occupancy
@@ -5210,6 +5667,11 @@ std::string stats_json(
             << s.buffer_full_stalls
             << ", \"ruby_sequencer_stall_cycles\": "
             << s.stall_cycles
+            << ", \"ruby_sequencer_ifetch_requests\": " << s.ifetch_requests
+            << ", \"ruby_sequencer_ifetch_buffer_full_stalls\": " << s.ifetch_buffer_full_stalls
+            << ", \"ruby_sequencer_ifetch_stall_cycles\": " << s.ifetch_stall_cycles
+            << ", \"ruby_sequencer_acceptance_frontier_clamps\": " << s.acceptance_frontier_clamps
+            << ", \"ruby_sequencer_acceptance_frontier_clamp_cycles\": " << s.acceptance_frontier_clamp_cycles
             << ", \"ruby_sequencer_max_outstanding\": "
             << s.max_outstanding
             << ", \"ruby_sequencer_coalesced_requests\": "
@@ -5795,9 +6257,27 @@ int simulate(const Args& args) {
         if(!input_identity)throw std::runtime_error("LLC audit requires --perf-cache-input-identity true");
         fastsim::llcaudit::source_identity()=input_identity->source_identity;
     }
+    bool preload_validated = true;
+    if (const char* value = std::getenv("FASTSIM_PRELOAD_VALIDATED")) {
+        const std::string setting(value);
+        if (setting != "0" && setting != "1")
+            throw std::invalid_argument("FASTSIM_PRELOAD_VALIDATED must be 0 or 1");
+        preload_validated = setting == "1";
+    }
+    preload_validated = boolean(args, "preload-validated-input", preload_validated);
+    const auto trace_prepare_start = std::chrono::steady_clock::now();
     auto traces =
-        fastsim::open_trace_manifest(manifest_path, config.cores);
+        fastsim::open_trace_manifest(manifest_path, config.cores, preload_validated);
+    const auto trace_prepare_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - trace_prepare_start).count();
+    const auto simulator_init_start = std::chrono::steady_clock::now();
     fastsim::Simulator simulator(config, std::move(traces));
+    const auto simulator_init_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - simulator_init_start).count();
+    std::cerr << "HOST_INPUT_PREPARATION_SECONDS=" << std::setprecision(12)
+              << trace_prepare_seconds << "\nHOST_SIMULATOR_INITIALIZATION_SECONDS="
+              << simulator_init_seconds << "\nHOST_VALIDATED_PRELOAD="
+              << (preload_validated ? "true" : "false") << '\n';
     if (emit_windowed_simulation(simulator, args, config)) return 0;
     const auto stats=simulator.run();
     if(input_identity) {
@@ -6145,6 +6625,7 @@ void usage(std::ostream& out) {
         << "  fastsim simulate --config FILE --manifest FILE "
            "--measurement-scope user|user-plus-kernel "
            "[--native-kernel-trace BOOL] "
+           "[--preload-validated-input BOOL] "
            "[--cores N] [--chunk-instructions N] "
            "[--reference-frequency-hz HZ] "
            "[--core-frequency-hz HZ | --core-frequencies-hz HZ,...] "

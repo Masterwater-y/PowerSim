@@ -2,18 +2,42 @@
 #include <optional>
 #include "fastsim/config.hpp"
 #include "fastsim/types.hpp"
+#include "fastsim/spr_retired_load_miss.hpp"
 #include <ostream>
 namespace fastsim {
 inline void write_retired_cache_miss_event(std::ostream& out,std::uint64_t known,
     std::uint64_t unknown,std::uint64_t estimated,unsigned mask,
     const PerfRetirementCounts& r,bool runtime) {
+ const unsigned level=mask==8 ? 0 : (mask==16 ? 1 : 2);
  out<<"{\"count\":"<<known<<",\"unknown\":"<<unknown
     <<",\"event\":209,\"umask\":"<<mask
     <<",\"estimate_available\":"<<(runtime?"true":"false")
     <<",\"estimated_count\":"<<estimated
-    <<",\"estimate_policy\":\"bounded-line-fill-v1\""
+    <<",\"estimate_policy\":\""<<spr_retired::Policy<<"\""
+    <<",\"prediction_nonmember\":"<<(r.perf_retired_loads-estimated)
+    <<",\"prediction_unknown\":0"
+    <<",\"prediction_exact_count\":"<<(estimated-r.spr_estimated_member[level])
+    <<",\"prediction_estimated_count\":"<<r.spr_estimated_member[level]
+    <<",\"prediction_exact_nonmember\":"<<(r.perf_retired_loads-estimated-r.spr_estimated_nonmember[level])
+    <<",\"prediction_estimated_nonmember\":"<<r.spr_estimated_nonmember[level]
     <<",\"estimate_fallback_loads\":"<<r.estimated_miss_fallback_loads
-    <<",\"estimated_merged_loads\":"<<r.estimated_merged_loads<<'}';
+    <<",\"estimated_merged_loads\":"<<r.estimated_merged_loads
+    <<",\"fallback_missing_source_loads\":"<<r.fallback_missing_source_loads
+    <<",\"fallback_missing_source_l1_misses\":"<<r.fallback_missing_source_l1_misses
+    <<",\"fallback_unknown_private_loads\":"<<r.fallback_unknown_private_loads
+    <<",\"fallback_unknown_private_l1_misses\":"<<r.fallback_unknown_private_l1_misses
+    <<",\"fallback_unknown_shared_loads\":"<<r.fallback_unknown_shared_loads
+    <<",\"fallback_unknown_shared_l1_misses\":"<<r.fallback_unknown_shared_l1_misses
+    <<",\"fallback_missing_shared_clock_loads\":"<<r.fallback_missing_shared_clock_loads
+    <<",\"fallback_missing_shared_clock_l1_misses\":"<<r.fallback_missing_shared_clock_l1_misses
+    <<",\"fallback_future_parent_loads\":"<<r.fallback_future_parent_loads
+    <<",\"fallback_future_parent_l1_misses\":"<<r.fallback_future_parent_l1_misses
+    <<",\"fallback_invalid_interval_loads\":"<<r.fallback_invalid_interval_loads
+    <<",\"fallback_invalid_interval_l1_misses\":"<<r.fallback_invalid_interval_l1_misses
+    <<",\"fallback_collision_loads\":"<<r.fallback_collision_loads
+    <<",\"fallback_collision_l1_misses\":"<<r.fallback_collision_l1_misses
+    <<",\"fallback_unclassified_loads\":"<<r.fallback_unclassified_loads
+    <<",\"fallback_unclassified_l1_misses\":"<<r.fallback_unclassified_l1_misses<<'}';
 }
 inline void write_retired_cache_scope(std::ostream& out,const PerfRetirementCounts& r,bool runtime) {
  out<<"{\"retired_macro_instructions\":"<<r.retired_macro_instructions

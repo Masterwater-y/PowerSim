@@ -6,6 +6,7 @@ import unittest
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+GEM5_ROOT = ROOT.parent / "gem5-deploy"
 sys.path.insert(0,str(ROOT/'tools'))
 from tests.test_spr_functional_retirement_capture import definition
 from tests.test_asid_static_instruction_maps import fixture
@@ -41,11 +42,13 @@ struct StaticInst {
  bool isIndirectCtrl()const{return false;}bool isCall()const{return false;}
  bool isReturn()const{return false;}bool isLoad()const{return false;}
  bool isStore()const{return false;}bool isAtomic()const{return false;}
+ bool isReadBarrier()const{return false;} bool isWriteBarrier()const{return false;}
+ bool isArchitecturalLockedMemory()const{return false;}
  bool isDirectCtrl()const{return true;}
  std::shared_ptr<X86ISA::PCState>branchTarget(const X86ISA::PCState&)const{
  auto p=std::make_shared<X86ISA::PCState>(target);return p;}
 };
-struct Inst{std::shared_ptr<StaticInst>staticInst=std::make_shared<StaticInst>();
+struct Inst{std::shared_ptr<StaticInst>staticInst=std::make_shared<StaticInst>(),macroop;
  X86ISA::PCState state;uint32_t tid=0;const auto&pcState()const{return state;}};
 using DynInstPtr=std::shared_ptr<Inst>;
 bool fstCanonicalRegister(uint32_t id,uint32_t&out){out=id;return true;}
@@ -81,8 +84,8 @@ int main(int argc,char**argv){assert(argc==2);TaoTrace t;t.fst_path_=argv[1];
 
 class SprAsidMapProducerTest(unittest.TestCase):
     def test_actual_producer_preserves_two_asids_and_refuses_same_key_conflict(self):
-        source=(ROOT/'gem5-spr/src/cpu/o3/probe/tao_trace.cc').read_text()
-        header=(ROOT/'gem5-spr/src/cpu/o3/probe/tao_trace.hh').read_text()
+        source=(GEM5_ROOT / 'src/cpu/o3/probe/tao_trace.cc').read_text()
+        header=(GEM5_ROOT / 'src/cpu/o3/probe/tao_trace.hh').read_text()
         fields=header[header.index('    struct FstStaticInstruction {'):header.index('    // 把当前 records.micro')]
         structs=source[source.index('struct FstInstructionMapHeaderV2 {'):source.index('// Map gem5\'s x86 renameable')]
         flags=definition(source,'enum FstStaticFlag')+';'

@@ -503,6 +503,24 @@ reported alone.
 
 ## 6. Throughput
 
+2026-11-12 用户明确规定：
+
+- **主吞吐分母排除输入初始化、预处理、来源/完整性检查和输入校验工作**；
+  这些费用单列，完整进程墙钟保留为独立周转诊断。功能预热继续单列。
+- 当前 `measurement_seconds` 已排除 `open_trace_manifest` 和启动预检，
+  但在线 `.ffe/.uops/.xlat` 等伴随校验仍在生产路径内。历史
+  `measurement_uops_per_second` 因而是 **validation-inclusive legacy
+  throughput**，不是新主口径。缺少独立墙钟边界时，新主口径为 unavailable，
+  不能借用旧值或减去累计 worker CPU 时间、采样百分比来补造。
+- 后续应先完成输入校验和可复用预处理，再开始模型计时；或者以可审计、
+  不重复计算并行重叠的墙钟边界排除校验。保留同一完整退休人口和源身份，
+  输入校验不能因为不计入吞吐而被关闭。
+- **固定绑定经核验的高频核心**。当前主机默认 CPU **52–63**、
+  socket/NUMA node **1**，使用现有 `performance` 策略；入口为
+  `python3 scripts/run_high_frequency.py -- COMMAND ARGS...`。
+  运行前检查可用性与频率，比较时记录实际工作频率；主机变化需重新核验，
+  不静默回退到 CPU 24–35，不修改全局 governor。
+
 Throughput is a direct performance distribution, not an error distribution.
 For both the `user` and `user-plus-kernel` runs, report arithmetic
 mean, P50, P90, P99, and minimum trace-processing throughput in million user

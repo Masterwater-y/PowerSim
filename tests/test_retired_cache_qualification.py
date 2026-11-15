@@ -207,7 +207,7 @@ int main() {
         with tempfile.TemporaryDirectory(dir=ROOT/'tmp') as tmp:
             src=Path(tmp)/'check.cc'; exe=Path(tmp)/'check'
             src.write_text(code)
-            build=subprocess.run(['/opt/gcc-11/bin/g++','-std=c++17','-static-libstdc++','-static-libgcc','-I',str(ROOT),str(src),'-o',str(exe)],capture_output=True,text=True)
+            build=subprocess.run(['/opt/gcc-11/bin/g++','-std=c++17','-static-libstdc++','-static-libgcc','-I',str(ROOT),'-I',str(ROOT/'include'),str(src),'-o',str(exe)],capture_output=True,text=True)
             self.assertEqual(build.returncode,0,build.stderr)
             run=subprocess.run([str(exe)],capture_output=True,text=True)
             self.assertEqual(run.returncode,0,run.stderr)

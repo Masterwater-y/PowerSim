@@ -602,7 +602,7 @@ def main() -> int:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/gem5-v28_2-fs-native-kernel.cfg"),
+        default=Path("configs/spr-evaluation-default.cfg"),
     )
     parser.add_argument(
         "--measurement-scope",

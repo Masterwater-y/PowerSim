@@ -5,6 +5,7 @@
 #include <functional>
 #include <optional>
 #include <vector>
+#include "fastsim/spr_transaction_id.hpp"
 namespace fastsim {
 enum class BoundedUopKind { Alu, Load, Store, LocalStore, Fence, Atomic };
 struct BoundedUop {
@@ -108,4 +109,52 @@ struct BoundedNonbindingStoreResult {
 };
 BoundedNonbindingStoreResult estimate_nonbinding_store(const BoundedNonbindingStoreInput&);
 
+// Standalone resource summary, not yet wired into Simulator or cache visibility.
+// Transaction-copyable state; all times use one model clock and callers may
+// advance only at a certified global watermark.
+struct BoundedStoreIdentity {
+    std::uint32_t core=0;
+    std::uint64_t sequence=0;
+    std::uint32_t ordinal=0;
+};
+struct BoundedStoreEdges { std::uint64_t send=0,response=0,release=0,permission=0; };
+struct BoundedStoreLifecycleStats {
+    std::uint64_t prepares=0,prepare_dropped=0,heads=0,invalidations=0;
+};
+class BoundedStoreLifecycle {
+ public:
+    BoundedStoreLifecycle(std::size_t cores,std::size_t prepare_credits,
+                          std::size_t demand_credits,std::uint32_t store_ports,
+                          std::size_t ordered_lines,std::size_t store_entries=112);
+    bool prepare(BoundedStoreIdentity,std::uint64_t line,std::uint64_t issue,std::uint64_t response);
+    BoundedStoreEdges demand(std::uint32_t core,std::uint64_t issue,std::uint64_t service);
+    BoundedStoreEdges head(BoundedStoreIdentity,std::uint64_t line,std::uint64_t eligible,
+                           std::uint64_t service,std::uint64_t publish_service=1,
+                           std::uint64_t reclaim_delay=0);
+    std::optional<std::uint64_t> generation(BoundedStoreIdentity id)const;
+    // Cache/directory publication is supplied by the existing outer
+    // transaction, and is permitted only at a certified completion watermark.
+    bool publish_prepare(BoundedStoreIdentity id,std::uint64_t generation,
+        const std::function<bool(std::uint32_t,std::uint64_t,std::uint64_t)>& publish);
+    // Process certified completions in response order. The callback owns the
+    // actual cache/directory transaction and may decline a stale completion.
+    std::size_t complete_prepares(std::uint64_t watermark,
+        const std::function<bool(BoundedStoreIdentity,std::uint64_t,
+                                 std::uint64_t,std::uint64_t)>& publish);
+    std::optional<std::uint64_t> next_visible(std::uint64_t line,std::uint64_t at)const;
+    void invalidate(std::uint64_t line,std::uint64_t at);
+    void advance(std::uint64_t watermark);
+    const BoundedStoreLifecycleStats& stats()const{return stats_;}
+ private:
+    struct Hint {BoundedStoreIdentity id;std::uint64_t line,issue,response,generation;
+                 std::optional<std::uint64_t> invalidated;bool consumed=false,published=false;};
+    struct LineSlot {std::uint64_t line=0,ready=0;};
+    struct Core {std::vector<std::uint64_t> demand_ready;std::vector<LineSlot> window;
+                 std::uint64_t port_cycle=0,prepare_frontier=0,release_frontier=0;
+                 std::uint32_t port_used=0;};
+    std::size_t prepare_credits_,store_entries_;std::uint32_t store_ports_;std::uint64_t watermark_=0;
+    std::vector<Core> cores_;std::vector<Hint> hints_;
+    SprTransactionId ids_;
+    BoundedStoreLifecycleStats stats_;
+};
 }

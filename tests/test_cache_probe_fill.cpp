@@ -15,6 +15,22 @@ fastsim::CacheConfig cache_config(std::uint64_t lines, std::uint32_t ways) {
     return config;
 }
 
+void test_l2_prefetch_no_dirty_victim() {
+    fastsim::PrivateHierarchy cache(cache_config(2, 2), cache_config(2, 2));
+    fastsim::CoreCounters count;
+    require(cache.l2_prefetch_safe_victim(1), "empty L2 accepts prefetch");
+    cache.complete_fill(1, false, count);
+    cache.complete_fill(2, false, count);
+    require(cache.l2_prefetch_safe_victim(3), "clean L2 victim may be replaced");
+    cache.access(1, true, count);
+    cache.access(2, false, count); // make dirty line 1 the LRU victim
+    require(!cache.l2_prefetch_safe_victim(3), "dirty L1 inclusion must reject victim");
+    auto transaction = cache.begin_transaction();
+    cache.complete_fill(3, false, count, &transaction);
+    cache.restore(transaction);
+    require(!cache.l2_prefetch_safe_victim(3), "restore recovers dirty victim eligibility");
+}
+
 void test_probe_visibility_and_completion_victim() {
     fastsim::SetAssociativeCache cache(cache_config(2, 2));
     fastsim::CacheCounters counters;
@@ -221,7 +237,62 @@ void test_private_prepared_lookup_commits_atomically() {
 
 }  // namespace
 
+void test_prefetch_publication_time_permission_and_restore() {
+    using namespace fastsim;
+    PrivateHierarchy hierarchy(cache_config(1, 1), cache_config(2, 1));
+    CoreCounters prefetch;
+    auto tx = hierarchy.begin_transaction();
+    const auto early = hierarchy.publish_prefetch_fill(4, 10, 30, 29, true, prefetch, &tx);
+    require(early.status == PrefetchPublicationStatus::kNotReady && !hierarchy.contains(4),
+            "inflight prefetch must remain invisible before completion");
+    const auto revoked = hierarchy.publish_prefetch_fill(4, 10, 30, 30, false, prefetch, &tx);
+    require(revoked.status == PrefetchPublicationStatus::kPermissionLost && !hierarchy.contains(4),
+            "revoked coherence permission must not install prefetch");
+    const auto ready = hierarchy.publish_prefetch_fill(4, 10, 30, 30, true, prefetch, &tx);
+    require(ready.status == PrefetchPublicationStatus::kPublished && hierarchy.contains(4),
+            "valid prefetch must publish at completion");
+    require(prefetch.l1d.accesses == 0 && prefetch.l2.accesses == 0,
+            "prefetch publication must not count as demand lookup");
+    const auto duplicate = hierarchy.publish_prefetch_fill(4, 10, 30, 31, true, prefetch, &tx);
+    require(duplicate.status == PrefetchPublicationStatus::kPublished && duplicate.result.level == HitLevel::kL1,
+            "repeat completion must be a harmless hit");
+    hierarchy.restore(tx);
+    require(!hierarchy.contains(4), "private transaction must roll back publication");
+    bool bad = false;
+    try { (void)hierarchy.publish_prefetch_fill(4, 30, 29, 30, true, prefetch); }
+    catch (const std::invalid_argument&) { bad = true; }
+    require(bad, "invalid completion interval must fail");
+    PrivateHierarchy l2_only(cache_config(1, 1), cache_config(2, 1));
+    CoreCounters l2_prefetch;
+    auto l2tx = l2_only.begin_transaction();
+    const auto notyet = l2_only.publish_prefetch_fill_l2(7, 4, 9, 8, true, l2_prefetch.l2, &l2tx);
+    require(notyet.status == PrefetchPublicationStatus::kNotReady && !l2_only.contains(7),
+            "L2 prefetch must not become visible before completion");
+    const auto l2done = l2_only.publish_prefetch_fill_l2(7, 4, 9, 9, true, l2_prefetch.l2, &l2tx);
+    require(l2done.status == PrefetchPublicationStatus::kPublished && l2_only.contains(7),
+            "L2 prefetch must become resident at completion");
+    CoreCounters demand_after_l2;
+    require(l2_only.probe(7, false, demand_after_l2, &l2tx).level == HitLevel::kL2,
+            "L2 prefetch must not install into L1D");
+    require(l2_prefetch.l2.accesses == 0, "L2 publication must not count demand");
+    l2_only.restore(l2tx);
+    require(!l2_only.contains(7), "L2 publication must roll back");
+    PrivateHierarchy victim(cache_config(1, 1), cache_config(1, 1));
+    CoreCounters demand, prefetch_only;
+    victim.complete_fill(5, true, demand);
+    const auto replaced = victim.publish_prefetch_fill(6, 2, 4, 4, true, prefetch_only);
+    require(replaced.status == PrefetchPublicationStatus::kPublished &&
+                replaced.result.l2_evicted && replaced.result.l2_evicted_dirty &&
+                replaced.result.l2_evicted_line == 5 && !victim.contains(5),
+            "prefetch completion must report dirty inclusive victim for directory/writeback");
+    require(demand.l1d.accesses == 0 && demand.l2.accesses == 0 &&
+                prefetch_only.l1d.accesses == 0 && prefetch_only.l2.accesses == 0,
+            "prefetch installation must not pollute demand lookup counters");
+}
+
 void test_cache_probe_fill() {
+    test_l2_prefetch_no_dirty_victim();
+    test_prefetch_publication_time_permission_and_restore();
     test_probe_visibility_and_completion_victim();
     test_probe_dirty_and_duplicate_completion();
     test_indexed_probe_and_fill();

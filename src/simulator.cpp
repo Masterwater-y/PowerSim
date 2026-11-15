@@ -3,6 +3,7 @@
 #include "fastsim/dram_refresh.hpp"
 #include "fastsim/store_request_engine.hpp"
 #include "fastsim/bounded_store_timing.hpp"
+#include "fastsim/legacy_prepare_timing.hpp"
 #include "fastsim/simulator.hpp"
 #include "fastsim/functional_sync.hpp"
 #include "fastsim/recorded_scheduler.hpp"
@@ -13,6 +14,15 @@
 #include "fastsim/mixed_dram.hpp"
 #include "fastsim/fixed_read_services.hpp"
 #include "fastsim/retired_cache_miss_estimator.hpp"
+#include "fastsim/spr_fill_calendar.hpp"
+#include "fastsim/spr_store_window.hpp"
+#include "fastsim/spr_store_input.hpp"
+#include "fastsim/spr_store_facts_chunk.hpp"
+#include "fastsim/spr_shared_store_credits.hpp"
+#include "fastsim/spr_load_bank.hpp"
+#include "fastsim/spr_l2_resident_prefetch.hpp"
+#include "fastsim/spr_llc_resident_prefetch.hpp"
+#include "fastsim/spr_l2_shared_prefetch_state.hpp"
 #include "fastsim/llc_fill_audit.hpp"
 
 #include <algorithm>
@@ -60,6 +70,20 @@ void set_buffer_service_baseline_events(std::vector<std::uint64_t> events) {
 }  // namespace testing
 #endif
 namespace {
+
+// Diagnostic controls are a process-start contract. Keep getenv and path
+// allocation outside all UOP/event loops and all worker threads.
+std::optional<std::string> diagnostic_path(const char* name) {
+    if (const auto* path = std::getenv(name)) return std::string(path);
+    return std::nullopt;
+}
+const bool merge_debug = std::getenv("FASTSIM_MERGE_DBG") != nullptr;
+const bool store_window_audit = std::getenv("FASTSIM_STORE_WINDOW_AUDIT") != nullptr;
+const bool store_closure_debug = std::getenv("FASTSIM_STORE_ENGINE_CLOSURE_DEBUG") != nullptr;
+const bool tso_trace = std::getenv("FASTSIM_TSO_TRACE") != nullptr;
+const auto tso_load_hist = diagnostic_path("FASTSIM_TSO_LOAD_HIST");
+const auto tso_prepare_hist = diagnostic_path("FASTSIM_TSO_PREPARE_HIST");
+const auto tso_retire_hist = diagnostic_path("FASTSIM_TSO_RETIRE_HIST");
 
 constexpr std::uint64_t kCycleUnit = 1ull << 16;
 
@@ -1801,6 +1825,7 @@ class SharedSystem {
         ContextMemoryCounters context_memory;
         std::optional<PendingMemoryState> pending_memory;
         std::size_t projected_records_size = 0;
+        std::optional<BoundedStoreLifecycle> bounded_store_lifecycle;
     };
 
     SharedSystem(const SimulatorConfig& config,
@@ -1809,7 +1834,7 @@ class SharedSystem {
         : config_(config),
           private_caches_(private_caches),
           stats_(stats),
-          llc_(config.llc),
+          llc_(config.llc, config.cha_xor_hash && config.cha_count == 52),
           dram_(config.dram, config.llc.line_size, config.store_wait_relief),
           cha_ready_(config.cha_count),
           // Ruby's L3 controllers each own their own TBE pool.  Keep the
@@ -2124,7 +2149,7 @@ class SharedSystem {
             llc_.begin_transaction(event_hint), stats_.llc, stats_.cha,
             stats_.instruction_llc, stats_.instruction_cha, dram_,
             cha_ready_, llc_mshr_ready_, {}, llc_transient_expiry_, {}, {}, stats_.context_memory,
-            pending_memory_};
+            pending_memory_, 0, bounded_store_lifecycle_};
         transaction.projected_records_size = projected_records_.size();
         transaction.private_caches.reserve(private_caches_.size());
         const auto per_core_hint = private_caches_.empty()
@@ -2332,6 +2357,7 @@ class SharedSystem {
         stats_.instruction_cha = transaction.instruction_cha_counters;
         stats_.context_memory = transaction.context_memory;
         pending_memory_ = transaction.pending_memory;
+        bounded_store_lifecycle_ = transaction.bounded_store_lifecycle;
         projected_records_.resize(transaction.projected_records_size);
         dram_ = transaction.dram;
         cha_ready_ = transaction.cha_ready;
@@ -2369,6 +2395,18 @@ class SharedSystem {
     std::int16_t owner_of(std::uint64_t line) const {
         const auto it = directory_.find(line);
         return it == directory_.end() ? -1 : it->second.owner;
+    }
+
+    // Resource state lives beside the directory so one transaction captures
+    // the in-flight identities and all cache/coherence effects together.
+    void configure_bounded_store_lifecycle(std::size_t prepare_credits,
+            std::size_t demand_credits,std::uint32_t store_ports,
+            std::size_t ordered_lines,std::size_t store_entries) {
+        bounded_store_lifecycle_.emplace(private_caches_.size(),prepare_credits,
+            demand_credits,store_ports,ordered_lines,store_entries);
+    }
+    BoundedStoreLifecycle& bounded_store_lifecycle() {
+        return bounded_store_lifecycle_.value();
     }
 
     bool modified(std::uint64_t line) const {
@@ -2591,6 +2629,133 @@ class SharedSystem {
         return permission_local;
     }
 
+    // Experimental typed prefetch: only a clean cold LLC line is accepted.
+    // Reservation touches the same CHA, slice credit and DRAM calendars as
+    // demand, but never publishes a tag, directory grant or demand counter.
+    struct L2PrefetchStart { std::uint64_t response; bool llc_source; };
+    std::optional<L2PrefetchStart> begin_l2_shared_prefetch(
+        std::uint32_t core, std::uint64_t line, std::uint64_t issue,
+        Transaction* transaction, bool allow_llc) {
+        expire_transients(issue, transaction);
+        const auto directory = directory_.find(line);
+        const bool llc_hit = llc_.contains(line);
+        if (core >= private_caches_.size() || (llc_hit && !allow_llc) ||
+            llc_transient_ready_.count(line) ||
+            (directory != directory_.end() && !directory->second.empty()) ||
+            !dram_contains_line(config_.dram, line, config_.llc.line_size))
+            return std::nullopt;
+        const auto cha = cha_of(line);
+        const auto arrival = issue + config_.noc_one_way_latency;
+        const auto start = std::max(arrival, cha_ready_[cha]);
+        stats_.cha[cha].queue_cycles += start - arrival;
+        cha_ready_[cha] = start + config_.llc_service_cycles;
+        const auto tag_ready = start + config_.llc.hit_latency;
+        if (llc_hit) {
+            CacheCounters scratch;
+            auto* tx = transaction ? &transaction->llc : nullptr;
+            llc_.access(line, false, scratch, tx);
+            return L2PrefetchStart{tag_ready + config_.noc_one_way_latency, true};
+        }
+        const auto first = llc_mshr_ready_.begin() +
+            static_cast<std::ptrdiff_t>(std::size_t(cha) * config_.llc_mshrs);
+        const auto last = first + static_cast<std::ptrdiff_t>(config_.llc_mshrs);
+        if (first == last) throw std::logic_error("prefetch requires LLC credit");
+        const auto path_ready = tag_ready + config_.directory_memory_latency;
+        const auto dram_arrival = std::max(path_ready, *first);
+        stats_.cha[cha].queue_cycles += dram_arrival - path_ready;
+        const auto result = dram_.access(dram_arrival, line, core);
+        stats_.cha[cha].queue_cycles += result.queue_cycles;
+        const auto fill = result.completion + config_.llc_fill_response_latency;
+        std::pop_heap(first, last, std::greater<>{});
+        *(last - 1) = fill;
+        std::push_heap(first, last, std::greater<>{});
+        return L2PrefetchStart{fill + config_.noc_one_way_latency, false};
+    }
+
+    // The caller cancels on a same-line accepted demand or store and retains
+    // the already consumed service. Recheck model state at publication so a
+    // stale grant never overwrites data obtained by another request.
+    bool complete_l2_shared_prefetch(std::uint32_t core, std::uint64_t line,
+        std::uint64_t issue, std::uint64_t response, std::uint64_t now,
+        Transaction* transaction, bool& dirty_writeback, bool llc_source,
+        bool consumed_by_demand,
+        std::optional<std::uint64_t>& private_victim,std::uint64_t* unused_evictions=nullptr) {
+        if (response > now) throw std::logic_error("early prefetch publication");
+        expire_transients(now, transaction);
+        const auto directory = directory_.find(line);
+        if (llc_transient_ready_.count(line) ||
+            (directory != directory_.end() && directory->second.modified) ||
+            private_caches_[core]->prepare_probe_l2(line).hit)
+            return false;
+        auto* llc_transaction = transaction ? &transaction->llc : nullptr;
+        CacheCounters scratch;
+        if (!llc_.contains(line)) {
+            const auto installed = llc_.access(line, false, scratch, llc_transaction);
+            if (installed.evicted)
+                dirty_writeback |= handle_llc_eviction(installed.evicted_line,
+                    installed.evicted_dirty, now, cha_of(installed.evicted_line),
+                    false, transaction, false);
+        }
+        auto* private_transaction = transaction ? &transaction->private_caches[core] : nullptr;
+        const auto published = private_caches_[core]->publish_prefetch_fill_l2(
+            line, issue, response, now, true, scratch, private_transaction);
+        if (published.status != PrefetchPublicationStatus::kPublished)
+            throw std::logic_error("ready L2 shared prefetch did not publish");
+        if (config_.spr_l2_prefetch_follow && !consumed_by_demand)
+            private_caches_[core]->mark_l2_prefetched(line, private_transaction);
+        if (published.result.l2_evicted) {
+            private_victim=published.result.l2_evicted_line;
+            dirty_writeback |= private_evict(core, published.result.l2_evicted_line,
+                published.result.l2_evicted_dirty, now, false, transaction, false);
+        }
+        if (config_.coherence) {
+            snapshot_directory(line, transaction);
+            directory_[line].add(core);
+            directory_[line].owner=-1;
+        }
+        if(unused_evictions)*unused_evictions+=scratch.unused_prefetch_evictions;
+        return true;
+    }
+
+    // Read-only LLC-resident approximation: no CHA/DRAM reservation is made.
+    // Unknown/outstanding functional service and exclusive owners are refused.
+    SprLlcResidentPrefetch::Begin begin_l2_llc_resident_prefetch(
+        SprLlcResidentPrefetch& prefetch, std::uint32_t core,
+        std::uint64_t line, std::uint64_t issue, bool batch_fill_pending,
+        Transaction* transaction) {
+        expire_transients(issue, transaction);
+        const auto dir = directory_.find(line);
+        const bool clean = dir == directory_.end() ||
+            (!dir->second.modified && dir->second.owner < 0);
+        const bool ready = clean && !batch_fill_pending && !llc_transient_ready_.count(line);
+        const auto latency = static_cast<std::uint64_t>(config_.llc.hit_latency) +
+            2ull * config_.noc_one_way_latency;
+        if (issue > std::numeric_limits<std::uint64_t>::max() - latency)
+            throw std::overflow_error("LLC resident prefetch response overflow");
+        const auto response = issue + latency;
+        return prefetch.begin(core, line, issue, response, ready, llc_, *private_caches_.at(core));
+    }
+
+    void advance_l2_llc_resident_prefetch(SprLlcResidentPrefetch& prefetch,
+        std::uint64_t now, const std::vector<PrivateHierarchy*>& caches,
+        const std::vector<PrivateTransaction*>& private_transactions,
+        Transaction* transaction) {
+        prefetch.advance(now, llc_, caches, private_transactions,
+            [&](std::uint32_t, std::uint64_t line) {
+                const auto dir = directory_.find(line);
+                return !llc_transient_ready_.count(line) &&
+                    (dir == directory_.end() || (!dir->second.modified && dir->second.owner < 0));
+            },
+            [&](std::uint32_t core, std::uint64_t line) {
+                if (config_.coherence) { snapshot_directory(line, transaction); directory_[line].add(core); }
+            },
+            [&](std::uint32_t core, std::uint64_t line, bool dirty, std::uint64_t cycle) {
+                if (dirty) throw std::logic_error("resident prefetch selected dirty victim");
+                if (private_evict(core, line, false, cycle, false, transaction, true))
+                    throw std::logic_error("clean prefetch eviction emitted DRAM write");
+            });
+    }
+
     SharedAccessResult access(std::uint32_t core, std::uint64_t line,
                               std::uint64_t memory_line, bool write,
                               HitLevel private_level,
@@ -2693,7 +2858,7 @@ class SharedSystem {
         const bool merged_memory =
             transient != llc_transient_ready_.end() &&
             tag_ready < transient->second.ready.value();
-        if (std::getenv("FASTSIM_MERGE_DBG") && !write && private_miss) {
+        if (merge_debug && !write && private_miss) {
             std::fprintf(stderr,
                 "MRG core=%u line=%llu issue=%llu tag_ready=%llu found=%d tx=%d",
                 core, static_cast<unsigned long long>(line),
@@ -3094,7 +3259,7 @@ class SharedSystem {
     std::uint32_t cha_of(std::uint64_t line) const {
         const auto mixed =
             config_.cha_xor_hash
-                ? line ^ (line >> 11) ^ (line >> 23)
+                ? spr_llc_mix_line(line)
                 : line;
         return static_cast<std::uint32_t>(mixed % config_.cha_count);
     }
@@ -3229,6 +3394,7 @@ class SharedSystem {
     mutable std::mutex transaction_directory_mutex_;
     const bool pending_services_enabled_;
     std::optional<PendingMemoryState> pending_memory_;
+    std::optional<BoundedStoreLifecycle> bounded_store_lifecycle_;
     std::uint64_t next_pending_write_id_ = 0;
     std::ofstream projected_audit_;
     std::ofstream committed_dram_audit_;
@@ -3282,8 +3448,16 @@ struct ChunkMemoryEvent {
     // the store queue.  Its data is taken from the forwarding path, so replay
     // must not probe the private caches or issue a Ruby request.
     bool forwarded_load = false;
+    bool spr_l2_getx_eligible = false;
+    bool spr_l2_train_eligible = false;
     bool task_pmu_member = false;
     bool software_prefetch = false;
+    bool spr_ordinary_store = false;
+    bool spr_ordinary_load = false;
+    bool spr_bank_eligible = false;
+    bool spr_port_eligible = false;
+    bool spr_port_proxy_special = false;
+    std::uint8_t spr_bank_offset = 0;
 };
 
 // This is a functional address model only.  It deliberately consumes no
@@ -3329,6 +3503,7 @@ std::uint64_t modeled_page_table_line(
 }
 
 struct ChunkUopBound {
+    bool rename_eliminated = false;
     // Four canonical register producer slots plus one optional functional
     // StoreSet/LFST edge reconstructed by the interval core.
     std::array<std::uint32_t, 5> producer_dists{};
@@ -3352,6 +3527,7 @@ struct ChunkUopBound {
     std::uint32_t fu_occupancy_cycles = 1;
     std::uint16_t memory_count = 0;
     IntervalFuPool fu_pool = IntervalFuPool::kInteger;
+    std::uint8_t spr_iq_partition = 0;
     bool memory_read = false;
     bool memory_write = false;
     bool dispatch_load = false;
@@ -3591,6 +3767,7 @@ class SparseIssueResourceCalendar {
 
     std::uint64_t allocate_issue(const ChunkUopBound& bound,
                                  std::uint64_t earliest) {
+        if (bound.rename_eliminated) return earliest;
         auto cycle = earliest;
         while (true) {
             if (count(issue_, cycle) >= issue_width_ ||
@@ -3706,6 +3883,7 @@ enum class CriticalCause : std::uint8_t {
 };
 
 struct SparseRobEntry {
+    bool rename_eliminated = false;
     // Observations only: independently versioned because block-summary mode
     // leaves the scheduling fields untouched until checkpoint export.
     std::uint64_t diagnostic_sequence = std::numeric_limits<std::uint64_t>::max();
@@ -4027,7 +4205,11 @@ struct DependencyView {
 
 struct CoreChunk {
     std::vector<ChunkMemoryEvent> memory;
+    // Allocated only for the experimental same-line SQ credit proxy.
+    std::unique_ptr<SprStoreFactsChunk> store_facts;
     std::vector<ChunkUopBound> uops;
+    // Allocated only by the experimental functional-input prefetch slice.
+    std::vector<SprPrefetchInput> prefetch_inputs;
     std::vector<ChunkDependencyExtension> dependency_rows;
     std::vector<std::uint32_t> dependency_distances;
     // Populated only for response-frontier diagnostics. Keeping identity out
@@ -4048,7 +4230,9 @@ struct CoreChunk {
 
     void reset_for_reuse() {
         memory.clear();
+        if (store_facts) store_facts->reset();
         uops.clear();
+        prefetch_inputs.clear();
         dependency_rows.clear();
         dependency_distances.clear();
         audit_uop_pcs.clear();
@@ -4242,6 +4426,18 @@ class ResidentCoreBuffer {
             "resident audit UOP has no owning segment");
     }
 
+    const SprPrefetchInput& prefetch_input(std::size_t index) const {
+        require_uop(index);
+        const auto absolute=checked_add(uop_origin_,index,"prefetch UOP overflow");
+        for(const auto& segment:segments_) {
+            if(absolute<segment.uop_begin || absolute>=segment.uop_end)continue;
+            if(segment.chunk->prefetch_inputs.size()!=segment.uop_end-segment.uop_begin)
+                throw std::logic_error("missing functional prefetch metadata");
+            return segment.chunk->prefetch_inputs.at(absolute-segment.uop_begin);
+        }
+        throw std::logic_error("prefetch UOP has no segment");
+    }
+
     const LlcAuditMember& llc_audit_member(std::size_t index) const {
         require_uop(index);
         const auto absolute=checked_add(uop_origin_,index,"LLC audit UOP overflow");
@@ -4257,6 +4453,39 @@ class ResidentCoreBuffer {
     const ChunkMemoryEvent& memory(std::size_t index) const {
         require_memory(index);
         return *memory_index_[index].value;
+    }
+
+    std::optional<SprStoreInput> store_input(std::size_t index) const {
+        require_memory(index);
+        const auto absolute = checked_add(memory_origin_, index, "store facts memory index overflow");
+        for (const auto& segment : segments_) {
+            if (absolute < segment.memory_begin || absolute >= segment.memory_end) continue;
+            if (!segment.chunk->store_facts) return std::nullopt;
+            const auto local = absolute - segment.memory_begin;
+            if (local > std::numeric_limits<std::uint32_t>::max())
+                throw std::overflow_error("store facts chunk index overflow");
+            const auto facts = segment.chunk->store_facts->lookup(static_cast<std::uint32_t>(local));
+            if (facts.status != SprStoreFactsChunk::Status::kKnown) return std::nullopt;
+            return facts.value;
+        }
+        throw std::logic_error("resident store facts have no owning segment");
+    }
+
+    std::optional<SprStoreWindow::CreditKey> store_credit_key(std::size_t index) const {
+        const auto facts = store_input(index);
+        if (!facts) return std::nullopt;
+        return SprStoreWindow::CreditKey{facts->flags, facts->context, facts->requestor};
+    }
+
+    bool same_store_producer_chunk(std::size_t left, std::size_t right) const {
+        require_memory(left); require_memory(right);
+        const auto a = checked_add(memory_origin_, left, "store chunk index overflow");
+        const auto b = checked_add(memory_origin_, right, "store chunk index overflow");
+        for (const auto& segment : segments_) {
+            if (a >= segment.memory_begin && a < segment.memory_end)
+                return b >= segment.memory_begin && b < segment.memory_end;
+        }
+        throw std::logic_error("store event has no owning producer chunk");
     }
 
     ChunkMemoryEvent& memory(std::size_t index) {
@@ -5062,6 +5291,54 @@ testing::run_buffered_tso_state_probe() {
     return result;
 }
 
+testing::BoundedStoreSharedTransactionProbeResult
+testing::run_bounded_store_shared_transaction_probe() {
+    SimulatorConfig config;
+    config.cores=2;config.cha_count=1;config.coherence=true;
+    SimulationStats stats;
+    stats.cores.resize(2);stats.cha.resize(1);stats.instruction_cha.resize(1);
+    std::vector<std::unique_ptr<PrivateHierarchy>> caches;
+    for(unsigned core=0;core<2;++core)
+        caches.push_back(std::make_unique<PrivateHierarchy>(config.l1d,config.l2));
+    SharedSystem shared(config,caches,stats);
+    shared.configure_bounded_store_lifecycle(1,2,1,2,8);
+    constexpr std::uint64_t line=0x8000/64;
+    CoreCounters counters;
+    const auto prior=caches[1]->access(line,false,counters);
+    (void)shared.access(1,line,line,false,prior.level,0,config.l1d.hit_latency,
+        config.l2.hit_latency,false,0,0);
+    auto tx=shared.begin_transaction();
+    const BoundedStoreIdentity identity{0,1,0};
+    auto& lifecycle=shared.bounded_store_lifecycle();
+    if(!lifecycle.prepare(identity,line,10,30))
+        throw std::logic_error("bounded shared probe could not reserve prepare");
+    const auto generation=lifecycle.generation(identity).value();
+    testing::BoundedStoreSharedTransactionProbeResult result;
+    auto publish=[&](BoundedStoreIdentity id,std::uint64_t address,
+                     std::uint64_t response,std::uint64_t) {
+        const auto core=id.core;
+        const auto access=caches[core]->access(address,false,counters,&tx.private_caches[core]);
+        (void)shared.access(core,address,address,true,access.level,response,config.l1d.hit_latency,
+            config.l2.hit_latency,false,1,0,&tx,false,true,true);
+        return true;
+    };
+    result.before_completion_hidden=lifecycle.complete_prepares(29,publish)==0 &&
+        !caches[0]->contains(line) && caches[1]->contains(line) && shared.owner_of(line)!=0;
+    result.shared_permission_published=lifecycle.complete_prepares(30,publish)==1 &&
+        caches[0]->contains(line) && shared.owner_of(line)==0 && !shared.modified(line);
+    result.cross_core_invalidated=!caches[1]->contains(line);
+    shared.restore(tx);
+    auto& restored=shared.bounded_store_lifecycle();
+    result.rollback_restored=!caches[0]->contains(line) && caches[1]->contains(line) &&
+        shared.owner_of(line)!=0 && !restored.generation(identity);
+    if(!restored.prepare(identity,line,10,30))
+        throw std::logic_error("bounded shared probe could not replay prepare");
+    restored.advance(30);
+    result.stale_generation_rejected=!restored.publish_prepare(identity,generation,
+        [](std::uint32_t,std::uint64_t,std::uint64_t){return true;});
+    return result;
+}
+
 testing::SharedMixedServiceProbeResult testing::run_shared_mixed_service_probe() {
     SimulatorConfig config;
     config.cores = 2;
@@ -5343,7 +5620,7 @@ class Simulator::Impl {
     }
 
     std::uint64_t store_commit_to_ruby_admission_cycles() const {
-        if (config_.buffer_tso_prepare_lifecycle || config_.reference_store_timing() || config_.bounded_store_timing())
+        if (config_.buffer_tso_prepare_lifecycle || config_.legacy_prepare_timing_enabled() || config_.reference_store_timing() || config_.bounded_store_timing())
             return static_cast<std::uint64_t>(*config_.store_commit_to_iew_delay) + 1;
         return (config_.store_post_commit_request || pending_fill_store_commit())
             ? kStoreCommitToRubyAdmissionCycles
@@ -5351,7 +5628,7 @@ class Simulator::Impl {
     }
 
     std::uint64_t store_response_to_next_admission_cycles() const {
-        return (config_.buffer_tso_prepare_lifecycle || config_.reference_store_timing() || config_.bounded_store_timing() ||
+        return (config_.buffer_tso_prepare_lifecycle || config_.legacy_prepare_timing_enabled() || config_.reference_store_timing() || config_.bounded_store_timing() ||
                 config_.store_post_commit_request || pending_fill_store_commit())
             ? kStoreResponseToNextAdmissionCycles
             : 0;
@@ -5599,6 +5876,20 @@ class Simulator::Impl {
         const auto ranges = std::count_if(threads.begin(), threads.end(),
             [](const auto& binding) { return binding.trace && binding.trace->has_score_range(); });
         fixed_work_enabled_ = ranges != 0;
+        if (config_.spr_store_group_merge && (context_execution_enabled_ || fixed_work_enabled_))
+            throw std::invalid_argument("store group slice does not support context or fixed-work boundaries");
+        if (config_.spr_store_group_merge)
+            for (std::uint32_t c = 0; c < config_.cores; ++c)
+                if (config_.frequency_hz(c) != config_.reference_frequency_hz)
+                    throw std::invalid_argument("store group slice requires the reference clock domain");
+        if (config_.spr_l2_shared_prefetch || config_.spr_l2_llc_resident_prefetch) {
+            if (config_.spr_l2_shared_prefetch && !config_.spr_l2_prefetch_follow &&
+                (context_execution_enabled_ || fixed_work_enabled_ || sync_plan_ || recorded_scheduler_))
+                throw std::invalid_argument("L2 shared prefetch does not yet support context, fixed-work or recorded scheduling");
+            for (std::uint32_t core=0; core<config_.cores; ++core)
+                if (config_.frequency_hz(core)!=config_.reference_frequency_hz)
+                    throw std::invalid_argument("L2 shared prefetch requires the reference clock domain");
+        }
         if (fixed_work_enabled_) {
             if (static_cast<std::size_t>(ranges) != threads.size() ||
                 threads.size() != config_.cores || config_.cores > 4 ||
@@ -5633,6 +5924,10 @@ class Simulator::Impl {
         }
         measurement_boundary_memory_state_enabled_ =
             boundary_state_streams == threads.size();
+        if (config_.spr_store_group_merge && measurement_boundary_memory_state_enabled_)
+            throw std::invalid_argument("store group warmup does not support boundary cache seeding");
+        if(config_.spr_l1_prefetch_l2_only && measurement_boundary_memory_state_enabled_)
+            throw std::invalid_argument("L2-resident prefetch does not support unobserved boundary cache seeding");
         if (measurement_boundary_memory_state_enabled_) {
             for (const auto& binding : threads) {
                 const auto* accesses =
@@ -5691,6 +5986,23 @@ class Simulator::Impl {
             domain_worker_count_ = 0;
         }
         initialize_stats(threads.size());
+        if(config_.spr_l1_prefetch_l2_only)
+            spr_l2_prefetch_.emplace(config_.cores,config_.spr_prefetch_host_inflight_per_core,
+                                      config_.spr_prefetch_host_queue_per_core,
+                                      config_.spr_l1_prefetch_stream_hits,
+                                      config_.l1d.size_bytes / config_.l1d.line_size / config_.l1d.associativity,
+                                      config_.spr_l1_prefetch_line_marks,
+                                      config_.spr_l1_prefetch_suppress_issue);
+        if (config_.spr_l2_shared_prefetch || config_.spr_l2_llc_resident_prefetch)
+            spr_l2_shared_prefetch_.emplace(config_.cores,
+                config_.spr_prefetch_host_queue_per_core,
+                config_.spr_l2_prefetch_follow ? config_.spr_l2_fill_entries : config_.spr_prefetch_host_inflight_per_core);
+        if(spr_l2_shared_prefetch_)spr_l2_shared_prefetch_->resources.configure(
+            {config_.spr_l1d_fill_entries,config_.spr_l2_fill_entries,config_.store_request_tbes});
+        if(spr_l2_shared_prefetch_ && spr_l2_prefetch_)
+            spr_l2_prefetch_->share_service_ids(spr_l2_shared_prefetch_->ids);
+        if (config_.spr_l2_llc_resident_prefetch)
+            spr_llc_resident_prefetch_.emplace(config_.cores,config_.spr_prefetch_host_inflight_per_core);
         cores_.reserve(config_.cores);
         threads_.reserve(threads.size());
         private_caches_.reserve(config_.cores);
@@ -5715,6 +6027,41 @@ class Simulator::Impl {
         core_completion_reference_q16_.assign(
             config_.cores, std::numeric_limits<std::uint64_t>::max());
         response_iq_ready_cycles_.resize(config_.cores);
+        response_spr_load_bank_.resize(config_.cores);
+        response_spr_store_window_.resize(config_.cores);
+        if (config_.legacy_prepare_timing_enabled()) {
+            legacy_prepare_state_.reserve(config_.cores);
+            for (std::uint32_t core=0;core<config_.cores;++core)
+                legacy_prepare_state_.emplace_back(config_.legacy_prepare_credits,
+                                                   config_.effective_sq_entries());
+        }
+        if (config_.spr_store_window_feedback)
+            for (auto& window : response_spr_store_window_)
+                window = SprStoreWindow(config_.spr_store_window_lines, config_.cache_store_ports);
+        if (config_.spr_store_group_merge) {
+            response_spr_shared_store_credits_.reserve(config_.cores);
+            for (std::uint32_t c = 0; c < config_.cores; ++c)
+                response_spr_shared_store_credits_.emplace_back(config_.effective_sq_entries());
+        }
+        response_spr_l1_load_fill_ready_.resize(config_.cores);
+        response_spr_l2_load_fill_ready_.resize(config_.cores);
+        if (config_.spr_load_fill_feedback) {
+            const auto bound = static_cast<std::size_t>(config_.rob_entries) +
+                config_.lq_entries + config_.sq_entries +
+                std::max(config_.spr_l1d_fill_entries, config_.spr_l2_fill_entries);
+            for (auto& ready : response_spr_l1_load_fill_ready_)
+                ready = SprFillCalendar(config_.spr_l1d_fill_entries, bound);
+            for (auto& ready : response_spr_l2_load_fill_ready_)
+                ready = SprFillCalendar(config_.spr_l2_fill_entries, bound);
+        }
+        if (config_.spr_partitioned_iq && config_.response_queue_feedback) {
+            response_partition_iq_ready_cycles_.resize(config_.cores);
+            for (auto& partitions : response_partition_iq_ready_cycles_) {
+                partitions[0].resize(config_.spr_execution_iq_entries, 0);
+                partitions[1].resize(config_.spr_memory_iq_entries, 0);
+                partitions[2].resize(config_.spr_store_data_iq_entries, 0);
+            }
+        }
         response_rename_releases_.resize(config_.cores);
         response_rename_live_.resize(config_.cores);
         response_rename_cycle_.resize(config_.cores);
@@ -5796,6 +6143,8 @@ class Simulator::Impl {
             }
         }
         sequencer_ready_cycles_.resize(config_.cores);
+        if (config_.ruby_sequencer_ifetch_admission)
+            sequencer_acceptance_frontier_.assign(config_.cores, 0);
         private_read_prior_response_.assign(config_.cores, 0);
         response_dtlb_walker_ready_cycles_.resize(config_.cores);
         response_dtlb_pending_fills_.resize(config_.cores);
@@ -5803,6 +6152,18 @@ class Simulator::Impl {
         response_dtlb_active_address_space_valid_.resize(config_.cores, 0);
         sequencer_line_requests_.resize(config_.cores);
         response_pending_fills_.resize(config_.cores);
+        unified_parent_active_ = config_.unified_parent_service != "off";
+        unified_parent_v2_ = config_.unified_parent_service == "v2-observe" ||
+            config_.unified_parent_service == "v2-wait";
+        unified_parent_wait_ = config_.unified_parent_service == "wait" ||
+            config_.unified_parent_service == "v2-wait";
+        response_parent_services_.resize(config_.cores);
+        if (unified_parent_active_)
+            for (auto& pool : response_parent_services_)
+                pool.configure(config_.unified_parent_service_capacity);
+        if (unified_parent_v2_)
+            for (auto& pool : response_parent_services_)
+                pool.configure_owned(config_.l1d_mshrs,config_.spr_l1d_fill_entries);
         reset_line_generation_admission_audit(0);
         if (config_.ruby_sequencer_max_outstanding != 0) {
             for (auto& ready : sequencer_ready_cycles_) {
@@ -6206,6 +6567,11 @@ class Simulator::Impl {
                 const auto origin = measurement_origin_q16_.empty() ? 0 : measurement_origin_q16_[core];
                 const auto execution_reference = reference_time_q16(core,
                     saturating_add(origin, cycles_to_fixed(execution.execution_cycles)));
+                execution.execution_end_reference_q16 = execution_reference;
+                execution.execution_covers_scored_uncore_responses =
+                    execution.scored_uncore_requests > 0 &&
+                    execution.scored_uncore_response_unknown == 0 &&
+                    execution_reference >= execution.last_scored_uncore_response_reference_q16;
                 execution.execution_covers_last_score = execution_reference >= last_score_reference;
                 stats_.all_execution_covers_last_score &= execution.execution_covers_last_score;
             }
@@ -6255,12 +6621,100 @@ class Simulator::Impl {
                 "disagree");
         }
         shared_->export_dram_controller_stats(stats_);
+        if(spr_l2_prefetch_) {
+            const auto& p=spr_l2_prefetch_->stats();
+            stats_.spr_prefetch_trained=p.trained;stats_.spr_prefetch_issued=p.issued;
+            stats_.spr_prefetch_completed=p.completed;stats_.spr_prefetch_unsupported_input=p.unsupported_input;
+            stats_.spr_prefetch_unsupported_l2_miss=p.unsupported_l2_miss;
+            stats_.spr_prefetch_cancelled_write=p.cancelled_write;
+            stats_.spr_prefetch_cancelled_eviction=p.cancelled_eviction;
+            stats_.spr_prefetch_cancelled_residency=p.cancelled_residency;
+            stats_.spr_prefetch_capacity_blocked=p.capacity_blocked;
+            stats_.spr_prefetch_queue_overflow=p.queue_overflow;
+            stats_.spr_prefetch_stream_hits=p.stream_hits;
+            stats_.spr_prefetch_stream_stale=p.stream_stale;
+            stats_.spr_prefetch_stream_replaced=p.stream_replaced;
+            stats_.spr_prefetch_stream_consumed_not_used=p.stream_consumed_not_used;
+            stats_.spr_prefetch_suppressed=p.suppressed;
+            stats_.spr_prefetch_source_unready=p.source_unready;
+            stats_.spr_prefetch_dirty_victim=p.skipped_dirty_victim;
+            stats_.spr_prefetch_evictions=p.evictions;
+            stats_.spr_prefetch_dirty_writebacks=p.dirty_writebacks;
+            stats_.spr_prefetch_unused_evictions=p.unused_evictions;
+            stats_.spr_prefetch_l1_late_followers=p.late_followers;
+            stats_.spr_prefetch_pending=spr_l2_prefetch_->pending();
+            stats_.spr_prefetch_queued_pending=spr_l2_prefetch_->queued_pending();
+        }
+        if (spr_l2_shared_prefetch_) {
+            const auto& p = *spr_l2_shared_prefetch_;
+            stats_.spr_l2_shared_prefetch_issued=p.issued;
+            stats_.spr_prefetch_resource_wait_cycles=p.resource_wait_cycles;
+            stats_.spr_prefetch_resource_retries=p.resource_retries;
+            stats_.spr_prefetch_shared_parent_follows=p.shared_parent_follows;
+            stats_.spr_l2_prefetch_unused_evictions=p.unused_evictions;
+            stats_.spr_l2_shared_prefetch_completed=p.completed;
+            stats_.spr_l2_shared_prefetch_dram_reads=p.dram_issued;
+            stats_.spr_l2_shared_prefetch_cancelled_demand=p.cancelled_demand;
+            stats_.spr_l2_shared_prefetch_cancelled_state=p.cancelled_state;
+            stats_.spr_l2_shared_prefetch_pending=p.pending.size();
+            stats_.spr_l2_shared_prefetch_initial_pending=p.initial_pending;
+            stats_.spr_l2_shared_prefetch_dropped=p.dropped;
+            stats_.spr_l2_shared_prefetch_trained=p.trained;
+            stats_.spr_l2_shared_prefetch_clamped_events=p.clamped_events;
+            stats_.spr_l2_shared_prefetch_skipped_past_frontier=p.skipped_past_frontier;
+            stats_.spr_l2_shared_prefetch_clamped_cycles=p.clamped_cycles;
+            stats_.spr_l2_shared_prefetch_unsupported_input=p.unsupported_input;
+            stats_.spr_l2_shared_prefetch_cancelled_cross_core=p.cancelled_cross_core;
+            stats_.spr_l2_shared_prefetch_cancelled_write=p.cancelled_write;
+            stats_.spr_l2_shared_prefetch_dirty_writebacks=p.dirty_writebacks;
+            stats_.spr_l2_prefetch_followed=p.followed;
+            stats_.spr_l2_prefetch_llc_issued=p.llc_issued;
+            stats_.spr_l2_prefetch_demand_fill_dropped=p.demand_fill_dropped;
+            stats_.spr_l2_prefetch_source_waits=p.source_waits;
+            stats_.spr_l2_prefetch_source_unresolved_dropped=p.source_unresolved_dropped;
+            stats_.spr_l2_prefetch_store_line_skipped=p.store_line_skipped;
+            stats_.spr_l2_prefetch_suppressed=p.suppressed;
+            for (const auto& predictor : p.predictors) {
+                stats_.spr_l2_shared_prefetch_queue_overflow += predictor.overflow();
+                stats_.spr_l2_shared_prefetch_queued_pending += predictor.queued();
+            }
+            stats_.spr_l2_shared_prefetch_queue_overflow -= p.initial_queue_overflow;
+            const auto created=p.initial_pending+p.issued+
+                (config_.spr_l2_prefetch_follow ? p.shared_parent_follows : 0);
+            const auto retired=p.completed+p.cancelled_state+
+                (config_.spr_l2_prefetch_follow ? 0 : p.cancelled_demand);
+            if (created != retired+p.pending.size())
+                throw std::logic_error("L2 shared prefetch population is not conserved");
+        }
+        if (spr_llc_resident_prefetch_) {
+            const auto& p = spr_llc_resident_prefetch_->stats();
+            stats_.spr_l2_llc_prefetch_issued=p.issued;
+            stats_.spr_l2_llc_prefetch_completed=p.completed;
+            stats_.spr_l2_llc_prefetch_missing=p.skipped_llc_missing;
+            stats_.spr_l2_llc_prefetch_uncertified=p.skipped_uncertified;
+            stats_.spr_l2_llc_prefetch_private=p.skipped_private;
+            stats_.spr_l2_llc_prefetch_duplicate=p.skipped_duplicate;
+            stats_.spr_l2_llc_prefetch_capacity=p.skipped_capacity;
+            stats_.spr_l2_llc_prefetch_dirty_victim=p.skipped_dirty_victim;
+            stats_.spr_l2_llc_prefetch_cancelled_source=p.cancelled_source;
+            stats_.spr_l2_llc_prefetch_cancelled_permission=p.cancelled_permission;
+            stats_.spr_l2_llc_prefetch_cancelled_write=p.cancelled_write;
+            stats_.spr_l2_llc_prefetch_cancelled_demand=p.cancelled_demand;
+            stats_.spr_l2_llc_prefetch_cancelled=p.cancelled_source+p.cancelled_permission+p.cancelled_write+p.cancelled_demand;
+            stats_.spr_l2_llc_prefetch_pending=spr_llc_resident_prefetch_->pending();
+            stats_.spr_l2_llc_prefetch_initial_pending=spr_llc_resident_prefetch_->initial_pending();
+            if (stats_.spr_l2_llc_prefetch_initial_pending + p.issued != p.completed + p.skipped_dirty_victim +
+                stats_.spr_l2_llc_prefetch_cancelled + stats_.spr_l2_llc_prefetch_pending)
+                throw std::logic_error("LLC resident prefetch population is not conserved");
+        }
         lifecycle_ = Lifecycle::kLegacyRunComplete;
         llc_fill_audit_.finish();
         return stats_;
     }
 
     SimulationWindowResult advance(const SimulationWindow& window) {
+        if (config_.spr_l2_shared_prefetch || config_.spr_l2_llc_resident_prefetch)
+            throw std::invalid_argument("L2 shared prefetch currently supports run(), not advance()");
         if (sync_plan_) throw std::invalid_argument("sync.plan currently supports run(), not execution windows/DVFS");
         if (context_execution_enabled_)
             throw std::invalid_argument("context scoring uses run(); advance() reports execution windows");
@@ -6356,6 +6810,8 @@ class Simulator::Impl {
 
     void set_core_frequencies(
         const std::vector<std::uint64_t>& frequencies_hz) {
+        if(config_.spr_l1_prefetch_l2_only)
+            throw std::invalid_argument("L2-resident prefetch does not support dynamic frequency changes");
         if (lifecycle_ == Lifecycle::kFinished ||
             lifecycle_ == Lifecycle::kLegacyRunComplete) {
             throw std::logic_error(
@@ -6412,6 +6868,10 @@ class Simulator::Impl {
 
     void validate_dvfs_configuration() const {
         if (!dvfs_ever_active_ && frequency_domain_identity()) return;
+        if (config_.ruby_sequencer_ifetch_admission)
+            throw std::invalid_argument("I-fetch Sequencer admission does not support DVFS");
+        if (config_.spr_store_group_merge)
+            throw std::invalid_argument("store-group timing does not support dynamic frequency changes");
         if (config_.ruby_fixed_read_services)
             throw std::invalid_argument("fixed read services do not support DVFS");
         if (config_.store_wait_relief)
@@ -6892,6 +7352,7 @@ class Simulator::Impl {
         stats_.response_critical_cycles.resize(config_.cores);
         stats_.branch_recovery.resize(config_.cores);
         stats_.pending_fill.resize(config_.cores);
+        stats_.unified_parent.resize(config_.cores);
         stats_.response_frontier_settlement.resize(config_.cores);
         stats_.response_residuals.resize(config_.cores);
         if (config_.response_interval_tail_audit)
@@ -6949,6 +7410,9 @@ class Simulator::Impl {
         CoreCounters warmup_total;
         for (const auto& core : cores_) warmup_total += core->total;
         const auto warmup_memory_events = stats_.batch_memory_events;
+        const auto warmup_group_candidates = stats_.spr_store_group_candidates;
+        const auto warmup_group_committed = stats_.spr_store_group_committed;
+        const auto warmup_group_future_fallbacks = stats_.spr_store_group_future_fallbacks;
 
         auto barrier_q16 = phase_global_time_q16_;
         for (const auto& core : cores_) {
@@ -7041,7 +7505,25 @@ class Simulator::Impl {
             measurement_origin_q16_[thread->bound_core] = barrier_q16;
         }
 
+        std::uint64_t warmup_store_credits_live = 0, warmup_store_credit_next_release = 0;
+        std::vector<std::uint64_t> warmup_live_by_core, warmup_release_by_core;
+        if (!response_spr_shared_store_credits_.empty()) {
+            const auto boundary = fixed_to_cycle_ceil(barrier_q16);
+            for (const auto& ledger : response_spr_shared_store_credits_) {
+                auto snapshot = ledger;
+                snapshot.advance(std::max(boundary, snapshot.frontier()));
+                warmup_store_credits_live += snapshot.used();
+                warmup_live_by_core.push_back(snapshot.used());
+                warmup_release_by_core.push_back(snapshot.next_release().value_or(0));
+                if (auto next = snapshot.next_release(); next &&
+                    (!warmup_store_credit_next_release || *next < warmup_store_credit_next_release))
+                    warmup_store_credit_next_release = *next;
+            }
+        }
         initialize_stats(threads_.size());
+        if(spr_l2_prefetch_)spr_l2_prefetch_->reset_counters();
+        if(spr_l2_shared_prefetch_)spr_l2_shared_prefetch_->reset_counters();
+        if(spr_llc_resident_prefetch_)spr_llc_resident_prefetch_->reset_counters();
         if(recorded_scheduler_) {
             recorded_scheduler_->begin_measurement(barrier_q16);
             std::fill(thread_state_task_macros_.begin(),thread_state_task_macros_.end(),0);
@@ -7109,6 +7591,13 @@ class Simulator::Impl {
         stats_.functional_warmup_memory_events = warmup_memory_events;
         stats_.functional_warmup_barrier_cycles =
             fixed_to_cycle_ceil(barrier_q16);
+        stats_.functional_warmup_spr_store_group_candidates = warmup_group_candidates;
+        stats_.functional_warmup_spr_store_group_committed = warmup_group_committed;
+        stats_.functional_warmup_spr_store_group_future_fallbacks = warmup_group_future_fallbacks;
+        stats_.functional_warmup_store_credits_live = warmup_store_credits_live;
+        stats_.functional_warmup_store_credit_next_release = warmup_store_credit_next_release;
+        stats_.functional_warmup_store_credits_live_by_core = std::move(warmup_live_by_core);
+        stats_.functional_warmup_store_credit_next_release_by_core = std::move(warmup_release_by_core);
 
         std::fill(finished_.begin(), finished_.end(), true);
         std::fill(producer_finished_.begin(), producer_finished_.end(), true);
@@ -7239,6 +7728,29 @@ class Simulator::Impl {
         std::uint32_t index = 0;
     };
 
+    struct StoreGroupCandidate {
+        static constexpr std::size_t kMaxMembers = 4;
+        std::uint64_t id = 0, window_id = 0;
+        std::uint64_t owner_sequence = 0, follower_sequence = 0;
+        std::uint32_t core = 0;
+        std::uint32_t owner_event = 0, follower_event = 0;
+        std::size_t batch_rank = 0;
+        std::uint64_t byte_mask = 0;
+        std::array<std::uint64_t,kMaxMembers> member_sequences{};
+        std::array<std::uint32_t,kMaxMembers> member_events{};
+        std::size_t member_count = 0;
+        std::size_t member_of(std::uint64_t sequence) const {
+            for (std::size_t i=0;i<member_count;++i)
+                if (member_sequences[i]==sequence) return i;
+            return member_count;
+        }
+        bool follower_event_of(std::uint32_t event) const {
+            for (std::size_t i=1;i<member_count;++i)
+                if (member_events[i]==event) return true;
+            return false;
+        }
+    };
+
     struct PathConflictPlan {
         std::unordered_set<std::uint64_t> cross_core_lines;
         std::uint64_t component_events = 0;
@@ -7285,6 +7797,15 @@ class Simulator::Impl {
 
     bool store_engine_prepare_active_ = false;
     struct MemoryReplay {
+        ParentServicePool::Facts parent_facts;
+        bool parent_pre_resident = false;
+        // Absolute reference-clock availability for an accepted prefetch follower.
+        std::optional<SprPrefetchService::Follower> prefetch_follow_ready;
+        std::uint64_t prefetch_resource_ticket=0;
+        std::optional<std::uint64_t> fixed_service_ready;
+        // The functional store still retires, but its hierarchy request is
+        // represented by an earlier same-line group owner.
+        bool store_group_follower = false;
         bool bounded_lease_valid=true;
         std::uint64_t bounded_publish_cycles=1;
         std::uint64_t store_engine_send = 0, store_engine_response = 0;
@@ -7395,6 +7916,10 @@ class Simulator::Impl {
         std::array<std::uint64_t,3> od_cause{},od_cause_l1_miss{};
         std::uint64_t takeover_miss_wait=0,miss_service=0;};
     struct TimingFeedback {
+        struct GroupEdges { std::uint64_t offload, callback; };
+        std::vector<std::optional<GroupEdges>> store_group_edges;
+        // Each feedback worker mutates only its own ledger.
+        std::vector<SprSharedStoreCredits> spr_shared_store_credits;
         // Diagnostic only: final O3/SQ issue edge, in reference cycles. Each
         // worker owns one core; only the accepted pass is exported at commit.
         std::vector<std::vector<std::uint64_t>> diagnostic_dram_issue_cycles;
@@ -7404,6 +7929,8 @@ class Simulator::Impl {
         // Absolute local cycles; each core owns its arrays during a solve.
         std::vector<std::vector<std::uint64_t>> fixed_read_responses;
         std::vector<std::vector<std::uint64_t>> fixed_read_issues;
+        // Final per-event CPU callback; used to defer prefetch source/fill visibility.
+        std::vector<std::vector<std::uint64_t>> prefetch_callback_cycles;
         // Exact replay admission edge, captured after CPU/MSHR capacity gates.
         std::vector<std::vector<std::uint64_t>> buffer_service_issue_q16;
         std::vector<std::uint8_t> buffer_service_late_issue_move;
@@ -7449,6 +7976,9 @@ class Simulator::Impl {
         std::vector<std::uint64_t> score_begin_retire_q16;
         std::vector<CriticalCause> interval_critical_cause;
         std::vector<std::vector<std::uint64_t>> sequencer_ready_cycles;
+        // Trial-local copies; only the accepted feedback pass is committed.
+        std::vector<LegacyPrepareTiming> legacy_prepare;
+        std::vector<std::uint64_t> sequencer_acceptance_frontier;
         std::vector<std::vector<std::uint64_t>>
             dtlb_walker_ready_cycles;
         std::vector<std::uint64_t> dtlb_hierarchy_walk_extra_cycles;
@@ -7465,9 +7995,16 @@ class Simulator::Impl {
         std::vector<SequencerCounters> sequencer_counters;
         std::vector<PendingFillTable> pending_fills;
         std::vector<PendingFillCounters> pending_fill_counters;
+        std::vector<ParentServicePool> parent_services;
+        std::vector<UnifiedParentCounters> parent_counters;
         std::vector<PrivateReadServiceCounters> private_read_service_counters;
         std::vector<std::uint64_t> private_read_last_response;
         std::vector<std::vector<std::uint64_t>> iq_ready_cycles;
+        std::vector<SprStoreWindow> spr_store_window;
+        std::vector<SprLoadBank> spr_load_bank;
+        std::vector<SprFillCalendar> spr_l1_load_fill_ready;
+        std::vector<SprFillCalendar> spr_l2_load_fill_ready;
+        std::vector<std::array<std::vector<std::uint64_t>, 3>> partition_iq_ready_cycles;
         std::vector<O3QueueCounters> o3_counters;
         std::vector<std::deque<ResponseRenameRelease>> rename_releases;
         std::vector<std::array<std::uint64_t, kTrackedRegisterClasses>>
@@ -7537,6 +8074,136 @@ class Simulator::Impl {
         // share packed machine words and race despite distinct core indices.
         std::vector<std::uint8_t> rob_head_suffix_open;
     };
+
+    void copy_sequencer_proposal(
+        const TimingFeedback& source,
+        const std::vector<std::uint32_t>& active_cores,
+        TimingFeedback& target) {
+        // Only active cores are solved. Preserve all their transactional state
+        // and counters; inactive retained storage is never read or committed.
+        // The omitted arrays are initialized at core-entry before any read.
+        const auto copy = [&](const auto& from, auto& to) {
+            // Some ledgers deliberately have no default constructor. A shape
+            // change takes the original full-copy path once, then subsequent
+            // epochs retain their capacity and copy only participating cores.
+            if (to.size() != from.size()) {
+                to = from;
+                return;
+            }
+            for (const auto core : active_cores)
+                if (core < from.size()) to[core] = from[core];
+        };
+        const auto output = [&](const auto& from, auto& to) {
+            to.resize(from.size());
+            for (const auto core : active_cores)
+                if (core < from.size()) to[core].clear();
+        };
+#define COPY_PROPOSAL_FIELD(name) copy(source.name, target.name)
+#define OUTPUT_PROPOSAL_FIELD(name) output(source.name, target.name)
+        COPY_PROPOSAL_FIELD(store_group_edges);
+        COPY_PROPOSAL_FIELD(spr_shared_store_credits);
+        OUTPUT_PROPOSAL_FIELD(diagnostic_dram_issue_cycles);
+        COPY_PROPOSAL_FIELD(bounded_store);
+        OUTPUT_PROPOSAL_FIELD(store_engine_retire);
+        OUTPUT_PROPOSAL_FIELD(store_engine_scan);
+        COPY_PROPOSAL_FIELD(store_engine_local_retire);
+        OUTPUT_PROPOSAL_FIELD(fixed_read_responses);
+        OUTPUT_PROPOSAL_FIELD(fixed_read_issues);
+        OUTPUT_PROPOSAL_FIELD(prefetch_callback_cycles);
+        COPY_PROPOSAL_FIELD(buffer_service_issue_q16);
+        COPY_PROPOSAL_FIELD(buffer_service_late_issue_move);
+        OUTPUT_PROPOSAL_FIELD(memory_issue_extra_q16);
+        OUTPUT_PROPOSAL_FIELD(line_generation_actual_issue_q16);
+        OUTPUT_PROPOSAL_FIELD(line_generation_issue_gate);
+        COPY_PROPOSAL_FIELD(sequencer_proposed_issue_extra_q16);
+        COPY_PROPOSAL_FIELD(sequencer_proposed_service_extra_q16);
+        COPY_PROPOSAL_FIELD(sequencer_allocated_callback_cycles);
+        OUTPUT_PROPOSAL_FIELD(buffered_store_publish_cycles);
+        OUTPUT_PROPOSAL_FIELD(buffered_store_demand_cycles);
+        OUTPUT_PROPOSAL_FIELD(buffered_store_original_demands);
+        COPY_PROPOSAL_FIELD(memory_begin);
+        COPY_PROPOSAL_FIELD(interval_extra_q16);
+        COPY_PROPOSAL_FIELD(score_retire_q16);
+        COPY_PROPOSAL_FIELD(score_begin_retire_q16);
+        COPY_PROPOSAL_FIELD(interval_critical_cause);
+        COPY_PROPOSAL_FIELD(sequencer_ready_cycles);
+        COPY_PROPOSAL_FIELD(legacy_prepare);
+        COPY_PROPOSAL_FIELD(sequencer_acceptance_frontier);
+        COPY_PROPOSAL_FIELD(dtlb_walker_ready_cycles);
+        COPY_PROPOSAL_FIELD(dtlb_hierarchy_walk_extra_cycles);
+        COPY_PROPOSAL_FIELD(dtlb_pending_fills);
+        COPY_PROPOSAL_FIELD(dtlb_active_address_space_ids);
+        COPY_PROPOSAL_FIELD(dtlb_active_address_space_valid);
+        COPY_PROPOSAL_FIELD(dtlb_premature_hits);
+        COPY_PROPOSAL_FIELD(dtlb_premature_hit_cycles);
+        COPY_PROPOSAL_FIELD(dtlb_premature_hit_max_cycles);
+        COPY_PROPOSAL_FIELD(sequencer_counters);
+        COPY_PROPOSAL_FIELD(pending_fills);
+        COPY_PROPOSAL_FIELD(pending_fill_counters);
+        COPY_PROPOSAL_FIELD(parent_services);
+        COPY_PROPOSAL_FIELD(parent_counters);
+        COPY_PROPOSAL_FIELD(private_read_service_counters);
+        COPY_PROPOSAL_FIELD(private_read_last_response);
+        COPY_PROPOSAL_FIELD(iq_ready_cycles);
+        COPY_PROPOSAL_FIELD(spr_store_window);
+        COPY_PROPOSAL_FIELD(spr_load_bank);
+        COPY_PROPOSAL_FIELD(spr_l1_load_fill_ready);
+        COPY_PROPOSAL_FIELD(spr_l2_load_fill_ready);
+        COPY_PROPOSAL_FIELD(partition_iq_ready_cycles);
+        COPY_PROPOSAL_FIELD(o3_counters);
+        COPY_PROPOSAL_FIELD(rename_releases);
+        COPY_PROPOSAL_FIELD(rename_live);
+        COPY_PROPOSAL_FIELD(rename_cycle);
+        COPY_PROPOSAL_FIELD(rename_used);
+        COPY_PROPOSAL_FIELD(rename_cause);
+        COPY_PROPOSAL_FIELD(rename_counters);
+        COPY_PROPOSAL_FIELD(dispatch_cycle);
+        COPY_PROPOSAL_FIELD(dispatch_used);
+        COPY_PROPOSAL_FIELD(dispatch_cause);
+        COPY_PROPOSAL_FIELD(rob_ready_cycles);
+        COPY_PROPOSAL_FIELD(lq_ready_cycles);
+        COPY_PROPOSAL_FIELD(sq_ready_cycles);
+        COPY_PROPOSAL_FIELD(sq_frontier_releases);
+        COPY_PROPOSAL_FIELD(rob_next_slot);
+        COPY_PROPOSAL_FIELD(lq_next_slot);
+        COPY_PROPOSAL_FIELD(sq_next_slot);
+        COPY_PROPOSAL_FIELD(commit_cycle);
+        COPY_PROPOSAL_FIELD(commit_used);
+        COPY_PROPOSAL_FIELD(commit_cause);
+        COPY_PROPOSAL_FIELD(store_drain_ready_cycle);
+        COPY_PROPOSAL_FIELD(memory_barrier_ready_cycle);
+        COPY_PROPOSAL_FIELD(branch_recovery_ready_cycle);
+        COPY_PROPOSAL_FIELD(branch_recovery_counters);
+        COPY_PROPOSAL_FIELD(commit_frontier);
+        COPY_PROPOSAL_FIELD(store_drain_frontier);
+        COPY_PROPOSAL_FIELD(open_frontier_cycles);
+        COPY_PROPOSAL_FIELD(open_tail_cycles);
+        COPY_PROPOSAL_FIELD(open_tail_cause);
+        COPY_PROPOSAL_FIELD(frontier_settlement);
+        COPY_PROPOSAL_FIELD(sparse_rob_entries);
+        COPY_PROPOSAL_FIELD(fetch_queue_entries);
+        COPY_PROPOSAL_FIELD(sparse_counters);
+        COPY_PROPOSAL_FIELD(response_residuals);
+        COPY_PROPOSAL_FIELD(interval_tail_audit);
+        COPY_PROPOSAL_FIELD(dram_request_lifecycle);
+        COPY_PROPOSAL_FIELD(response_frontier_audit);
+        COPY_PROPOSAL_FIELD(event_only_calibration_checkpoints);
+        COPY_PROPOSAL_FIELD(event_only_calibration_uops);
+        COPY_PROPOSAL_FIELD(event_only_calibration_estimated_cycles);
+        COPY_PROPOSAL_FIELD(event_only_calibration_exact_cycles);
+        COPY_PROPOSAL_FIELD(event_only_teacher_uops);
+        COPY_PROPOSAL_FIELD(event_only_teacher_estimated_cycles);
+        COPY_PROPOSAL_FIELD(event_only_teacher_exact_cycles);
+        COPY_PROPOSAL_FIELD(event_only_approximation_estimated_cycles);
+        OUTPUT_PROPOSAL_FIELD(rob_head_suffix_uops);
+        COPY_PROPOSAL_FIELD(rob_head_suffix_open);
+#undef OUTPUT_PROPOSAL_FIELD
+#undef COPY_PROPOSAL_FIELD
+        target.event_only_teacher_rate = source.event_only_teacher_rate;
+        target.event_only_teacher_estimate_scale = source.event_only_teacher_estimate_scale;
+        target.event_only_teacher_reference_rate = source.event_only_teacher_reference_rate;
+        target.event_only_teacher_reference_ready = source.event_only_teacher_reference_ready;
+    }
 
     void prepare_buffer_tso_epoch(
         const std::vector<BatchPending>& batch) {
@@ -7668,6 +8335,261 @@ class Simulator::Impl {
         }
     }
 
+    // Freeze at most one disjoint line group per core, four groups per Q.
+    const StoreGroupCandidate* group_for_core(std::uint32_t core) const {
+        return core<active_store_groups_.size() && active_store_groups_[core]
+            ? &*active_store_groups_[core] : nullptr;
+    }
+    void clear_active_groups() {
+        for(auto& group:active_store_groups_)group.reset();
+        active_store_group_count_=0;
+    }
+    void prepare_store_group_candidate(const std::vector<BatchPending>& batch,
+                                       const std::vector<std::size_t>& accepted_begin,
+                                       const std::vector<std::size_t>& accepted_end) {
+        clear_active_groups();
+        if (!config_.spr_store_group_merge) return;
+        if (store_group_window_id_ == std::numeric_limits<std::uint64_t>::max())
+            throw std::overflow_error("store group window identity exhausted");
+        ++store_group_window_id_;
+        if (batch.size() < 2 || response_spr_shared_store_credits_.empty()) return;
+        if (sync_plan_)
+            for (std::uint32_t c = 0; c < config_.cores; ++c)
+                if (sync_frontier_known_[c] || sync_pending_[c]) {
+                    ++stats_.spr_store_group_sync_skipped;
+                    return;
+                }
+        // Prefix store counts advance monotonically per core while walking
+        // the existing global event order; there is no per-cycle scan or
+        // whole-window rescheduling. Worst-case occupied credits include all
+        // earlier stores, even if some would actually have completed.
+        std::vector<std::size_t> cursor = accepted_begin;
+        std::vector<std::size_t> prior_stores(config_.cores, 0);
+        struct LineShape {
+            std::size_t count=0, known_stores=0, first_index=0, first_rank=0, last_rank=0, last_uop=0;
+            std::uint16_t packed_own_stores=0;
+            std::uint8_t first_core=0, last_core=0, cores=0, loads=0, known_store_cores=0, unknown=0;
+            bool contiguous=true, same_chunk=true, safe_gap=true;
+        };
+        std::optional<std::unordered_map<std::uint64_t, LineShape>> line_counts;
+        // Bit flags retain the old yes/no decision while recording all peer
+        // causes; the per-candidate reason counters can overlap.
+        std::optional<std::vector<std::uint16_t>> special_boundary;
+        const auto plain = [](const ChunkMemoryEvent& e,const ChunkUopBound& u) {
+            return e.write && !e.atomic && !e.instruction_fetch && !e.page_walk &&
+                !e.page_fault_state_fill && !e.software_prefetch &&
+                u.memory_count == 1 && u.data_memory_accesses == 1 &&
+                !u.memory_read && !u.locked_rmw && !u.local_no_access &&
+                !u.perf_hardware_entry && !u.perf_precise_fault_abandonment &&
+                !u.serialize_before && !u.serialize_after &&
+                !u.memory_barrier_before && !u.memory_barrier_after;
+        };
+        const auto blocks_gap = [](const ChunkUopBound& u) {
+            return u.memory_count || u.memory_read || u.memory_write || u.memory_uop ||
+                u.local_no_access || u.software_prefetch || u.perf_missing_source ||
+                u.perf_hardware_entry || u.perf_precise_fault_abandonment ||
+                u.locked_rmw || u.serialize_before || u.serialize_after ||
+                u.memory_barrier_before || u.memory_barrier_after;
+        };
+        const auto line_shape = [&](std::uint64_t requested) -> const LineShape& {
+            if (!line_counts) {
+                line_counts.emplace(); line_counts->reserve(batch.size());
+                for (std::size_t event_rank=0;event_rank<batch.size();++event_rank) {
+                    const auto& pending=batch[event_rank];
+                    const auto& resident=current_chunks_[pending.core];
+                    const auto& event=resident.memory(pending.index);
+                    const auto uop_index=resident.memory_uop(pending.index);
+                    const auto& uop=resident.uop(uop_index);
+                    auto& line=(*line_counts)[event.line];
+                    if (!line.count) {
+                        line.first_core=static_cast<std::uint8_t>(pending.core);
+                        line.first_index=pending.index;
+                        line.first_rank=event_rank;
+                    } else {
+                        line.contiguous &= event_rank==line.last_rank+1;
+                        if (pending.core!=line.first_core || pending.core!=line.last_core) {
+                            line.same_chunk=false; line.safe_gap=false;
+                        } else {
+                            line.same_chunk &= resident.same_store_producer_chunk(line.first_index,pending.index);
+                            if (uop_index<=line.last_uop) line.safe_gap=false;
+                            else if (event_rank==line.last_rank+1)
+                                for (auto index=line.last_uop+1;index<uop_index;++index)
+                                    if (blocks_gap(resident.uop(index))) {line.safe_gap=false;break;}
+                        }
+                    }
+                    ++line.count; line.last_rank=event_rank; line.last_uop=uop_index;
+                    line.last_core=static_cast<std::uint8_t>(pending.core);
+                    const auto bit=static_cast<std::uint8_t>(1u<<pending.core);
+                    line.cores |= bit;
+                    if (plain(event,uop) && resident.store_input(pending.index)) {
+                        ++line.known_stores; line.known_store_cores |= bit;
+                        const auto shift=static_cast<unsigned>(pending.core)*3u;
+                        const auto old=static_cast<std::uint16_t>((line.packed_own_stores>>shift)&7u);
+                        if(old<7) line.packed_own_stores += static_cast<std::uint16_t>(1u<<shift);
+                    } else if (!event.write && !event.atomic && !event.page_walk &&
+                               !event.instruction_fetch && !event.software_prefetch) {
+                        line.loads |= bit;
+                    } else line.unknown |= bit;
+                }
+            }
+            return line_counts->at(requested);
+        };
+        for (std::size_t rank = 0; rank + 1 < batch.size(); ++rank) {
+            const auto& a = batch[rank]; const auto& b = batch[rank + 1];
+            if (a.core != b.core) continue;
+            ++stats_.spr_store_pair_same_core;
+            const auto core = a.core;
+            if (group_for_core(core)) continue;
+            const auto& chunk = current_chunks_[core];
+            const auto& ae = chunk.memory(a.index); const auto& be = chunk.memory(b.index);
+            if (!ae.write || !be.write) continue;
+            ++stats_.spr_store_pair_both_write;
+            if (ae.line != be.line) continue;
+            ++stats_.spr_store_pair_same_line;
+            const auto au = chunk.memory_uop(a.index), bu = chunk.memory_uop(b.index);
+            if (au == accepted_begin[core]) ++stats_.spr_store_pair_first_uop;
+            if (au < cursor[core] || bu <= au) continue;
+            if (bu == au + 1) ++stats_.spr_store_pair_uop_adjacent;
+            while (cursor[core] < au) {
+                const auto& previous = chunk.uop(cursor[core]++);
+                prior_stores[core] += previous.memory_write || previous.locked_rmw ||
+                    previous.dispatch_store;
+            }
+            bool safe_gap = true;
+            for (auto index = au + 1; index < bu; ++index)
+                if (blocks_gap(chunk.uop(index))) { safe_gap = false; break; }
+            if (!safe_gap) continue;
+            ++stats_.spr_store_pair_gap_nonmemory;
+            if (!chunk.same_store_producer_chunk(a.index,b.index)) continue;
+            ++stats_.spr_store_pair_same_chunk;
+            const auto& ab = chunk.uop(au); const auto& bb = chunk.uop(bu);
+            if (!plain(ae,ab) || !plain(be,bb)) continue;
+            if (!buffered_tso_permission_prepare(ae)) {
+                // Cross-core same-line conflicts are excluded here, before
+                // the later known-facts/line-count eligibility stages.
+                if (buffer_tso_conflict_lines_.find(ae.line) != buffer_tso_conflict_lines_.end()) {
+                    const auto& line = line_shape(ae.line);
+                    const auto others = static_cast<std::uint8_t>(~static_cast<std::uint8_t>(1u<<core));
+                    if (line.cores & others) {
+                        ++stats_.spr_store_line_prefilter_peer;
+                        stats_.spr_store_line_prefilter_peer_store += (line.known_store_cores & others)!=0;
+                        stats_.spr_store_line_prefilter_peer_load += (line.loads & others)!=0;
+                        stats_.spr_store_line_prefilter_peer_unknown += (line.unknown & others)!=0;
+                    }
+                }
+                continue;
+            }
+            ++stats_.spr_store_pair_ordinary;
+            const auto af = chunk.store_input(a.index), bf = chunk.store_input(b.index);
+            if (!af || !bf || af->line != bf->line || af->flags != bf->flags ||
+                af->context != bf->context || af->requestor != bf->requestor) continue;
+            ++stats_.spr_store_pair_known_facts;
+            const auto& line = line_shape(ae.line);
+            if (line.count != 2) {
+                const auto own=static_cast<std::uint8_t>(1u<<core);
+                const auto others=static_cast<std::uint8_t>(~own);
+                const auto own_known=(line.packed_own_stores>>(static_cast<unsigned>(core)*3u))&7u;
+                stats_.spr_store_line_own_store += own_known>2;
+                stats_.spr_store_line_own_load += (line.loads & own)!=0;
+                stats_.spr_store_line_own_unknown += (line.unknown & own)!=0;
+                stats_.spr_store_line_peer += (line.cores & others)!=0;
+                stats_.spr_store_line_peer_store += (line.known_store_cores & others)!=0;
+                stats_.spr_store_line_peer_load += (line.loads & others)!=0;
+                stats_.spr_store_line_peer_unknown += (line.unknown & others)!=0;
+                const bool all_own_stores=line.cores==own && line.known_stores==line.count;
+                stats_.spr_store_line_all_own_stores += all_own_stores;
+                // Functional shape only: equal Request flags, capacity and
+                // final visibility remain unproven by these counters.
+                if (all_own_stores && line.contiguous && line.same_chunk && line.safe_gap) {
+                    stats_.spr_store_line_run_3 += line.count==3;
+                    stats_.spr_store_line_run_4 += line.count==4;
+                }
+                if (line.count > StoreGroupCandidate::kMaxMembers ||
+                    !all_own_stores || !line.contiguous || !line.same_chunk ||
+                    !line.safe_gap || rank != line.first_rank) {
+                    ++stats_.spr_store_pair_reject_same_line;
+                    continue;
+                }
+            }
+            const auto member_count=line.count;
+            StoreGroupCandidate group;
+            group.core=core; group.batch_rank=rank; group.member_count=member_count;
+            bool matching_facts=true;
+            for (std::size_t member=0;member<member_count;++member) {
+                const auto& entry=batch[rank+member];
+                if (entry.core!=core) { matching_facts=false; break; }
+                const auto& event=chunk.memory(entry.index);
+                const auto& uop=chunk.uop(chunk.memory_uop(entry.index));
+                const auto facts=chunk.store_input(entry.index);
+                if (!plain(event,uop) || !facts || facts->line!=af->line ||
+                    facts->flags!=af->flags || facts->context!=af->context ||
+                    facts->requestor!=af->requestor) {matching_facts=false;break;}
+                group.member_sequences[member]=uop.sequence;
+                group.member_events[member]=entry.index;
+                group.byte_mask |= facts->byte_mask;
+            }
+            if (!matching_facts) {++stats_.spr_store_pair_reject_same_line;continue;}
+            if (!special_boundary) {
+                special_boundary.emplace(config_.cores, 0);
+                for (const auto& pending : batch)
+                    if (current_chunks_[pending.core].memory(pending.index).atomic)
+                        (*special_boundary)[pending.core] |= 1u;
+                for (std::uint32_t other = 0; other < config_.cores; ++other)
+                    for (auto index = accepted_begin[other]; index < accepted_end[other]; ++index) {
+                        const auto& u = current_chunks_[other].uop(index);
+                        auto& bits=(*special_boundary)[other];
+                        if (u.perf_missing_source) bits |= 2u;
+                        if (u.local_no_access) bits |= 4u;
+                        if (u.perf_hardware_entry) bits |= 8u;
+                        if (u.perf_precise_fault_abandonment) bits |= 16u;
+                        if (u.serialize_before || u.serialize_after) bits |= 32u;
+                        if (u.memory_barrier_before || u.memory_barrier_after) bits |= 64u;
+                        if (u.locked_rmw) bits |= 128u;
+                    }
+            }
+            std::uint16_t other_special = 0;
+            for (std::uint32_t other = 0; other < config_.cores; ++other)
+                if (other != core) other_special |= (*special_boundary)[other];
+            if (other_special) {
+                ++stats_.spr_store_pair_reject_peer_special;
+                stats_.spr_store_pair_peer_atomic += (other_special & 1u) != 0;
+                stats_.spr_store_pair_peer_mmio += (other_special & 2u) != 0;
+                stats_.spr_store_pair_peer_noaccess += (other_special & 4u) != 0;
+                stats_.spr_store_pair_peer_hardware += (other_special & 8u) != 0;
+                stats_.spr_store_pair_peer_precise_fault += (other_special & 16u) != 0;
+                stats_.spr_store_pair_peer_serialize += (other_special & 32u) != 0;
+                stats_.spr_store_pair_peer_barrier += (other_special & 64u) != 0;
+                stats_.spr_store_pair_peer_locked += (other_special & 128u) != 0;
+                continue;
+            }
+            ++stats_.spr_store_pair_line_uncontended;
+            const auto capacity = config_.effective_sq_entries();
+            const auto required = prior_stores[core] + member_count;
+            if (required > capacity || response_sq_ready_cycles_[core].size() != capacity) continue;
+            auto credits = response_spr_shared_store_credits_[core];
+            const auto earliest = std::max(credits.frontier(),
+                saturating_add(ab.dispatch_q16 / kCycleUnit, interval_gap_q16_[core] / kCycleUnit));
+            credits.probe(earliest);
+            if (credits.used() > capacity - required) continue;
+            const auto slot = response_sq_next_slot_[core];
+            bool fifo_ready = true;
+            for (std::size_t i = 0; i < required; ++i)
+                if (response_sq_ready_cycles_[core][(slot + i) % capacity] > earliest) {
+                    fifo_ready = false; break;
+                }
+            if (!fifo_ready) continue;
+            ++stats_.spr_store_pair_budget_available;
+            group.id=store_group_ids_.allocate(); group.window_id=store_group_window_id_;
+            group.owner_sequence=group.member_sequences[0]; group.follower_sequence=group.member_sequences[1];
+            group.owner_event=group.member_events[0]; group.follower_event=group.member_events[1];
+            active_store_groups_[core] = group;
+            ++active_store_group_count_;
+            ++stats_.spr_store_group_candidates;
+            if (!config_.spr_store_multi_group ||
+                active_store_group_count_ == active_store_groups_.size()) return;
+        }
+    }
+
     bool buffered_tso_permissions_intact(
         const std::vector<BatchPending>& batch,
         const std::vector<std::vector<MemoryReplay>>& feedback) const {
@@ -7744,6 +8666,22 @@ class Simulator::Impl {
                            right.sequence, right.ordinal);
             });
         for (const auto& publish : publishes) {
+            if (spr_l2_shared_prefetch_) {
+                const auto now = std::max(fixed_to_cycle_ceil(publish.reference_cycle_q16),
+                    spr_l2_shared_prefetch_->frontier);
+                // A store may have a later FIFO edge than the last demand in
+                // its batch. Preserve that edge across Qs and cancel any
+                // prefetch generated after the earlier store replay.
+                spr_l2_prefetch_->cancel_line(publish.line, now);
+                if (spr_llc_resident_prefetch_)
+                    spr_llc_resident_prefetch_->cancel_before_write(publish.line, now);
+                if (config_.spr_l2_prefetch_follow)
+                    spr_l2_shared_prefetch_->note_local_store_publication(
+                        publish.line,publish.core,fixed_to_cycle_ceil(publish.reference_cycle_q16));
+                else
+                    spr_l2_shared_prefetch_->note_store_publication(
+                        publish.line, publish.core, now);
+            }
             if (config_.buffer_tso_prepare_lifecycle) {
                 const auto position = publish.index - timing.memory_begin[publish.core];
                 if (timing.buffered_store_original_demands[publish.core][position]) {
@@ -7802,6 +8740,12 @@ class Simulator::Impl {
                 throw std::logic_error(
                     "buffered store lost prepared permission before publish");
             }
+            // The prepare classifier intentionally skipped this request; the
+            // legacy path has no separate demand replay to account for it.
+            // This is the legacy request-event counter, not macro retirement.
+            const auto& event = current_chunks_[publish.core].memory(publish.index);
+            if (!event.instruction_fetch && !event.software_prefetch)
+                ++cores_[publish.core]->total.perf_retired_stores;
         }
     }
 
@@ -8277,6 +9221,10 @@ class Simulator::Impl {
                   cores_[core]->total,
                   transaction);
         MemoryReplay replay;
+        // access() returns the lookup result from before install(); reuse it
+        // rather than introducing a second tag lookup on every local hit.
+        replay.parent_pre_resident = private_result.level==HitLevel::kL1 ||
+            private_result.level==HitLevel::kL2;
         replay.private_level = private_result.level;
         replay.l2_evicted = private_result.l2_evicted;
         replay.l2_evicted_dirty = private_result.l2_evicted_dirty;
@@ -8506,7 +9454,8 @@ class Simulator::Impl {
         const std::vector<std::size_t>& accepted_begin,
         const std::vector<std::size_t>& accepted_end,
         const std::vector<std::uint32_t>& active_cores,
-        TimingFeedback& timing) {
+        TimingFeedback& timing,
+        const std::function<void(std::uint32_t)>* initialize_core = nullptr) {
         ensure_domain_workers();
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -8520,6 +9469,7 @@ class Simulator::Impl {
             timing_end_ = &accepted_end;
             timing_active_cores_ = &active_cores;
             timing_output_ = &timing;
+            timing_initialize_core_ = initialize_core;
             domain_task_ = DomainPhaseTask::kTimingFeedback;
             domain_next_core_.store(0, std::memory_order_relaxed);
             domain_task_count_ = static_cast<std::uint32_t>(
@@ -8543,6 +9493,7 @@ class Simulator::Impl {
             timing_end_ = nullptr;
             timing_active_cores_ = nullptr;
             timing_output_ = nullptr;
+            timing_initialize_core_ = nullptr;
         }
         const auto ended = std::chrono::steady_clock::now();
         ++stats_.domain_phase_calls;
@@ -8693,6 +9644,7 @@ class Simulator::Impl {
                         }
                         const auto active_core =
                             (*timing_active_cores_)[core];
+                        if (timing_initialize_core_) (*timing_initialize_core_)(active_core);
                         compute_core_timing_feedback(
                             active_core, *timing_event_feedback_,
                             *timing_begin_, *timing_end_,
@@ -8761,6 +9713,8 @@ class Simulator::Impl {
         const auto core_id = thread.bound_core;
         auto& core = *cores_[core_id];
         auto chunk = acquire_recycled_chunk(core_id);
+        if ((config_.spr_store_sq_join_credit_proxy || config_.spr_store_group_merge) && !chunk->store_facts)
+            chunk->store_facts = std::make_unique<SprStoreFactsChunk>();
         chunk->interval_bound = core.interval != nullptr;
         chunk->context_only = thread.score_marker_emitted ||
             (thread.trace->has_score_range() && !thread.score_begin_emitted);
@@ -9435,6 +10389,16 @@ class Simulator::Impl {
                             address_space_id, std::move(branch_fetch),
                             hierarchy_page_walk_latency_override,
                             branch_prediction.btb_hit_latency);
+                    chunk->counters.spr_dtlb_stlb_hits += interval_timing.spr_dtlb_stlb_hits;
+                    chunk->counters.spr_dtlb_stlb_misses += interval_timing.spr_dtlb_stlb_misses;
+                    chunk->counters.spr_dtlb_stlb_fallbacks += interval_timing.spr_dtlb_stlb_fallbacks;
+                    chunk->counters.spr_dtlb_stlb_flushes += interval_timing.spr_dtlb_stlb_flushes;
+                    chunk->counters.spr_dtlb_stlb_missing_controls += interval_timing.spr_dtlb_stlb_missing_controls;
+                    chunk->counters.spr_dtlb_stlb_unqualified_boundary += interval_timing.spr_dtlb_stlb_unqualified_boundary;
+                    chunk->counters.spr_itlb_hits += interval_timing.spr_itlb_hits;
+                    chunk->counters.spr_itlb_stlb_hits += interval_timing.spr_itlb_stlb_hits;
+                    chunk->counters.spr_itlb_stlb_misses += interval_timing.spr_itlb_stlb_misses;
+                    chunk->counters.spr_itlb_unknown += interval_timing.spr_itlb_unknown;
                     if (timed_speculative_prediction) {
                         core.predictor.schedule_commit(
                             branch_prediction.sequence,
@@ -9846,15 +10810,22 @@ class Simulator::Impl {
                     }
                     interval_uop_index = chunk->uops.size();
                     ChunkUopBound bound;
+                    bound.rename_eliminated = interval_timing.rename_decision.eliminated();
                     std::copy(
                         record.producer_dists.begin(),
                         record.producer_dists.end(),
                         bound.producer_dists.begin());
                     bound.producer_dists.back() =
                         interval_timing.store_set_dependency_distance;
+                    if (bound.rename_eliminated) {
+                        bound.producer_dists.fill(0);
+                        std::copy(interval_timing.rename_decision.producers.begin(),
+                                  interval_timing.rename_decision.producers.end(),
+                                  bound.producer_dists.begin());
+                    }
                     const auto& extensions =
                         thread.trace->current_dependency_extensions();
-                    if (!extensions.empty()) {
+                    if (!bound.rename_eliminated && !extensions.empty()) {
                         chunk->dependency_rows.push_back(ChunkDependencyExtension{
                             interval_uop_index, chunk->dependency_distances.size(),
                             extensions.size()});
@@ -9909,6 +10880,8 @@ class Simulator::Impl {
                     bound.fu_occupancy_cycles =
                         interval_timing.fu_occupancy_cycles;
                     bound.fu_pool = interval_timing.fu_pool;
+                    if (config_.spr_partitioned_iq)
+                        bound.spr_iq_partition = spr_iq_partition(record.canonical_op_class());
                     bound.memory_read = has_flag(record.flags, kLoad) ||
                         has_flag(record.flags, kAtomic);
                     bound.memory_write = record.is_write();
@@ -9943,6 +10916,15 @@ class Simulator::Impl {
                     bound.dtlb_access = interval_timing.dtlb_access;
                     bound.dtlb_miss = interval_timing.dtlb_miss;
                     chunk->uops.push_back(bound);
+                    if(config_.spr_l1_prefetch_l2_only) {
+                        // Each predictor belongs to one physical CPU context;
+                        // a constant context is an index permutation within that
+                        // independent predictor, not a guessed process ASID.
+                        chunk->prefetch_inputs.push_back(spr_prefetch_input(
+                            record,thread.trace->current_ordinary_load_eligible(),
+                            std::uint64_t{0},thread.trace->current_translation_fragments(),
+                            thread.trace->current_memory_facts()));
+                    }
                     if(llc_fill_audit_.enabled()) {
                         const auto ordinal=thread.trace->current_source_record_ordinal();
                         if(!ordinal)throw std::runtime_error("LLC audit requires raw FST ordinals");
@@ -10465,6 +11447,66 @@ class Simulator::Impl {
                         has_flag(record.flags, kAtomic),
                     fill_page_state && line == first_line,
                     page_first_line});
+                if(config_.spr_l2_prefetch_follow) {
+                    if(const auto* facts=thread.trace->current_store_facts()) {
+                        const auto excluded=fst::kStoreNoAccess | fst::kStoreSecure |
+                            fst::kStoreUncacheable | fst::kStoreStrictlyOrdered;
+                        chunk->memory.back().spr_l2_train_eligible=
+                            (facts->attributes & fst::kStoreFactsComplete) &&
+                            !(facts->attributes & excluded) && has_flag(record.flags,kPhysicalAddress);
+                    }
+                }
+                if (config_.spr_l2_prefetch_follow && record.is_write()) {
+                    const auto input=spr_store_input(record,thread.trace->current_store_facts());
+                    chunk->memory.back().spr_l2_getx_eligible = input && input->line==line;
+                }
+                if (config_.spr_store_window_feedback)
+                  if (const auto* facts = thread.trace->current_store_facts()) {
+                    constexpr auto forbidden = fst::kStoreNoAccess | fst::kStoreSplit |
+                        fst::kStoreMasked | fst::kStoreSecure | fst::kStoreAtomic |
+                        fst::kStoreUncacheable | fst::kStoreStrictlyOrdered |
+                        fst::kStoreHtm | fst::kStoreSpecial;
+                    const auto required = fst::kStoreFactsComplete | fst::kStoreOrdinary;
+                    chunk->memory.back().spr_ordinary_store = record.is_write() &&
+                        (facts->attributes & required) == required &&
+                        (facts->attributes & forbidden) == 0;
+                }
+                if ((config_.spr_store_sq_join_credit_proxy || config_.spr_store_group_merge) && record.is_write()) {
+                    auto input = spr_store_input(record, thread.trace->current_store_facts());
+                    if (input && input->line != line) input.reset();
+                    if (chunk->memory.size() - 1 > std::numeric_limits<std::uint32_t>::max())
+                        throw std::overflow_error("store facts chunk index overflow");
+                    chunk->store_facts->append(static_cast<std::uint32_t>(chunk->memory.size() - 1), input);
+                }
+                if ((config_.spr_load_fill_feedback || config_.spr_load_bank_feedback ||
+                     unified_parent_active_) && !record.is_write())
+                    chunk->memory.back().spr_ordinary_load =
+                        thread.trace->current_ordinary_load_eligible().value_or(false);
+                if (config_.spr_load_bank_feedback && !record.is_write()) {
+                    const auto* facts=thread.trace->current_memory_facts();
+                    const bool split=facts && (facts->attributes & fst::kStoreSplit);
+                    const bool single=physical_range_contiguous &&
+                        record.size <= line_size - (record.address % line_size) &&
+                        (!dynamic_translation || thread.trace->current_translation_fragments().size()==1);
+                    const bool facts_complete=facts && (facts->attributes & fst::kStoreFactsComplete);
+                    const bool known_packet=SprLoadBank::packet_eligible(
+                        has_flag(record.flags,kPhysicalAddress),true,facts_complete,split,single);
+                    chunk->memory.back().spr_port_eligible=known_packet;
+                    if (config_.spr_load_port_fallback_proxy) {
+                        constexpr auto known_special = fst::kStoreNoAccess | fst::kStoreMasked |
+                            fst::kStoreSecure | fst::kStoreAtomic | fst::kStoreUncacheable |
+                            fst::kStoreStrictlyOrdered | fst::kStoreHtm | fst::kStoreSpecial;
+                        const auto ordinary=thread.trace->current_ordinary_load_eligible();
+                        chunk->memory.back().spr_port_proxy_special =
+                            (ordinary && !*ordinary) ||
+                            (facts && ((facts->attributes & known_special) ||
+                                       (facts->attributes & ~fst::kKnownStoreAttributes)));
+                    }
+                    if (known_packet && chunk->memory.back().spr_ordinary_load) {
+                        chunk->memory.back().spr_bank_eligible=true;
+                        chunk->memory.back().spr_bank_offset=static_cast<std::uint8_t>(record.address % line_size);
+                    }
+                }
                 chunk->memory.back().task_pmu_member=task_pmu_member;
                 chunk->memory.back().software_prefetch = thread.trace->current_memory_request_role() ==
                     fst::MemoryRequestRole::SoftwarePrefetch;
@@ -10555,6 +11597,8 @@ class Simulator::Impl {
             thread.score_begin_emitted = true;
         }
         capture_score_marker();
+        if (config_.spr_store_sq_join_credit_proxy || config_.spr_store_group_merge)
+            chunk->store_facts->seal(chunk->memory.size());
         thread.functional_total.add(chunk->counters);
         if (chunk->score_prefix) {
             thread.functional_total.add(*chunk->score_prefix);
@@ -11538,7 +12582,7 @@ class Simulator::Impl {
             interval_gap_q16_[core] / kCycleUnit);
         for (const auto& entry : rob) {
             if (entry.sequence != std::numeric_limits<std::uint64_t>::max() &&
-                entry.completion_cycle >= earliest) calendar.reserve(entry.completion_cycle);
+                !entry.rename_eliminated && entry.completion_cycle >= earliest) calendar.reserve(entry.completion_cycle);
         }
         return calendar;
     }
@@ -11546,8 +12590,9 @@ class Simulator::Impl {
     bool try_compute_response_inactive_segment(
         std::uint32_t core, std::size_t begin, std::size_t end,
         TimingFeedback& timing) const {
-        if (!config_.response_activity_certificate ||
+        if (config_.spr_partitioned_iq || !config_.response_activity_certificate ||
             config_.response_pending_fill ||
+            unified_parent_active_ ||
             !config_.response_sparse_scoreboard ||
             config_.response_paired_frontier ||
             config_.response_fetch_queue_feedback ||
@@ -11645,12 +12690,12 @@ class Simulator::Impl {
                 dispatch_used = 0;
             }
             const auto admitted_dispatch = std::max(
-                dispatch_cycle, candidate_iq.front());
+                dispatch_cycle, bound.rename_eliminated ? 0 : candidate_iq.front());
             if (admitted_dispatch > proposed_dispatch) {
                 return reject();
             }
             ++dispatch_used;
-            if (candidate_o3.iq_max_occupancy <
+            if (!bound.rename_eliminated && candidate_o3.iq_max_occupancy <
                 candidate_iq.size()) {
                 const auto active = static_cast<std::uint64_t>(
                     std::count_if(
@@ -11724,8 +12769,10 @@ class Simulator::Impl {
             const auto actual_completion = saturating_add(
                 bound.completion_q16 / kCycleUnit,
                 interval_gap_cycles);
-            if (writebacks.allocate(actual_completion) != actual_completion) return reject();
-            replace_min(candidate_iq, consumer_base_issue);
+            if (!bound.rename_eliminated) {
+                if (writebacks.allocate(actual_completion) != actual_completion) return reject();
+                replace_min(candidate_iq, consumer_base_issue);
+            }
 
             const auto base_retire = saturating_add(
                 bound.retire_q16 / kCycleUnit,
@@ -11749,6 +12796,7 @@ class Simulator::Impl {
 
             auto& entry = candidate_sparse[rob_next_slot];
             entry.sequence = bound.sequence;
+            entry.rename_eliminated = bound.rename_eliminated;
             entry.completion_cycle = actual_completion;
             entry.store_set_completion_cycle = actual_completion;
             entry.completion_extension_cycles = 0;
@@ -11995,6 +13043,120 @@ class Simulator::Impl {
             CriticalCause::kUnattributed;
     }
 
+    ParentServicePool::Id resolve_parent_service(
+        std::uint32_t core, const ChunkMemoryEvent& event, const MemoryReplay& replay,
+        bool deferred_store, std::uint64_t admission, std::uint64_t& response,
+        bool needs_lease, ParentServicePool& pool, UnifiedParentCounters& counters) const {
+        ++counters.requests;
+        if (unified_parent_v2_ && replay.l2_evicted) pool.invalidate(replay.l2_evicted_line);
+        const bool ordinary = event.spr_ordinary_load && !event.modeled_address &&
+            !deferred_store && !event.write && !event.atomic &&
+            !event.page_walk && !event.instruction_fetch && !event.software_prefetch &&
+            !event.forwarded_load && !event.page_fault_state_fill &&
+            !replay.software_prefetch_skipped && !replay.sequencer_coalesced;
+        counters.ordinary_reads += ordinary;
+        if (!ordinary) ++counters.special_fallbacks;
+        const bool data_fill = ordinary &&
+            (replay.private_level != HitLevel::kL1 || replay.shared_escape);
+        if (ordinary && !data_fill && !needs_lease && pool.index_size()==0) {
+            ++counters.hit_fast_returns;
+            return ParentServicePool::none;
+        }
+        const bool safe_line = parent_line_safe(core,event.line);
+        if ((!ordinary && !(unified_parent_v2_ && deferred_store)) ||
+            !safe_line || data_fill) pool.invalidate(event.line);
+        if (ordinary && safe_line && !data_fill) {
+            const auto decision = pool.decide(event.line,admission);
+            if (decision.outcome == ParentServicePool::Outcome::kFollower) {
+                ++counters.followers;
+                const auto ready = pool.get(decision.id)->data_ready;
+                auto required = ready;
+                if (unified_parent_v2_) {
+                    const auto gate = pool.read_gate(decision.id,admission,event.source_sequence);
+                    const auto& parent = *pool.get(decision.id);
+                    const auto data_wait = parent.data_ready > admission ? parent.data_ready-admission : 0;
+                    const auto control_wait = parent.controller_ready > admission ? parent.controller_ready-admission : 0;
+                    counters.data_waits += data_wait != 0; counters.data_wait_cycles += data_wait;
+                    counters.controller_waits += control_wait != 0; counters.controller_wait_cycles += control_wait;
+                    // Certified local hits execute their own existing local
+                    // path once after the controller/data gates open.
+                    if (replay.shared_timing.path != SharedTimingPath::kLocal) {
+                        ++counters.source_fallbacks;
+                        required = response;
+                    } else required = saturating_add(gate,response-admission);
+                }
+                if (unified_parent_wait_ && required > response) {
+                    ++counters.waits;
+                    const auto wait = required - response;
+                    counters.wait_cycles += wait;
+                    counters.max_wait_cycles = std::max(counters.max_wait_cycles,wait);
+                    response = required;
+                }
+            } else if (decision.outcome == ParentServicePool::Outcome::kFuture) {
+                ++counters.future_fallbacks;
+            } else if (decision.outcome == ParentServicePool::Outcome::kUncertified) {
+                ++counters.source_fallbacks;
+            }
+        }
+        if (!data_fill && !needs_lease) return ParentServicePool::none;
+        // The selected lower service is frozen. Final CPU admission may not
+        // be later than that source edge; max(ready,issue+hit) is not a source
+        // certificate. Unsupported generations remain visible as UNKNOWN.
+        const auto selected = fixed_to_cycle_ceil(local_horizon_q16(
+            core,cycles_to_fixed(replay.shared_stage_issue_cycle)));
+        bool certified = data_fill && safe_line &&
+            admission == saturating_add(selected,memory_admission_delay_cycles(event)) &&
+            response >= fixed_to_cycle_ceil(local_horizon_q16(
+                core,cycles_to_fixed(replay.shared_response_cycle))) &&
+            !replay.functional_carried;
+        using P=ParentServicePool;
+        const auto selected_response=fixed_to_cycle_ceil(local_horizon_q16(
+            core,cycles_to_fixed(replay.shared_response_cycle)));
+        auto source_decision=!safe_line ? P::SourceDecision::kTargetUnknown :
+            !data_fill ? P::SourceDecision::kUnsupportedAction :
+            replay.functional_carried ? P::SourceDecision::kCarried :
+            admission!=saturating_add(selected,memory_admission_delay_cycles(event))
+                ? P::SourceDecision::kAdmissionMismatch :
+            response<selected_response ? P::SourceDecision::kCallbackBeforeSelected :
+            P::SourceDecision::kSplit;
+        const bool owns_private_fill=unified_parent_v2_ && certified;
+        if (owns_private_fill && !pool.can_own(true,admission)) {
+            source_decision=pool.own_decision(true,admission);
+            certified=false;
+            ++counters.resource_source_fallbacks;
+        }
+        pool.compact_expiry();
+        const auto id = pool.create(event.line,event.source_sequence,admission,response,
+            certified ? ParentServicePool::Time::kFinalLocal : ParentServicePool::Time::kUnknown,
+            data_fill && safe_line);
+        if (id == ParentServicePool::none) {
+            counters.source_decision(P::Role::kLoad,P::Action::kFetchShared,
+                P::SourceDecision::kHostCapacity);
+            ++counters.capacity_fallbacks;
+            // A missing resource owner cannot be replaced with a fabricated
+            // zero release. Fail this experiment closed; never drop requests.
+            if (needs_lease) throw std::runtime_error("unified parent service pool capacity exhausted");
+        } else {
+            counters.source_decision(P::Role::kLoad,P::Action::kFetchShared,source_decision);
+            ++counters.services;
+            counters.certified_services += certified;
+            if (unified_parent_v2_)
+                pool.set_service(id,ParentServicePool::Action::kFetchShared,
+                    ParentServicePool::Role::kLoad,response,0,response,
+                    certified ? ParentServicePool::Time::kFinalLocal : ParentServicePool::Time::kUnknown);
+            if (unified_parent_v2_ && certified) {
+                // The final local callback is a conservative private data
+                // upper edge; no earlier physical fill is claimed here.
+                pool.own(id,true,admission);
+                ++counters.tbe_allocations;
+                ++counters.fill_allocations;
+            }
+            counters.max_records = std::max(counters.max_records,
+                static_cast<std::uint64_t>(pool.peak()));
+        }
+        return id;
+    }
+
     std::uint64_t close_pending_fill_response(
         const ChunkMemoryEvent& event, const MemoryReplay& replay,
         std::uint64_t admission, std::uint64_t response,
@@ -12169,6 +13331,8 @@ class Simulator::Impl {
             const bool sparse_scoreboard =
                 MaterializedFastKernel ||
                 config_.response_sparse_scoreboard;
+            const bool legacy_store_audit = config_.legacy_prepare_timing_enabled() &&
+                store_window_audit;
             const bool attribute_cycles =
                 !MaterializedFastKernel && config_.cpi_attribution;
             const bool response_fetch_queue_feedback =
@@ -12242,6 +13406,8 @@ class Simulator::Impl {
                 timing.fixed_read_responses[core].assign(memory_event_upper_bound, 0);
                 timing.fixed_read_issues[core].assign(memory_event_upper_bound, 0);
             }
+            if (config_.spr_l2_prefetch_follow)
+                timing.prefetch_callback_cycles[core].assign(memory_event_upper_bound,0);
             if (config_.reference_store_timing()) {
                 timing.store_engine_retire[core].assign(memory_event_upper_bound, 0);
                 timing.store_engine_scan[core].assign(memory_event_upper_bound, 0);
@@ -12316,7 +13482,7 @@ class Simulator::Impl {
             // common case; this is timing-equivalent, not a capacity bypass.
             auto& mshr_ready_cycles =
                 scratch.l1_mshr_ready_cycles;
-            if (memory_event_upper_bound > config_.l1d_mshrs) {
+            if (!unified_parent_active_ && memory_event_upper_bound > config_.l1d_mshrs) {
                 mshr_ready_cycles.assign(config_.l1d_mshrs, 0);
             } else {
                 mshr_ready_cycles.clear();
@@ -12330,14 +13496,20 @@ class Simulator::Impl {
             // request is stalled (same invariant the size guard relies on).
             // With relief disabled the calendar stays empty and behavior is
             // bit-identical.
-            if (memory_event_upper_bound > config_.l2_mshrs ||
-                config_.mlp_exposure_relief > 0.0) {
+            if (!unified_parent_active_ && (memory_event_upper_bound > config_.l2_mshrs ||
+                config_.mlp_exposure_relief > 0.0)) {
                 l2_mshr_ready_cycles.assign(config_.l2_mshrs, 0);
             } else {
                 l2_mshr_ready_cycles.clear();
             }
+            if (unified_parent_active_)
+                timing.parent_services[core].begin_checkpoint(
+                    memory_event_upper_bound > config_.l1d_mshrs ? config_.l1d_mshrs : 0,
+                    memory_event_upper_bound > config_.l2_mshrs ? config_.l2_mshrs : 0);
             auto& sequencer_ready =
                 timing.sequencer_ready_cycles[core];
+            auto* sequencer_acceptance_frontier = config_.ruby_sequencer_ifetch_admission
+                ? &timing.sequencer_acceptance_frontier[core] : nullptr;
             auto& dtlb_walker_ready =
                 timing.dtlb_walker_ready_cycles[core];
             auto& dtlb_pending_fills =
@@ -12494,6 +13666,11 @@ class Simulator::Impl {
                 sequencer_event_order.clear();
             }
             auto& iq_ready = timing.iq_ready_cycles[core];
+            auto& spr_store_window = timing.spr_store_window[core];
+            auto& spr_load_bank = timing.spr_load_bank[core];
+            auto& spr_l1_load_fill_ready = timing.spr_l1_load_fill_ready[core];
+            auto& spr_l2_load_fill_ready = timing.spr_l2_load_fill_ready[core];
+            auto& partition_iq_ready = timing.partition_iq_ready_cycles[core];
             std::optional<MonotoneCapacityCalendar> iq_calendar;
             if (response_monotone_iq_calendar &&
                 iq_ready.size() >= 32 &&
@@ -12501,10 +13678,19 @@ class Simulator::Impl {
                     MonotoneCapacityCalendar::kMaximumEntries) {
                 iq_calendar.emplace(iq_ready);
             }
-            const auto iq_minimum = [&] {
-                return iq_calendar
+            const auto iq_minimum = [&](std::uint8_t partition) {
+                const auto shared = iq_calendar
                            ? iq_calendar->minimum()
                            : iq_ready.front();
+                return config_.spr_partitioned_iq
+                    ? std::max(shared, partition_iq_ready[partition].front())
+                    : shared;
+            };
+            const auto iq_occupied_at = [&](std::uint64_t cycle) {
+                return iq_calendar ? iq_calendar->count_after(cycle) :
+                    static_cast<std::uint64_t>(std::count_if(
+                        iq_ready.begin(), iq_ready.end(),
+                        [cycle](std::uint64_t ready) { return ready > cycle; }));
             };
             auto o3_counters = timing.o3_counters[core];
             auto rename_releases = timing.rename_releases[core];
@@ -12935,7 +14121,7 @@ class Simulator::Impl {
             const auto try_causal_block_transfer = [&] (
                     std::size_t block_begin, std::size_t block_width,
                     std::size_t width_index) {
-                if (!sparse_scoreboard || attribute_cycles ||
+                if (config_.spr_partitioned_iq || config_.spr_load_fill_feedback || config_.spr_store_window_feedback || config_.spr_load_bank_feedback || !sparse_scoreboard || attribute_cycles ||
                     response_paired_frontier ||
                     buffered_tso_store() ||
                     config_.ruby_sequencer_load_admission ||
@@ -13142,12 +14328,12 @@ class Simulator::Impl {
                     }
                     const auto admitted_dispatch = std::max(
                         candidate_dispatch_cycle,
-                        candidate_iq.minimum());
+                        bound.rename_eliminated ? 0 : candidate_iq.minimum());
                     if (admitted_dispatch != proposed_dispatch) {
                         return false;
                     }
                     ++candidate_dispatch_used;
-                    if (candidate_o3.iq_max_occupancy <
+                    if (!bound.rename_eliminated && candidate_o3.iq_max_occupancy <
                         candidate_iq.size()) {
                         const auto active =
                             candidate_iq.count_after(admitted_dispatch);
@@ -13306,12 +14492,14 @@ class Simulator::Impl {
                         bound.completion_q16 / kCycleUnit,
                         interval_gap_cycles);
                     if (has_load && memory_response_cycle > base_completion) return false;
-                    const auto local_writebacks = static_cast<std::uint32_t>(std::count(
-                        block_writebacks.begin(), block_writebacks.begin() + lane,
-                        base_completion));
-                    if (writebacks->count(base_completion) + local_writebacks >=
-                        config_.writeback_width) return false;
-                    block_writebacks[lane] = base_completion;
+                    if (!bound.rename_eliminated) {
+                        const auto local_writebacks = static_cast<std::uint32_t>(std::count(
+                            block_writebacks.begin(), block_writebacks.begin() + lane,
+                            base_completion));
+                        if (writebacks->count(base_completion) + local_writebacks >=
+                            config_.writeback_width) return false;
+                        block_writebacks[lane] = base_completion;
+                    }
                     auto iq_release = consumer_base_issue;
                     if (bound.memory_count != 0) {
                         iq_release = regular_store
@@ -13320,8 +14508,10 @@ class Simulator::Impl {
                                   base_completion,
                                   memory_response_cycle);
                     }
-                    candidate_iq.replace_minimum(iq_release);
-                    ++candidate_sparse.iq_radix_updates;
+                    if (!bound.rename_eliminated) {
+                        candidate_iq.replace_minimum(iq_release);
+                        ++candidate_sparse.iq_radix_updates;
+                    }
 
                     const auto base_retire = saturating_add(
                         bound.retire_q16 / kCycleUnit,
@@ -13421,8 +14611,9 @@ class Simulator::Impl {
                 sparse_counters = candidate_sparse;
                 for (std::size_t lane = 0;
                      lane < block_width; ++lane) {
-                    writebacks->reserve(block_writebacks[lane]);
                     const auto block_uop = block_begin + lane;
+                    if (!chunk.uop(block_uop).rename_eliminated)
+                        writebacks->reserve(block_writebacks[lane]);
                     const auto local = block_uop - begin;
                     sparse_retire_cycles[retire_slot[lane]] =
                         retire[lane];
@@ -13451,6 +14642,13 @@ class Simulator::Impl {
                 serial_timing_extra = 0;
                 return true;
             };
+            struct PendingStorePair {
+                std::array<std::uint64_t,StoreGroupCandidate::kMaxMembers> tickets{};
+                std::array<std::size_t,StoreGroupCandidate::kMaxMembers> sq_slots{};
+                std::size_t count=0, owner_position=0;
+                std::uint64_t members_ready=0, owner_callback=0, predecessor_drain=0;
+            };
+            std::optional<PendingStorePair> pending_store_pair;
             for (auto uop = begin; uop < end; ++uop) {
                 if constexpr (CausalBlockTransfer) {
                     bool transferred = false;
@@ -13473,6 +14671,9 @@ class Simulator::Impl {
                 }
                 const auto& bound = chunk.uop(uop);
                 const auto first_memory = chunk.first_memory(uop);
+                // Allocated only for the opt-in shared budget.  Each store
+                // consumes its own ticket independently of the FIFO SQ.
+                std::uint64_t shared_store_ticket = 0;
                 CoreTimingStageFrame stage_frame;
                 stage_frame.uop_index = uop;
                 stage_frame.sequence = bound.sequence;
@@ -13732,10 +14933,10 @@ class Simulator::Impl {
                     audit_event.cpu_ack_cycle = software_prefetch_timing_active_ && event.software_prefetch
                         ? audit_event.admission_cycle : response_cycle;
                     audit_event.latency_cycles =
-                        (config_.response_pending_fill || config_.response_private_read_services)
+                        (config_.response_pending_fill || config_.response_private_read_services || unified_parent_active_)
                         ? response_cycle - corrected_issue : feedback.latency_cycles;
                     audit_event.exposed_cycles =
-                        (config_.response_pending_fill || config_.response_private_read_services)
+                        (config_.response_pending_fill || config_.response_private_read_services || unified_parent_active_)
                         ? (audit_event.latency_cycles > event.lower_bound_latency
                             ? audit_event.latency_cycles - event.lower_bound_latency : 0)
                         : feedback.exposed_cycles;
@@ -13886,7 +15087,7 @@ class Simulator::Impl {
                         &dispatch_cycle, &dispatch_used, &event_feedback,
                         &fetch_queue_entries, &first_memory,
                         &interval_gap_cycles, &iq_calendar,
-                        &iq_minimum, &iq_ready, &lq_next_slot, &lq_ready,
+                        &iq_minimum, &iq_occupied_at, &iq_ready, &lq_next_slot, &lq_ready,
                         &needs_tso, &o3_counters,
                         &record_audit_memory_event, &rename_cause,
                         &rename_counters, &rename_cycle, &rename_live,
@@ -13897,9 +15098,11 @@ class Simulator::Impl {
                         &response_rob_lsq_feedback, &response_block_summary,
                         &rob_next_slot,
                         &rob_ready, &sparse_counters,
+                        &sequencer_ready, &sequencer_counters, &sequencer_acceptance_frontier,
                         &sparse_retire_cycles, &sparse_rob,
                         &sparse_scoreboard,
-                        &sq_next_slot, &sq_ready, &uop, &tail_audit] (
+                        &sq_next_slot, &sq_ready, &uop, &tail_audit,
+                        &timing, &shared_store_ticket] (
                         CoreTimingStageFrame& frame) {
                 frame.base_fetch_cycle = saturating_add(
                     bound.fetch_q16 / kCycleUnit,
@@ -13916,8 +15119,34 @@ class Simulator::Impl {
                     const auto exposed = feedback.exposed_cycles;
                     const auto base_issue =
                         event.delta_q16 / kCycleUnit;
-                    const auto corrected_issue = saturating_add(
+                    auto corrected_issue = saturating_add(
                         base_issue, interval_gap_cycles);
+                    if (sequencer_acceptance_frontier && !event.speculative_instruction_fetch) {
+                        const auto proposed = corrected_issue;
+                        const auto ordered = std::max(proposed, *sequencer_acceptance_frontier);
+                        if (ordered > proposed) {
+                            ++sequencer_counters.acceptance_frontier_clamps;
+                            sequencer_counters.acceptance_frontier_clamp_cycles += ordered - proposed;
+                        }
+                        const auto admitted = std::max(ordered, sequencer_ready.front());
+                        if (admitted > ordered) {
+                            ++sequencer_counters.buffer_full_stalls;
+                            ++sequencer_counters.ifetch_buffer_full_stalls;
+                            sequencer_counters.stall_cycles += admitted - ordered;
+                            sequencer_counters.ifetch_stall_cycles += admitted - ordered;
+                        }
+                        ++sequencer_counters.requests;
+                        ++sequencer_counters.ifetch_requests;
+                        const auto active = static_cast<std::uint64_t>(std::count_if(
+                            sequencer_ready.begin(), sequencer_ready.end(),
+                            [admitted](std::uint64_t ready) { return ready > admitted; }));
+                        sequencer_counters.max_outstanding = std::max(
+                            sequencer_counters.max_outstanding, active + 1);
+                        replace_min(sequencer_ready, saturating_add(admitted, feedback.latency_cycles));
+                        *sequencer_acceptance_frontier = admitted;
+                        instruction_fetch_delay = saturating_add(instruction_fetch_delay, admitted - proposed);
+                        corrected_issue = admitted;
+                    }
                     record_audit_memory_event(
                         event, feedback, base_issue, corrected_issue,
                         saturating_add(
@@ -14043,6 +15272,11 @@ class Simulator::Impl {
                                  !event.instruction_fetch);
                         }
                     }
+                    // An escaped MMIO store has a retired functional UOP but
+                    // deliberately no hierarchy event in the existing model.
+                    // It still competes for the local shared store budget.
+                    if (config_.spr_store_group_merge && bound.perf_missing_source && bound.memory_write)
+                        dispatch_store = true;
                     if (sparse_scoreboard) {
                         const auto gate_sparse_queue = [&] (
                             std::vector<std::uint64_t>& ready,
@@ -14252,17 +15486,18 @@ class Simulator::Impl {
                              o3_counters.sq_max_occupancy);
                     }
                     bool iq_admitted_before_rename = false;
-                    if (response_rename_feedback &&
-                        iq_minimum() > capacity_dispatch) {
+                    if (!bound.rename_eliminated && response_rename_feedback &&
+                        iq_minimum(bound.spr_iq_partition) > capacity_dispatch) {
                         if (tail_audit) frame.tail_dispatch_gate = IntervalTailDispatchGate::kIq;
                         const auto before = capacity_dispatch;
-                        capacity_dispatch = iq_minimum();
+                        capacity_dispatch = iq_minimum(bound.spr_iq_partition);
                         ++o3_counters.iq_full_events;
                         o3_counters.iq_stall_cycles +=
                             capacity_dispatch - before;
                         o3_counters.iq_max_occupancy = std::max(
                             o3_counters.iq_max_occupancy,
-                            static_cast<std::uint64_t>(iq_ready.size()));
+                            config_.spr_partitioned_iq ? iq_occupied_at(before) :
+                                static_cast<std::uint64_t>(iq_ready.size()));
                         capacity_cause = CriticalCause::kIqCapacity;
                         iq_admitted_before_rename = true;
                     }
@@ -14404,18 +15639,51 @@ class Simulator::Impl {
                         pipeline_dispatch > proposed_dispatch
                             ? dispatch_cause
                             : CriticalCause::kUnattributed;
-                    const auto admitted_dispatch =
-                        response_rename_feedback &&
+                    auto admitted_dispatch =
+                        bound.rename_eliminated || (response_rename_feedback &&
                                 iq_admitted_before_rename
+                            )
                             ? pipeline_dispatch
                             : std::max(
-                                  pipeline_dispatch, iq_minimum());
+                                  pipeline_dispatch, iq_minimum(bound.spr_iq_partition));
+                    const auto iq_admitted_dispatch = admitted_dispatch;
+                    if (config_.spr_store_group_merge && dispatch_store) {
+                        if (core >= timing.spr_shared_store_credits.size())
+                            throw std::logic_error("missing shared store budget");
+                        auto& budget = timing.spr_shared_store_credits[core];
+                        if (budget.frontier() > admitted_dispatch)
+                            ++o3_counters.spr_store_budget_frontier_clamps;
+                        admitted_dispatch = std::max(admitted_dispatch, budget.frontier());
+                        auto probe = budget.probe(admitted_dispatch);
+                        if (probe.status == SprSharedStoreCredits::Admission::kFull) {
+                            if (!probe.next_release)
+                                throw std::logic_error("shared store budget full without a modeled completion");
+                            admitted_dispatch = std::max(admitted_dispatch, *probe.next_release);
+                            probe = budget.probe(admitted_dispatch);
+                        }
+                        if (probe.status != SprSharedStoreCredits::Admission::kAccepted)
+                            throw std::logic_error("shared store budget could not admit store");
+                        const auto* dispatch_group = group_for_core(core);
+                        const bool candidate_member = dispatch_group &&
+                            dispatch_group->member_of(bound.sequence) < dispatch_group->member_count;
+                        const auto kind = candidate_member
+                            ? SprSharedStoreCredits::Kind::kOrdinary
+                            : (bound.locked_rmw || bound.local_no_access || bound.perf_missing_source ||
+                               bound.serialize_before || bound.serialize_after ||
+                               bound.memory_barrier_before || bound.memory_barrier_after)
+                                  ? SprSharedStoreCredits::Kind::kSpecial
+                                  : SprSharedStoreCredits::Kind::kUnknown;
+                        const auto admitted = budget.admit(admitted_dispatch, admitted_dispatch, kind);
+                        if (admitted.status != SprSharedStoreCredits::Admission::kAccepted)
+                            throw std::logic_error("shared store budget admission changed after probe");
+                        shared_store_ticket = admitted.id;
+                    }
                     actual_dispatch = admitted_dispatch;
-                    if (admitted_dispatch > pipeline_dispatch) {
+                    if (iq_admitted_dispatch > pipeline_dispatch) {
                         if (tail_audit) frame.tail_dispatch_gate = IntervalTailDispatchGate::kIq;
                         ++o3_counters.iq_full_events;
                         o3_counters.iq_stall_cycles +=
-                            admitted_dispatch - pipeline_dispatch;
+                            iq_admitted_dispatch - pipeline_dispatch;
                         dispatch_cycle = admitted_dispatch;
                         dispatch_used = 0;
                         if (attribute_cycles) {
@@ -14426,7 +15694,21 @@ class Simulator::Impl {
                         }
                         o3_counters.iq_max_occupancy = std::max(
                             o3_counters.iq_max_occupancy,
-                            static_cast<std::uint64_t>(iq_ready.size()));
+                            config_.spr_partitioned_iq ? iq_occupied_at(pipeline_dispatch) :
+                                static_cast<std::uint64_t>(iq_ready.size()));
+                    }
+                    if (admitted_dispatch > iq_admitted_dispatch) {
+                        // SQ/shared-buffer capacity is separate from IQ.
+                        ++o3_counters.spr_store_budget_waits;
+                        o3_counters.spr_store_budget_wait_cycles = saturating_add(
+                            o3_counters.spr_store_budget_wait_cycles,
+                            admitted_dispatch - iq_admitted_dispatch);
+                        dispatch_cycle = admitted_dispatch;
+                        dispatch_used = 0;
+                        if (attribute_cycles) {
+                            dispatch_cause = CriticalCause::kSqCapacity;
+                            admitted_dispatch_cause = CriticalCause::kSqCapacity;
+                        }
                     }
                     ++dispatch_used;
                     dispatch_extra =
@@ -14440,7 +15722,7 @@ class Simulator::Impl {
                         uop_dispatch_cause =
                             admitted_dispatch_cause;
                     }
-                    if (o3_counters.iq_max_occupancy < iq_ready.size()) {
+                    if (!bound.rename_eliminated && o3_counters.iq_max_occupancy < iq_ready.size()) {
                         const auto active = iq_calendar
                             ? iq_calendar->count_after(admitted_dispatch)
                             : static_cast<std::uint64_t>(std::count_if(
@@ -14494,7 +15776,8 @@ class Simulator::Impl {
                         &resource_calendar, &response_residuals,
                         &response_paired_frontier,
                         &rob_next_slot, &sequencer_admitted_producer,
-                        &sequencer_counters, &sequencer_ready,
+                        &sequencer_counters, &sequencer_ready, &sequencer_acceptance_frontier,
+                        &spr_l1_load_fill_ready, &spr_l2_load_fill_ready, &spr_load_bank, &o3_counters,
                         &serial_timing_extra, &source_order_sequencer, &is_deferred_store,
                         &sparse_counters, &sparse_rob, &sparse_scoreboard,
                         &store_drain_ready, &store_set_completion_causes,
@@ -14937,6 +16220,8 @@ class Simulator::Impl {
                 has_load = bound.local_no_access && bound.memory_read;
                 auto& has_store = frame.has_store;
                 has_store = bound.local_no_access && bound.memory_write;
+                if (config_.spr_store_group_merge && bound.perf_missing_source && bound.memory_write)
+                    has_store = true;
                 auto& response_seed = frame.response_seed;
                 response_seed = false;
                 auto& store_latency_cycles = frame.store_latency_cycles;
@@ -15036,6 +16321,8 @@ class Simulator::Impl {
                 if (config_.response_pending_fill && bound.memory_count != 0) {
                     timing.pending_fills[core].expire_before(actual_dispatch);
                 }
+                if (unified_parent_active_ && bound.memory_count != 0)
+                    timing.parent_services[core].expire_before(actual_dispatch);
                 for (std::uint32_t offset = 0;
                      offset < bound.memory_count; ++offset) {
                     const auto event_index = first_memory + offset;
@@ -15049,7 +16336,7 @@ class Simulator::Impl {
                     const bool selected_store = event.write &&
                         shared_service_selected(core, event_index);
                     shared_store_service |= selected_store;
-                    const bool deferred_store =
+                    const bool deferred_store = feedback.store_group_follower ||
                         is_deferred_store(event, event_index);
                     if (feedback.exposed_cycles > (1ull << 40)) {
                         throw std::overflow_error(
@@ -15205,12 +16492,22 @@ class Simulator::Impl {
                             saturating_add(
                                 event_issue_extra,
                                 admission_delay));
+                        const auto ordered_issue = sequencer_acceptance_frontier
+                            ? std::max(proposed_issue, *sequencer_acceptance_frontier)
+                            : proposed_issue;
+                        if (ordered_issue > proposed_issue) {
+                            ++sequencer_counters.acceptance_frontier_clamps;
+                            sequencer_counters.acceptance_frontier_clamp_cycles += ordered_issue - proposed_issue;
+                        }
                         const auto admitted_issue = std::max(
-                            proposed_issue, sequencer_ready.front());
+                            ordered_issue, sequencer_ready.front());
+                        if (sequencer_acceptance_frontier)
+                            *sequencer_acceptance_frontier = admitted_issue;
                         if (admitted_issue > proposed_issue) {
-                            ++sequencer_counters.buffer_full_stalls;
-                            sequencer_counters.stall_cycles +=
-                                admitted_issue - proposed_issue;
+                            if (admitted_issue > ordered_issue) {
+                                ++sequencer_counters.buffer_full_stalls;
+                                sequencer_counters.stall_cycles += admitted_issue - ordered_issue;
+                            }
                             event_issue_extra = saturating_add(
                                 event_issue_extra,
                                 admitted_issue - proposed_issue);
@@ -15220,10 +16517,10 @@ class Simulator::Impl {
                                 event_issue_cause =
                                     CriticalCause::kSequencer;
                             }
-                            sequencer_counters.max_outstanding = std::max(
-                                sequencer_counters.max_outstanding,
-                                static_cast<std::uint64_t>(
-                                    sequencer_ready.size()));
+                            if (admitted_issue > ordered_issue)
+                                sequencer_counters.max_outstanding = std::max(
+                                    sequencer_counters.max_outstanding,
+                                    static_cast<std::uint64_t>(sequencer_ready.size()));
                         }
                         if (sequencer_counters.max_outstanding <
                             sequencer_ready.size()) {
@@ -15243,22 +16540,43 @@ class Simulator::Impl {
                         saturating_add(base_issue, interval_gap_cycles), event_issue_extra);
                     const bool uses_l1_mshr =
                         !feedback.software_prefetch_skipped && !deferred_store &&
-                        !mshr_ready_cycles.empty() &&
+                        (!mshr_ready_cycles.empty() || (unified_parent_active_ &&
+                         timing.parent_services[core].has_calendar(0))) &&
                         !feedback.sequencer_coalesced &&
                         feedback.private_level != HitLevel::kL1;
                     const bool uses_l2_mshr =
                         !feedback.software_prefetch_skipped && !deferred_store &&
-                        !l2_mshr_ready_cycles.empty() &&
+                        (!l2_mshr_ready_cycles.empty() || (unified_parent_active_ &&
+                         timing.parent_services[core].has_calendar(1))) &&
                         !feedback.sequencer_coalesced &&
                         (feedback.private_level == HitLevel::kLlc ||
                          feedback.private_level == HitLevel::kUnknown);
+                    const bool spr_load_proposal =
+                        config_.spr_load_fill_feedback && !deferred_store &&
+                        !event.write && !event.atomic && !event.page_walk &&
+                        !event.instruction_fetch && !event.software_prefetch &&
+                        !event.forwarded_load && !feedback.software_prefetch_skipped &&
+                        !feedback.sequencer_coalesced && feedback.private_level != HitLevel::kL1;
+                    if (spr_load_proposal && !event.spr_ordinary_load)
+                        ++o3_counters.spr_fill_uncertified_fallbacks;
+                    bool uses_spr_l1_load_fill =
+                        config_.spr_load_fill_feedback && !config_.spr_l2_prefetch_follow &&
+                        event.spr_ordinary_load && !deferred_store &&
+                        !event.write && !event.atomic && !event.page_walk &&
+                        !event.instruction_fetch && !event.software_prefetch &&
+                        !event.forwarded_load &&
+                        !feedback.software_prefetch_skipped &&
+                        !feedback.sequencer_coalesced &&
+                        feedback.private_level != HitLevel::kL1;
                     if (uses_l1_mshr) {
                         const auto proposed_issue = saturating_add(
                             saturating_add(
                                 base_issue, event_issue_extra),
                             admission_delay);
-                        if (mshr_ready_cycles.front() > proposed_issue) {
-                            event_issue_extra = mshr_ready_cycles.front() -
+                        const auto first_release = unified_parent_active_
+                            ? timing.parent_services[core].first_release(0) : mshr_ready_cycles.front();
+                        if (first_release > proposed_issue) {
+                            event_issue_extra = first_release -
                                 saturating_add(
                                     base_issue, admission_delay);
                             event_issue_gate_kind =
@@ -15274,9 +16592,11 @@ class Simulator::Impl {
                             saturating_add(
                                 base_issue, event_issue_extra),
                             admission_delay);
-                        if (l2_mshr_ready_cycles.front() > proposed_issue) {
+                        const auto first_release = unified_parent_active_
+                            ? timing.parent_services[core].first_release(1) : l2_mshr_ready_cycles.front();
+                        if (first_release > proposed_issue) {
                             event_issue_extra =
-                                l2_mshr_ready_cycles.front() -
+                                first_release -
                                 saturating_add(
                                     base_issue, admission_delay);
                             event_issue_gate_kind =
@@ -15287,6 +16607,70 @@ class Simulator::Impl {
                             }
                         }
                     }
+                    // Certified packet accounting is unchanged. The opt-in
+                    // fallback is one generic port token per modeled load
+                    // fragment, without asserting its actual packet count.
+                    if (config_.spr_load_bank_feedback && !event.write && !event.atomic &&
+                        !event.page_walk && !event.instruction_fetch && !event.forwarded_load) {
+                        const bool known_bank=event.spr_bank_eligible && !event.software_prefetch;
+                        if (!known_bank && !event.software_prefetch)
+                            ++o3_counters.spr_bank_fallbacks;
+                        const bool fallback_proxy = config_.spr_load_port_fallback_proxy &&
+                            !event.spr_port_eligible && !event.software_prefetch &&
+                            !event.spr_port_proxy_special &&
+                            !event.page_fault_state_fill && !feedback.software_prefetch_skipped &&
+                            !feedback.sequencer_coalesced && !feedback.functional_carried;
+                        if (!event.spr_port_eligible)
+                            ++o3_counters.spr_load_port_fallbacks;
+                        if (event.spr_port_eligible || fallback_proxy) {
+                            const auto proposed=saturating_add(
+                                saturating_add(base_issue,interval_gap_cycles),
+                                saturating_add(event_issue_extra,admission_delay));
+                            const auto address=known_bank
+                                ? event.line*config_.l1d.line_size+event.spr_bank_offset : 0;
+                            spr_load_bank.prune(actual_dispatch);
+                            const bool bank_blocked=known_bank && !spr_load_bank.available(address,proposed);
+                            const bool port_blocked=!spr_load_bank.port_available(proposed,config_.cache_load_ports);
+                            const auto accepted=spr_load_bank.first_available(
+                                address,proposed,config_.cache_load_ports,known_bank);
+                            if (accepted>proposed) {
+                                if (bank_blocked) ++o3_counters.spr_bank_waits;
+                                if (port_blocked) ++o3_counters.spr_load_port_waits;
+                                if (fallback_proxy) ++o3_counters.spr_load_port_proxy_waits;
+                                o3_counters.spr_load_port_bank_wait_cycles+=accepted-proposed;
+                                event_issue_extra=saturating_add(event_issue_extra,accepted-proposed);
+                            }
+                            spr_load_bank.accept(address,accepted,config_.cache_load_ports,known_bank);
+                            if (fallback_proxy) ++o3_counters.spr_load_port_proxy_fragments;
+                            else ++o3_counters.spr_load_port_packets;
+                            if (known_bank) ++o3_counters.spr_bank_packets;
+                        }
+                    }
+                    SprFillCalendar::Ticket spr_l1_ticket;
+                    SprFillCalendar::Ticket spr_l2_ticket;
+                    if (uses_spr_l1_load_fill) {
+                        const auto proposed = saturating_add(
+                            saturating_add(base_issue, interval_gap_cycles),
+                            saturating_add(event_issue_extra, admission_delay));
+                        ++o3_counters.spr_fill_candidates;
+                        spr_l1_load_fill_ready.prune(actual_dispatch);
+                        spr_l1_ticket = spr_l1_load_fill_ready.reserve(
+                            proposed, std::max(feedback.latency_cycles, admission_delay + 1));
+                        if (!spr_l1_ticket.valid) {
+                            uses_spr_l1_load_fill = false;
+                            ++o3_counters.spr_fill_calendar_fallbacks;
+                        }
+                        if (uses_spr_l1_load_fill && spr_l1_ticket.admission > proposed) {
+                            ++o3_counters.spr_l1_fill_waits;
+                            event_issue_extra = saturating_add(event_issue_extra,
+                                spr_l1_ticket.admission - proposed);
+                            event_issue_gate_kind = ResponseIssueGateKind::kL1Mshr;
+                            if (attribute_cycles) event_issue_cause = CriticalCause::kL1Mshr;
+                        }
+                    }
+                    const bool uses_spr_l2_load_fill = uses_spr_l1_load_fill &&
+                        (feedback.private_level == HitLevel::kLlc ||
+                         feedback.private_level == HitLevel::kUnknown);
                     if (attribute_cycles && event_issue_extra != 0) {
                         ++response_residuals.memory_issue_moved_events;
                         response_residuals.memory_issue_moved_cycles +=
@@ -15314,6 +16698,49 @@ class Simulator::Impl {
                     auto event_response_cycle = saturating_add(
                         corrected_event_issue_cycle,
                         feedback.latency_cycles);
+                    if(feedback.fixed_service_ready) {
+                        const auto ready=fixed_to_cycle_ceil(local_horizon_q16(core,
+                            cycles_to_fixed(*feedback.fixed_service_ready)));
+                        event_response_cycle=std::max(ready,saturating_add(corrected_event_issue_cycle,
+                            private_response_latency(event,HitLevel::kL1)));
+                    }
+                    if (feedback.prefetch_follow_ready) {
+                        const auto ready = fixed_to_cycle_ceil(local_horizon_q16(core,
+                            cycles_to_fixed(feedback.prefetch_follow_ready->ready)));
+                        event_response_cycle = SprPrefetchService::response_for(
+                            {feedback.prefetch_follow_ready->ticket,ready},corrected_event_issue_cycle,
+                            private_response_latency(event,feedback.prefetch_follow_ready->level==SprPrefetchService::Level::kL1 ? HitLevel::kL1 : HitLevel::kL2),config_.l1d.hit_latency);
+                        const auto latency = event_response_cycle - corrected_event_issue_cycle;
+                        const auto exposed = latency > event.lower_bound_latency
+                            ? latency - event.lower_bound_latency : 0;
+                        event_exposed_cycles = static_cast<std::uint64_t>(
+                            std::ceil(static_cast<double>(exposed) * config_.memory_exposure));
+                    }
+                    if(feedback.fixed_service_ready || feedback.prefetch_follow_ready) {
+                        const auto latency=event_response_cycle-corrected_event_issue_cycle;
+                        const auto exposed=latency>event.lower_bound_latency ? latency-event.lower_bound_latency : 0;
+                        event_exposed_cycles=static_cast<std::uint64_t>(std::ceil(
+                            static_cast<double>(exposed)*config_.memory_exposure));
+                    }
+                    if (uses_spr_l2_load_fill) {
+                        // L2 is reached after L1 admission; reserve it there,
+                        // not at the earlier CPU request edge. End-to-end
+                        // callback is a conservative L2 release approximation.
+                        const auto l2_arrival = saturating_add(
+                            saturating_add(corrected_event_issue_cycle, admission_delay),
+                            config_.l1d.hit_latency);
+                        spr_l2_load_fill_ready.prune(actual_dispatch);
+                        spr_l2_ticket = spr_l2_load_fill_ready.reserve(l2_arrival,
+                            event_response_cycle > l2_arrival ? event_response_cycle - l2_arrival : 1);
+                        if (!spr_l2_ticket.valid) ++o3_counters.spr_fill_calendar_fallbacks;
+                        const auto l2_admission = spr_l2_ticket.admission;
+                        if (l2_admission > l2_arrival) ++o3_counters.spr_l2_fill_waits;
+                        const auto before = event_response_cycle;
+                        event_response_cycle = std::max(l2_admission,
+                            saturating_add(event_response_cycle, l2_admission - l2_arrival));
+                        event_exposed_cycles = saturating_add(event_exposed_cycles,
+                            event_response_cycle - before);
+                    }
                     if (feedback.software_prefetch_skipped)
                         event_response_cycle = saturating_add(accepted_producer_issue_cycle, admission_delay);
                     if (feedback.fixed_read && feedback.sequencer_coalesced) {
@@ -15362,6 +16789,17 @@ class Simulator::Impl {
                         event_exposed_cycles = saturating_add(
                             event_exposed_cycles, event_response_cycle - original_response);
                     }
+                    ParentServicePool::Id parent_service = ParentServicePool::none;
+                    if (unified_parent_active_) {
+                        const auto before = event_response_cycle;
+                        parent_service = resolve_parent_service(
+                            core, event, feedback, deferred_store,
+                            saturating_add(corrected_event_issue_cycle, admission_delay),
+                            event_response_cycle, uses_l1_mshr || uses_l2_mshr,
+                            timing.parent_services[core], timing.parent_counters[core]);
+                        event_exposed_cycles = saturating_add(
+                            event_exposed_cycles, event_response_cycle - before);
+                    }
                     if (source_order_sequencer && !sequencer_ready.empty() &&
                         software_prefetch_timing_active_ && event.software_prefetch && !feedback.software_prefetch_skipped &&
                         event_response_cycle > 0 && event_response_cycle - 1 >
@@ -15375,11 +16813,24 @@ class Simulator::Impl {
                     }
                     const auto mshr_release = event_response_cycle - interval_gap_cycles;
                     if (uses_l1_mshr) {
-                        replace_min(mshr_ready_cycles, mshr_release);
+                        if (unified_parent_active_)
+                            timing.parent_services[core].attach_lease(parent_service,0,
+                                saturating_add(base_issue,event_issue_extra),mshr_release);
+                        else replace_min(mshr_ready_cycles, mshr_release);
                     }
                     if (uses_l2_mshr) {
-                        replace_min(l2_mshr_ready_cycles, mshr_release);
+                        if (unified_parent_active_)
+                            timing.parent_services[core].attach_lease(parent_service,1,
+                                saturating_add(base_issue,event_issue_extra),mshr_release);
+                        else replace_min(l2_mshr_ready_cycles, mshr_release);
                     }
+                    if (parent_service) timing.parent_services[core].discard_unindexed(parent_service);
+                    if (spr_l1_ticket.valid && spr_l1_load_fill_ready.finish(spr_l1_ticket,
+                            std::max(event_response_cycle, spr_l1_ticket.admission)))
+                        ++o3_counters.spr_fill_extension_conflicts;
+                    if (spr_l2_ticket.valid && spr_l2_load_fill_ready.finish(spr_l2_ticket,
+                            std::max(event_response_cycle, spr_l2_ticket.admission)))
+                        ++o3_counters.spr_fill_extension_conflicts;
                     // Local memory-level-parallelism relief on the exposed
                     // load response. For a retirement-blocking ordinary load
                     // the active timing path is the data-ready frontier
@@ -15497,6 +16948,11 @@ class Simulator::Impl {
                     if (!deferred_store && !SuppressSequencerCapacity &&
                         !source_order_sequencer &&
                         !sequencer_ready.empty()) {
+                        if (sequencer_acceptance_frontier)
+                            *sequencer_acceptance_frontier = std::max(
+                                *sequencer_acceptance_frontier,
+                                saturating_add(saturating_add(base_issue, interval_gap_cycles),
+                                               saturating_add(event_issue_extra, admission_delay)));
                         replace_min(
                             sequencer_ready, read_service.certified
                                 ? read_service.callback : event_response_cycle);
@@ -15504,6 +16960,8 @@ class Simulator::Impl {
                     const auto cpu_response_cycle = software_prefetch_timing_active_ && event.software_prefetch
                         ? saturating_add(accepted_producer_issue_cycle, admission_delay)
                         : event_response_cycle;
+                    if (config_.spr_l2_prefetch_follow)
+                        timing.prefetch_callback_cycles[core][event_index-memory_begin]=event_response_cycle;
                     memory_response_cycle = std::max(
                         memory_response_cycle, cpu_response_cycle);
                     if (!event.page_walk && !event.write && !event.atomic) {
@@ -15528,7 +16986,7 @@ class Simulator::Impl {
                             corrected_event_issue_cycle,
                             event_response_cycle, accepted_producer_issue_cycle);
                     }
-                    if (const char* lh = std::getenv("FASTSIM_TSO_LOAD_HIST")) {
+                    if (const char* lh = tso_load_hist ? tso_load_hist->c_str() : nullptr) {
                         static FILE* lf = [lh]() { return std::fopen(lh, "w"); }();
                         if (lf != nullptr && !event.write && !event.atomic &&
                             !event.page_walk && !event.instruction_fetch) {
@@ -15715,7 +17173,7 @@ class Simulator::Impl {
                         &attribute_cycles, &bound,
                         &branch_recovery_counters, &branch_recovery_ready,
                         &completion_cause, &completion_extra,
-                        &interval_gap_cycles, &iq_calendar, &iq_ready,
+                        &interval_gap_cycles, &iq_calendar, &iq_ready, &partition_iq_ready,
                         &iq_slot_reserved, &load_data_ready_cycle,
                         &memory_response_cycle,
                         &regular_store, &resource_calendar,
@@ -15745,7 +17203,7 @@ class Simulator::Impl {
                     response_seed = true;
                     if (attribute_cycles) completion_cause = CriticalCause::kMemoryResponse;
                 }
-                if (writebacks || resource_calendar) {
+                if (!bound.rename_eliminated && (writebacks || resource_calendar)) {
                     const auto base_completion = saturating_add(
                         bound.completion_q16 / kCycleUnit,
                         interval_gap_cycles);
@@ -15830,7 +17288,7 @@ class Simulator::Impl {
                     response_residuals.completion_extension_cycles +=
                         completion_extra;
                 }
-                if (iq_slot_reserved) {
+                if (iq_slot_reserved && !bound.rename_eliminated) {
                     auto iq_release = actual_issue;
                     if (bound.memory_count != 0) {
                         iq_release = regular_store
@@ -15844,6 +17302,8 @@ class Simulator::Impl {
                     } else {
                         replace_min(iq_ready, iq_release);
                     }
+                    if (config_.spr_partitioned_iq)
+                        replace_min(partition_iq_ready[bound.spr_iq_partition], iq_release);
                 }
                 };
                 try_complete_writeback(stage_frame);
@@ -15859,7 +17319,7 @@ class Simulator::Impl {
                         &core, &dispatch_extra, &event_feedback,
                         &first_memory, &has_load, &has_store,
                         &head_suffix_open, &interval_gap_cycles,
-                        &l2_mshr_ready_cycles, &lq_next_slot, &lq_ready,
+                        &l2_mshr_ready_cycles, &lq_next_slot, &lq_ready, &legacy_store_audit,
                         &memory_begin, &memory_response_cycle,
                         &memory_issue_extra_q16,
                         &buffered_store_publish_cycles,
@@ -15880,13 +17340,14 @@ class Simulator::Impl {
                         &sparse_scoreboard, &sq_frontier, &sq_next_slot,
                         &sq_ready, &store_base_issue_cycle,
                         &store_drain_frontier, &store_drain_ready,
-                        &store_latency_cycles,
+                        &spr_store_window, &store_latency_cycles,
                         &store_lower_bound_latency_cycles,
                         &store_request_issue_cycle,
                         &regular_store_fragments,
                         &store_set_actual_completion,
                         &store_set_completion_cause, &timing,
-                        &track_sq_release_owner, &tail_audit, &tail_floor] (
+                        &track_sq_release_owner, &tail_audit, &tail_floor,
+                        &shared_store_ticket, &pending_store_pair] (
                         CoreTimingStageFrame& frame) {
                 auto& actual_retire = frame.retire_cycle;
                 actual_retire = saturating_add(
@@ -16036,11 +17497,25 @@ class Simulator::Impl {
                             (lq_next_slot + 1) % lq_ready.size());
                     }
                     if (has_store) {
+                        const auto pair_predecessor_drain = store_drain_ready;
+                        const bool audit_prior_local=store_drain_frontier.local_access;
+                        const auto audit_prior_origin=legacy_store_audit
+                            ? spr_store_window.origin_for_frontier(pair_predecessor_drain)
+                            : SprStoreWindow::Origin{};
+                        const auto* active_store_group_ = group_for_core(core);
+                        const auto member_index = active_store_group_ && core==active_store_group_->core
+                            ? active_store_group_->member_of(bound.sequence)
+                            : StoreGroupCandidate::kMaxMembers;
+                        const bool group_member = active_store_group_ && core==active_store_group_->core &&
+                            member_index < active_store_group_->member_count;
+                        const bool pair_owner = group_member && member_index==0;
+                        const bool pair_follower = group_member && member_index!=0;
                         auto sq_release = std::max(
                             actual_retire, memory_response_cycle);
+                        std::optional<std::uint64_t> sq_join_release;
                         auto base_sq_release = std::max(
                             base_retire, base_memory_response_cycle);
-                        if (regular_store) {
+                        if (regular_store && !pair_follower) {
                             const auto lifecycle_prior_release = store_drain_ready;
                             BoundedNonbindingStoreResult lifecycle_estimate{};
                             bool lifecycle_estimated = false;
@@ -16056,12 +17531,43 @@ class Simulator::Impl {
                                 actual_retire, commit_to_admission);
                             auto base_store_send = saturating_add(
                                 base_retire, commit_to_admission);
+                            bool window_eligible = config_.spr_store_window_feedback &&
+                                regular_store_fragments == 1 && !has_load &&
+                                !bound.serialize_before && !bound.serialize_after &&
+                                !bound.memory_barrier_before && !bound.memory_barrier_after &&
+                                !bound.locked_rmw;
+                            std::uint64_t window_line = 0;
+                            std::optional<SprStoreWindow::CreditKey> credit_key;
+                            if (window_eligible)
+                              for (std::uint32_t offset = 0; offset < bound.memory_count; ++offset) {
+                                const auto& event = chunk.memory(first_memory + offset);
+                                if (event.write && !event.atomic && !event.page_walk && !event.instruction_fetch) {
+                                    window_eligible = window_eligible && event.spr_ordinary_store;
+                                    window_line = event.line;
+                                    if (config_.spr_store_sq_join_credit_proxy)
+                                        credit_key = chunk.store_credit_key(first_memory + offset);
+                                }
+                            }
+                            if (config_.spr_store_sq_join_credit_proxy && !credit_key)
+                                window_eligible = false;
+                            std::optional<SprStoreWindow::Ticket> store_ticket;
+                            std::uint32_t legacy_audit_role=0, legacy_audit_level=5, legacy_audit_path=0;
+                            std::uint64_t legacy_audit_service=0;
                             if (needs_tso) {
-                                store_send = std::max(
-                                    store_send,
-                                    saturating_add(
-                                        store_drain_ready,
-                                        response_to_next_admission));
+                                if (config_.spr_store_window_feedback) {
+                                    if (window_eligible) ++o3_counters.spr_store_window_admitted;
+                                    else ++o3_counters.spr_store_window_fallbacks;
+                                }
+                                if (window_eligible) {
+                                    if (legacy_store_audit)
+                                        timing.legacy_prepare[core].observe_window(
+                                            spr_store_window.inspect(window_line,store_send));
+                                    store_ticket = spr_store_window.reserve(window_line, store_send, credit_key);
+                                    store_send = store_ticket->admission;
+                                } else {
+                                    store_send = std::max(store_send,
+                                        saturating_add(store_drain_ready, response_to_next_admission));
+                                }
                                 if (response_paired_frontier &&
                                     store_drain_frontier.valid) {
                                     base_store_send = std::max(
@@ -16191,11 +17697,68 @@ class Simulator::Impl {
                             const auto publish_latency = config_.store_private_callback_timing
                                 ? static_cast<std::uint64_t>(*config_.l1d.store_hit_latency)
                                 : store_lower_bound_latency_cycles;
+                            if (legacy_store_audit) {
+                                legacy_audit_service=store_latency_cycles;
+                                for(std::uint32_t offset=0;offset<bound.memory_count;++offset) {
+                                    const auto index=first_memory+offset;
+                                    const auto& event=chunk.memory(index);
+                                    if(event.write && !event.atomic && !event.page_walk && !event.instruction_fetch) {
+                                        legacy_audit_level=static_cast<std::uint32_t>(event_feedback[core][index].private_level);
+                                        legacy_audit_path=static_cast<std::uint32_t>(event_feedback[core][index].shared_timing.path);
+                                        break;
+                                    }
+                                }
+                            }
                             sq_release = regular_store_response_cycle(
                                 store_send, buffered_permission_ready,
                                 store_latency_cycles,
                                 publish_latency,
                                 buffer_eligible);
+                            if (config_.legacy_prepare_timing_enabled() && buffer_eligible) {
+                                const auto& event=chunk.memory(buffered_store_event);
+                                const auto prepare_issue=std::max(
+                                    saturating_add(actual_retire,commit_to_admission),
+                                    store_drain_frontier.local_scan_ready_cycle);
+                                const auto& prepare_replay=event_feedback[core][buffered_store_event];
+                                const auto selected=fixed_to_cycle_ceil(local_horizon_q16(
+                                    core,cycles_to_fixed(prepare_replay.shared_stage_issue_cycle)));
+                                auto service_facts=prepare_replay.parent_facts;
+                                if (service_facts.lower_return_valid)
+                                    service_facts.lower_return=fixed_to_cycle_ceil(local_horizon_q16(
+                                        core,cycles_to_fixed(service_facts.lower_return)));
+                                const auto result=unified_parent_v2_
+                                    ? timing.legacy_prepare[core].store_unified(
+                                        {event.source_sequence,event.ordinal,event.line},
+                                        prepare_issue,store_send,buffered_permission_ready,
+                                        store_latency_cycles,publish_latency,service_facts,
+                                        (store_send<=prepare_issue ? store_send : prepare_issue)==selected &&
+                                            !prepare_replay.functional_carried,
+                                        unified_parent_wait_,parent_line_safe(core,event.line),
+                                        timing.parent_services[core],timing.parent_counters[core],
+                                        prepare_replay.functional_carried
+                                            ? ParentServicePool::SourceReject::kCarried
+                                            : ParentServicePool::SourceReject::kAdmissionMismatch)
+                                    : timing.legacy_prepare[core].store(
+                                        {event.source_sequence,event.ordinal,event.line},
+                                        prepare_issue,store_send,buffered_permission_ready,
+                                        store_latency_cycles,publish_latency);
+                                if (legacy_store_audit) {
+                                    legacy_audit_role=static_cast<std::uint32_t>(result.role)+1;
+                                    timing.legacy_prepare[core].observe_direct(result,
+                                        saturating_add(actual_retire,commit_to_admission),
+                                        store_drain_frontier.local_scan_ready_cycle,
+                                        buffered_permission_ready,publish_latency,legacy_audit_level);
+                                }
+                                sq_release=result.response;
+                                store_latency_cycles=sq_release-store_send;
+                                frame.audit_buffer_tso_permission_ready_cycle=result.permission;
+                                if (result.role==LegacyPrepareRole::Direct ||
+                                    result.role==LegacyPrepareRole::Dropped)
+                                    frame.audit_buffer_tso_prepare_service_cycles=0;
+                                frame.audit_buffer_tso_role=
+                                    result.role==LegacyPrepareRole::Takeover ? 2u :
+                                    result.role==LegacyPrepareRole::Prepared ? 3u : 1u;
+                            }
                             if (config_.buffer_tso_prepare_lifecycle && buffer_eligible) {
                                 // Observations only: canonical replay uses a
                                 // different reference clock and is not the
@@ -16239,8 +17802,7 @@ class Simulator::Impl {
                                 }
                                 store_latency_cycles = sq_release - store_send;
                                 timing.buffered_store_demand_cycles[core][position] = store_send;
-                                if (const char* hist_path = std::getenv(
-                                        "FASTSIM_TSO_PREPARE_HIST")) {
+                                if (const char* hist_path = tso_prepare_hist ? tso_prepare_hist->c_str() : nullptr) {
                                     static FILE* hist_file = [hist_path]() {
                                         return std::fopen(hist_path, "w");
                                     }();
@@ -16462,8 +18024,42 @@ class Simulator::Impl {
                                           ? std::max(base_store_send, base_buffered_permission_ready)
                                           : saturating_add(base_store_send, store_lower_bound_latency_cycles);
                             }
+                            if (buffer_eligible && spr_l2_shared_prefetch_ && !spr_llc_resident_prefetch_ &&
+                                !config_.spr_l2_prefetch_follow) {
+                                // Prefetch replay commits shared events in accepted
+                                // order. Publish this buffered store no earlier than
+                                // that batch's model frontier, and carry the same
+                                // delay through SQ release and subsequent stores.
+                                const auto frontier_local_q16 = local_horizon_q16(
+                                    core, cycles_to_fixed(spr_l2_shared_prefetch_->frontier,
+                                                         "prefetch store frontier"));
+                                const auto release_floor = fixed_to_cycle_ceil(frontier_local_q16);
+                                if (release_floor > sq_release) {
+                                    ++o3_counters.spr_prefetch_store_frontier_clamps;
+                                    o3_counters.spr_prefetch_store_frontier_cycles += release_floor - sq_release;
+                                }
+                                sq_release = std::max(sq_release, release_floor);
+                                memory_response_cycle = std::max(memory_response_cycle, sq_release);
+                                store_latency_cycles = sq_release - store_send;
+                            }
                             if (needs_tso) {
-                                store_drain_ready = sq_release;
+                                if (store_ticket) {
+                                    if (legacy_store_audit)
+                                        spr_store_window.complete(*store_ticket,sq_release,
+                                            {bound.sequence,store_send,legacy_audit_role,legacy_audit_level,legacy_audit_service,
+                                             legacy_audit_path,saturating_add(actual_retire,commit_to_admission)});
+                                    else spr_store_window.complete(*store_ticket, sq_release);
+                                }
+                                else if (config_.spr_store_window_feedback) {
+                                    if (legacy_store_audit)
+                                        spr_store_window.barrier_until(sq_release,
+                                            {4,false,{bound.sequence,store_send,legacy_audit_role,
+                                                      legacy_audit_level,legacy_audit_service,legacy_audit_path,
+                                                      saturating_add(actual_retire,commit_to_admission),sq_release}});
+                                    else spr_store_window.barrier_until(sq_release);
+                                }
+                                store_drain_ready = config_.spr_store_window_feedback
+                                    ? std::max(store_drain_ready, sq_release) : sq_release;
                                 if (response_paired_frontier) {
                                     store_drain_frontier.assign(
                                         base_sq_release, sq_release,
@@ -16472,6 +18068,13 @@ class Simulator::Impl {
                                     store_drain_frontier.assign(
                                         sq_release, sq_release, bound.sequence);
                                 }
+                            }
+                            if (config_.spr_store_sq_join_credit_proxy && store_ticket &&
+                                store_ticket->credit_join && store_send >= actual_retire &&
+                                sq_release > store_send) {
+                                sq_join_release = store_send;
+                                ++o3_counters.spr_store_sq_joined;
+                                o3_counters.spr_store_sq_credit_saved_cycles += sq_release - store_send;
                             }
                             if (buffer_eligible) {
                                 buffered_store_publish_cycles[
@@ -16561,11 +18164,14 @@ class Simulator::Impl {
                             store_request_issue_cycle = store_send;
                             store_drain_frontier.local_access = false;
                         }
-                        if (bound.local_no_access && has_store) {
+                        if ((bound.local_no_access ||
+                             (config_.spr_store_group_merge && bound.perf_missing_source)) && has_store) {
                             const auto local_admission = static_cast<std::uint64_t>(
                                 *config_.store_commit_to_iew_delay) + 1;
-                            sq_release = saturating_add(actual_retire, local_admission);
-                            base_sq_release = saturating_add(base_retire, local_admission);
+                            const auto local_release = saturating_add(actual_retire, local_admission);
+                            const auto local_base_release = saturating_add(base_retire, local_admission);
+                            sq_release = bound.local_no_access ? local_release : std::max(sq_release, local_release);
+                            base_sq_release = bound.local_no_access ? local_base_release : std::max(base_sq_release, local_base_release);
                             if (needs_tso && store_drain_ready != 0) {
                                 const auto next = store_drain_frontier.local_access ? 0 :
                                     kStoreResponseToNextAdmissionCycles;
@@ -16593,8 +18199,83 @@ class Simulator::Impl {
                             store_drain_frontier.local_access = false;
                             store_drain_frontier.local_scan_ready_cycle = store_drain_ready;
                         }
+                        if (config_.spr_store_window_feedback && !regular_store) {
+                            store_drain_ready = std::max(store_drain_ready, sq_release);
+                            if (legacy_store_audit) {
+                                const auto own_local_ready=saturating_add(actual_retire,
+                                    static_cast<std::uint64_t>(*config_.store_commit_to_iew_delay)+1);
+                                const auto prior_ready=pair_predecessor_drain ? saturating_add(
+                                    pair_predecessor_drain,audit_prior_local?0:kStoreResponseToNextAdmissionCycles) : 0;
+                                const bool inherited=bound.local_no_access && prior_ready>own_local_ready;
+                                const std::uint32_t kind=bound.local_no_access?1u:bound.locked_rmw?2u:3u;
+                                spr_store_window.barrier_until(store_drain_ready,
+                                    {kind,inherited,inherited?audit_prior_origin:SprStoreWindow::Origin{}});
+                            } else spr_store_window.barrier_until(store_drain_ready);
+                            store_drain_frontier.assign(store_drain_ready, store_drain_ready, bound.sequence);
+                        }
+                        if (pair_owner) {
+                            if (!regular_store || !shared_store_ticket ||
+                                first_memory != active_store_group_->owner_event)
+                                throw std::logic_error("store group owner changed during feedback");
+                            PendingStorePair pending;
+                            pending.tickets[0]=shared_store_ticket;
+                            pending.sq_slots[0]=sq_next_slot;
+                            pending.count=1;
+                            pending.members_ready=std::max(actual_retire,actual_completion);
+                            pending.owner_callback=sq_release;
+                            pending.predecessor_drain=pair_predecessor_drain;
+                            pending.owner_position=first_memory-memory_begin;
+                            pending_store_pair=pending;
+                            // Hold the distinct FIFO slot until the follower
+                            // has retired and the single modeled callback exists.
+                            sq_release = std::numeric_limits<std::uint64_t>::max();
+                        } else if (pair_follower) {
+                            if (!pending_store_pair || !regular_store || !shared_store_ticket ||
+                                core >= timing.spr_shared_store_credits.size() ||
+                                pending_store_pair->count != member_index ||
+                                first_memory != active_store_group_->member_events[member_index])
+                                throw std::logic_error("store group follower without owner");
+                            auto& pending=*pending_store_pair;
+                            pending.tickets[member_index]=shared_store_ticket;
+                            pending.sq_slots[member_index]=sq_next_slot;
+                            pending.members_ready=std::max({pending.members_ready,actual_retire,actual_completion});
+                            ++pending.count;
+                            if (pending.count==active_store_group_->member_count) {
+                                const auto members_ready=std::max({pending.members_ready,pending.predecessor_drain,
+                                    timing.spr_shared_store_credits[core].frontier()});
+                                const auto offload=saturating_add(members_ready,
+                                    static_cast<std::uint64_t>(*config_.store_commit_to_iew_delay)+1);
+                                const auto callback=std::max(pending.owner_callback,
+                                    saturating_add(offload,std::max<std::uint64_t>(1,store_lower_bound_latency_cycles)));
+                                timing.store_group_edges[core]=TimingFeedback::GroupEdges{offload,callback};
+                                timing.spr_shared_store_credits[core].schedule_group(
+                                    pending.tickets.data(),pending.count,offload,callback);
+                                for (std::size_t i=0;i<pending.count;++i) {
+                                    const auto release=i==0?callback:offload;
+                                    sq_ready[pending.sq_slots[i]]=release;
+                                    if (track_sq_release_owner)
+                                        sq_frontier[pending.sq_slots[i]].assign(
+                                            release,release,active_store_group_->member_sequences[i]);
+                                }
+                                buffered_store_publish_cycles[pending.owner_position]=callback;
+                                store_drain_ready=callback;
+                                store_drain_frontier.assign(callback,callback,bound.sequence);
+                                sq_release=offload;
+                                pending_store_pair.reset();
+                            } else {
+                                // Keep every intermediate follower's SQ and
+                                // shared credit until the complete group exits.
+                                sq_release=std::numeric_limits<std::uint64_t>::max();
+                            }
+                        }
                         if (track_sq_release_owner)
                             frame.audit_store_sq_release_cycle = sq_release;
+                        if (config_.spr_store_group_merge && !pair_owner && !pair_follower) {
+                            if (!shared_store_ticket || core >= timing.spr_shared_store_credits.size())
+                                throw std::logic_error("store retired without shared budget admission");
+                            timing.spr_shared_store_credits[core].schedule_single(
+                                shared_store_ticket, sq_release);
+                        }
                         ResponseFrontierRelease sq_release_frontier;
                         if (track_sq_release_owner) {
                             if (response_paired_frontier) {
@@ -16608,7 +18289,7 @@ class Simulator::Impl {
                             }
                         }
                         if (needs_tso) {
-                            sq_ready[sq_next_slot] = sq_release;
+                            sq_ready[sq_next_slot] = sq_join_release.value_or(sq_release);
                             if (track_sq_release_owner) {
                                 sq_frontier[sq_next_slot] =
                                     sq_release_frontier;
@@ -16631,6 +18312,7 @@ class Simulator::Impl {
                         if (audit_checkpoint) {
                             auto& entry = audit_sparse_rob[rob_next_slot];
                             entry.sequence = bound.sequence;
+                            entry.rename_eliminated = bound.rename_eliminated;
                             entry.completion_cycle = actual_completion;
                             entry.completion_extension_cycles =
                                 completion_extension;
@@ -16670,6 +18352,7 @@ class Simulator::Impl {
                     } else {
                         auto& entry = sparse_rob[rob_next_slot];
                         entry.sequence = bound.sequence;
+                        entry.rename_eliminated = bound.rename_eliminated;
                         entry.completion_cycle = actual_completion;
                         entry.completion_extension_cycles =
                             completion_extension;
@@ -16812,9 +18495,11 @@ class Simulator::Impl {
                             store_request_issue_cycle = store_send;
                             store_drain_frontier.local_access = false;
                         }
-                        if (bound.local_no_access && has_store) {
-                            sq_release = saturating_add(actual_retire,
+                        if ((bound.local_no_access ||
+                             (config_.spr_store_group_merge && bound.perf_missing_source)) && has_store) {
+                            const auto local_release = saturating_add(actual_retire,
                                 static_cast<std::uint64_t>(*config_.store_commit_to_iew_delay)+1);
+                            sq_release = bound.local_no_access ? local_release : std::max(sq_release, local_release);
                             if (needs_tso && store_drain_ready != 0)
                                 sq_release = std::max(sq_release,saturating_add(store_drain_ready,
                                     store_drain_frontier.local_access ? 0 : kStoreResponseToNextAdmissionCycles));
@@ -16825,6 +18510,12 @@ class Simulator::Impl {
                                 store_drain_frontier.local_access=true;
                                 store_drain_frontier.local_scan_ready_cycle=sq_release;
                             }
+                        }
+                        if (config_.spr_store_group_merge) {
+                            if (!shared_store_ticket || core >= timing.spr_shared_store_credits.size())
+                                throw std::logic_error("store retired without shared budget admission");
+                            timing.spr_shared_store_credits[core].schedule_single(
+                                shared_store_ticket, sq_release);
                         }
                         if (needs_tso) {
                             sq_ready[sq_next_slot] = sq_release;
@@ -17563,7 +19254,7 @@ class Simulator::Impl {
                 if (fixed_work_enabled_ && bound.sequence + 1 == score_sequence_begin_[core])
                     timing.score_begin_retire_q16[core] = cycles_to_fixed(actual_retire);
                 previous_actual_retire = actual_retire;
-                if (const char* rh = std::getenv("FASTSIM_TSO_RETIRE_HIST")) {
+                if (const char* rh = tso_retire_hist ? tso_retire_hist->c_str() : nullptr) {
                     static FILE* rf = [rh]() { return std::fopen(rh, "w"); }();
                     if (rf != nullptr) {
                         std::fprintf(
@@ -17686,6 +19377,7 @@ class Simulator::Impl {
                     const auto& retained = chunk.uop(begin + local);
                     auto& entry = sparse_rob[slot];
                     entry.sequence = retained.sequence;
+                    entry.rename_eliminated = retained.rename_eliminated;
                     entry.completion_cycle = saturating_add(
                         retained.completion_q16 / kCycleUnit,
                         saturating_add(
@@ -17954,6 +19646,8 @@ class Simulator::Impl {
             destination.fixed_read_responses[core] = std::move(source.fixed_read_responses[core]);
             destination.fixed_read_issues[core] = std::move(source.fixed_read_issues[core]);
         }
+        if (!source.prefetch_callback_cycles.empty())
+            destination.prefetch_callback_cycles[core]=std::move(source.prefetch_callback_cycles[core]);
         if (!source.buffer_service_issue_q16.empty())
             destination.buffer_service_issue_q16[core] = std::move(source.buffer_service_issue_q16[core]);
         if (!source.buffer_service_late_issue_move.empty())
@@ -17985,6 +19679,10 @@ class Simulator::Impl {
         destination.interval_extra_q16[core] = std::move(source.interval_extra_q16[core]);
         destination.interval_critical_cause[core] = std::move(source.interval_critical_cause[core]);
         destination.sequencer_ready_cycles[core] = std::move(source.sequencer_ready_cycles[core]);
+        if (!source.legacy_prepare.empty())
+            destination.legacy_prepare[core] = std::move(source.legacy_prepare[core]);
+        if (!source.sequencer_acceptance_frontier.empty())
+            destination.sequencer_acceptance_frontier[core] = source.sequencer_acceptance_frontier[core];
         destination.dtlb_walker_ready_cycles[core] = std::move(source.dtlb_walker_ready_cycles[core]);
         destination.dtlb_hierarchy_walk_extra_cycles[core] = std::move(source.dtlb_hierarchy_walk_extra_cycles[core]);
         destination.dtlb_pending_fills[core] = std::move(source.dtlb_pending_fills[core]);
@@ -17996,9 +19694,16 @@ class Simulator::Impl {
         destination.sequencer_counters[core] = std::move(source.sequencer_counters[core]);
         destination.pending_fills[core] = std::move(source.pending_fills[core]);
         destination.pending_fill_counters[core] = std::move(source.pending_fill_counters[core]);
+        destination.parent_services[core] = std::move(source.parent_services[core]);
+        destination.parent_counters[core] = std::move(source.parent_counters[core]);
         destination.private_read_service_counters[core] = std::move(source.private_read_service_counters[core]);
         destination.private_read_last_response[core] = std::move(source.private_read_last_response[core]);
         destination.iq_ready_cycles[core] = std::move(source.iq_ready_cycles[core]);
+        destination.spr_store_window[core] = std::move(source.spr_store_window[core]);
+        destination.spr_load_bank[core] = std::move(source.spr_load_bank[core]);
+        destination.spr_l1_load_fill_ready[core] = std::move(source.spr_l1_load_fill_ready[core]);
+        destination.spr_l2_load_fill_ready[core] = std::move(source.spr_l2_load_fill_ready[core]);
+        destination.partition_iq_ready_cycles[core] = std::move(source.partition_iq_ready_cycles[core]);
         destination.o3_counters[core] = std::move(source.o3_counters[core]);
         destination.rename_releases[core] = std::move(source.rename_releases[core]);
         destination.rename_live[core] = std::move(source.rename_live[core]);
@@ -18075,8 +19780,6 @@ class Simulator::Impl {
         const auto unite = [&](std::uint32_t a, std::uint32_t b) {
             parent[root(b)] = root(a);
         };
-        const auto sets = config_.llc.size_bytes /
-            (config_.llc.line_size * config_.llc.associativity);
         std::unordered_map<std::uint64_t, std::uint32_t> set_resource;
         std::unordered_set<std::uint64_t> side_effect_sets;
         std::vector<std::uint64_t> requests(config_.cores, 0);
@@ -18091,12 +19794,12 @@ class Simulator::Impl {
                 auto& evicted = add_epoch_accessor(replay.l2_evicted_line);
                 evicted[pending.core / 64] |= 1ull << (pending.core % 64);
                 if (replay.l2_evicted_dirty)
-                    side_effect_sets.insert(replay.l2_evicted_line % sets);
+                    side_effect_sets.insert(llc_set_of(replay.l2_evicted_line));
             }
             hidden_side_effect |= event.atomic || !replay.shared_timing.replayable;
             if (!replay.shared_timing.uncore_request) continue;
             const auto cha = replay.shared_timing.cha;
-            const auto inserted = set_resource.emplace(event.line % sets, cha);
+            const auto inserted = set_resource.emplace(llc_set_of(event.line), cha);
             if (!inserted.second) unite(cha, inserted.first->second);
             if (replay.unique_dram_request)
                 unite(cha, config_.cha_count + start->dram.channel_of(replay.shared_timing.memory_line));
@@ -18141,7 +19844,7 @@ class Simulator::Impl {
             counters.unsupported_carried_requests += replay.functional_carried;
             counters.unsupported_other_requests += other;
             unsupported[component] |= hidden_side_effect || event.instruction_fetch ||
-                replay.functional_carried || other || side_effect_sets.count(event.line % sets) != 0;
+                replay.functional_carried || other || side_effect_sets.count(llc_set_of(event.line)) != 0;
             const auto* accessors = find_epoch_accessors(event.line);
             if (accessors) {
                 for (std::size_t word = 0; word < accessors->size(); ++word) {
@@ -18535,6 +20238,35 @@ class Simulator::Impl {
         const std::vector<std::size_t>& accepted_begin,
         const std::vector<std::size_t>& accepted_end,
         TimingFeedback& timing) {
+        if (unified_parent_active_) {
+            parent_write_lines_.clear();
+            parent_write_owners_.clear();
+            parent_write_budget_exceeded_ = false;
+            for (std::uint32_t core=0; core<config_.cores; ++core) {
+                const auto& chunk = current_chunks_[core];
+                const auto count = std::min(chunk.memory_size(),event_feedback[core].size());
+                for (std::size_t i=0; i<count; ++i) {
+                    const auto& event = chunk.memory(i);
+                    if (!(event.write || event.atomic || event.page_fault_state_fill)) continue;
+                    if (parent_write_lines_.size() >= config_.unified_parent_service_capacity) {
+                        parent_write_budget_exceeded_ = true;
+                        break;
+                    }
+                    parent_write_lines_.insert(event.line);
+                    if (unified_parent_v2_) {
+                        const auto owner = (event.atomic || event.page_fault_state_fill)
+                            ? config_.cores : core;
+                        auto inserted=parent_write_owners_.emplace(event.line,owner);
+                        if (!inserted.second && inserted.first->second!=owner)
+                            inserted.first->second=config_.cores;
+                    }
+                }
+            }
+        }
+        if (config_.spr_store_group_merge) {
+            timing.spr_shared_store_credits = response_spr_shared_store_credits_;
+            timing.store_group_edges.assign(config_.cores, std::nullopt);
+        }
         if (shared_service_start_) prepare_shared_service_components(
             event_feedback, accepted_begin, accepted_end);
         // Retain all outer and per-core capacities across epochs. Clearing an
@@ -18550,6 +20282,7 @@ class Simulator::Impl {
         // worker can shrink/grow without reinitializing the retained prefix.
         // Inactive-core remnants are never consumed.
         timing.memory_issue_extra_q16.resize(config_.cores);
+        if (config_.legacy_prepare_timing_enabled()) timing.legacy_prepare.resize(config_.cores);
         if (!config_.committed_dram_audit_path.empty())
             timing.diagnostic_dram_issue_cycles.resize(config_.cores);
         if(config_.bounded_store_timing())timing.bounded_store.assign(config_.cores,BoundedStoreFeedback{});
@@ -18557,6 +20290,7 @@ class Simulator::Impl {
             clear_nested(timing.fixed_read_responses);
             clear_nested(timing.fixed_read_issues);
         }
+        if (config_.spr_l2_prefetch_follow) clear_nested(timing.prefetch_callback_cycles);
         if (config_.ruby_buffer_service_repair)
             clear_nested(timing.buffer_service_issue_q16);
         if (buffer_service_trial_)
@@ -18573,8 +20307,15 @@ class Simulator::Impl {
         if (config_.buffer_tso_prepare_lifecycle)
             clear_nested(timing.buffered_store_original_demands);
         clear_nested(timing.sequencer_ready_cycles);
+        if (config_.ruby_sequencer_ifetch_admission)
+            timing.sequencer_acceptance_frontier.assign(config_.cores, 0);
         clear_nested(timing.dtlb_walker_ready_cycles);
         clear_nested(timing.iq_ready_cycles);
+        timing.spr_store_window.resize(config_.cores);
+        timing.spr_load_bank.resize(config_.cores);
+        timing.spr_l1_load_fill_ready.resize(config_.cores);
+        timing.spr_l2_load_fill_ready.resize(config_.cores);
+        timing.partition_iq_ready_cycles.resize(config_.cores);
         clear_nested(timing.rename_releases);
         clear_nested(timing.rob_ready_cycles);
         clear_nested(timing.lq_ready_cycles);
@@ -18610,6 +20351,8 @@ class Simulator::Impl {
             config_.cores, SequencerCounters{});
         timing.pending_fills.resize(config_.cores);
         timing.pending_fill_counters.assign(config_.cores, PendingFillCounters{});
+        timing.parent_services.resize(config_.cores);
+        timing.parent_counters.assign(config_.cores, UnifiedParentCounters{});
         timing.dtlb_hierarchy_walk_extra_cycles.assign(
             config_.cores, 0);
         timing.dtlb_pending_fills.resize(config_.cores);
@@ -18701,15 +20444,28 @@ class Simulator::Impl {
 
         std::vector<std::uint32_t> active_cores;
         active_cores.reserve(config_.cores);
-        for (std::uint32_t core = 0; core < config_.cores; ++core) {
-            if (accepted_begin[core] == accepted_end[core]) continue;
-            active_cores.push_back(core);
+        // Copy only core-owned state, on the worker that consumes it.
+        // The source-order proposal still requires its initialized snapshot
+        // on the coordinator before the proposal/committed passes diverge.
+        const std::function<void(std::uint32_t)> initialize_core = [this, &timing](std::uint32_t core) {
             timing.sequencer_ready_cycles[core] =
                 sequencer_ready_cycles_[core];
+            if (config_.legacy_prepare_timing_enabled())
+                timing.legacy_prepare[core] = legacy_prepare_state_[core];
+            if (config_.ruby_sequencer_ifetch_admission)
+                timing.sequencer_acceptance_frontier[core] = sequencer_acceptance_frontier_[core];
             if (config_.response_pending_fill) {
                 timing.pending_fills[core] = response_pending_fills_[core];
                 timing.pending_fill_counters[core].carried_parents =
                     response_pending_fills_[core].size();
+            }
+            if (unified_parent_active_) {
+                timing.parent_services[core] = response_parent_services_[core];
+                timing.parent_counters[core].carried = response_parent_services_[core].index_size();
+                if (parent_write_budget_exceeded_) timing.parent_services[core].invalidate_all();
+                else for (auto line : parent_write_lines_)
+                    if (!unified_parent_v2_ || !parent_line_safe(core,line))
+                        timing.parent_services[core].invalidate(line);
             }
             timing.dtlb_walker_ready_cycles[core] =
                 response_dtlb_walker_ready_cycles_[core];
@@ -18723,6 +20479,16 @@ class Simulator::Impl {
             }
             timing.iq_ready_cycles[core] =
                 response_iq_ready_cycles_[core];
+            if (config_.spr_load_bank_feedback)
+                timing.spr_load_bank[core] = response_spr_load_bank_[core];
+            if (config_.spr_store_window_feedback)
+                timing.spr_store_window[core] = response_spr_store_window_[core];
+            if (config_.spr_load_fill_feedback)
+                timing.spr_l1_load_fill_ready[core] = response_spr_l1_load_fill_ready_[core];
+            if (config_.spr_load_fill_feedback)
+                timing.spr_l2_load_fill_ready[core] = response_spr_l2_load_fill_ready_[core];
+            if (config_.spr_partitioned_iq && config_.response_queue_feedback)
+                timing.partition_iq_ready_cycles[core] = response_partition_iq_ready_cycles_[core];
             timing.rename_releases[core] =
                 response_rename_releases_[core];
             timing.rename_live[core] = response_rename_live_[core];
@@ -18785,6 +20551,14 @@ class Simulator::Impl {
                 response_event_only_teacher_exact_cycles_[core];
             timing.rob_head_suffix_open[core] =
                 response_rob_head_suffix_open_[core];
+        };
+        const bool source_order_sequencer =
+            config_.dtlb.hierarchy_walk || software_prefetch_timing_active_ ||
+            config_.ruby_sequencer_load_admission;
+        for (std::uint32_t core = 0; core < config_.cores; ++core) {
+            if (accepted_begin[core] == accepted_end[core]) continue;
+            active_cores.push_back(core);
+            if (source_order_sequencer) initialize_core(core);
         }
         // Repeated timing solves must not commit duplicate cache demands.
         // These transactions only discard trials; they never disable prepare
@@ -18796,9 +20570,6 @@ class Simulator::Impl {
             for (const auto& core : cores_) demand_counters_before.push_back(core->total);
             buffer_tso_demand_transaction_ = &*demand_transaction;
         }
-        const bool source_order_sequencer =
-            config_.dtlb.hierarchy_walk || software_prefetch_timing_active_ ||
-            config_.ruby_sequencer_load_admission;
         if (source_order_sequencer) {
             // First solve the exact CPU-side issue schedule without finite
             // Sequencer capacity.  The second pass below can then allocate
@@ -18807,16 +20578,17 @@ class Simulator::Impl {
             // pass is deliberately sequential: it reuses per-core scratch
             // and is an experimental correctness path, while the committed
             // pass retains the normal parallel implementation.
-            auto proposed_timing = timing;
+            auto& proposed_timing = sequencer_proposal_scratch_;
+            copy_sequencer_proposal(timing, active_cores, proposed_timing);
             for (const auto core : active_cores) {
                 compute_core_timing_feedback(
                     core, event_feedback, accepted_begin, accepted_end,
                     proposed_timing, true);
             }
-            timing.sequencer_proposed_issue_extra_q16 =
-                std::move(proposed_timing.memory_issue_extra_q16);
-            timing.sequencer_proposed_service_extra_q16 =
-                std::move(proposed_timing.sequencer_proposed_service_extra_q16);
+            timing.sequencer_proposed_issue_extra_q16.swap(
+                proposed_timing.memory_issue_extra_q16);
+            timing.sequencer_proposed_service_extra_q16.swap(
+                proposed_timing.sequencer_proposed_service_extra_q16);
             if (config_.buffer_tso_prepare_lifecycle) {
                 shared_->restore(*demand_transaction);
                 for (std::uint32_t core = 0; core < config_.cores; ++core)
@@ -18839,10 +20611,11 @@ class Simulator::Impl {
         if (active_cores.size() > 1) {
             run_parallel_timing_feedback(
                 event_feedback, accepted_begin, accepted_end,
-                active_cores, timing);
+                active_cores, timing, source_order_sequencer ? nullptr : &initialize_core);
             ++stats_.timing_feedback_parallel_calls;
         } else {
             for (const auto core : active_cores) {
+                if (!source_order_sequencer) initialize_core(core);
                 compute_core_timing_feedback(
                     core, event_feedback, accepted_begin, accepted_end,
                     timing);
@@ -19075,10 +20848,22 @@ class Simulator::Impl {
                     samples.end(), committed.begin(), committed.end());
             }
             if (config_.response_queue_feedback) {
+                if (config_.spr_store_group_merge)
+                    response_spr_shared_store_credits_[core] = timing.spr_shared_store_credits[core];
                 stats_.private_read_services += timing.private_read_service_counters[core];
                 private_read_prior_response_[core] = timing.private_read_last_response[core];
                 response_iq_ready_cycles_[core] =
                     timing.iq_ready_cycles[core];
+                if (config_.spr_load_bank_feedback)
+                    response_spr_load_bank_[core] = timing.spr_load_bank[core];
+                if (config_.spr_store_window_feedback)
+                    response_spr_store_window_[core] = timing.spr_store_window[core];
+                if (config_.spr_load_fill_feedback)
+                    response_spr_l1_load_fill_ready_[core] = timing.spr_l1_load_fill_ready[core];
+                if (config_.spr_load_fill_feedback)
+                    response_spr_l2_load_fill_ready_[core] = timing.spr_l2_load_fill_ready[core];
+                if (config_.spr_partitioned_iq)
+                    response_partition_iq_ready_cycles_[core] = timing.partition_iq_ready_cycles[core];
                 response_dispatch_cycle_[core] =
                     timing.dispatch_cycle[core];
                 response_dispatch_used_[core] =
@@ -19323,12 +21108,41 @@ class Simulator::Impl {
             if (config_.ruby_sequencer_max_outstanding != 0) {
                 sequencer_ready_cycles_[core] =
                     timing.sequencer_ready_cycles[core];
+                if (config_.ruby_sequencer_ifetch_admission)
+                    sequencer_acceptance_frontier_[core] = timing.sequencer_acceptance_frontier[core];
                 stats_.sequencer[core] +=
                     timing.sequencer_counters[core];
+            }
+            if (config_.legacy_prepare_timing_enabled()) {
+                const auto before=legacy_prepare_state_[core].stats();
+                const auto after=timing.legacy_prepare[core].stats();
+                auto& counters=cores_[core]->total;
+                counters.legacy_prepare_accepted+=after.accepted-before.accepted;
+                counters.legacy_prepare_dropped+=after.dropped-before.dropped;
+                counters.legacy_prepare_direct+=after.direct-before.direct;
+                counters.legacy_prepare_takeover+=after.takeover-before.takeover;
+                counters.legacy_prepare_ready+=after.prepared-before.prepared;
+                counters.legacy_prepare_diagnostics+=after.diagnostics.difference(before.diagnostics);
+                legacy_prepare_state_[core]=timing.legacy_prepare[core];
             }
             if (config_.response_pending_fill) {
                 response_pending_fills_[core] = std::move(timing.pending_fills[core]);
                 stats_.pending_fill[core] += timing.pending_fill_counters[core];
+            }
+            if (unified_parent_active_) {
+                auto parent_counters = timing.parent_counters[core];
+                parent_counters.copied_record_blocks =
+                    timing.parent_services[core].copied_record_blocks() -
+                    response_parent_services_[core].copied_record_blocks();
+                const auto index_after=timing.parent_services[core].index_cost();
+                const auto index_before=response_parent_services_[core].index_cost();
+                parent_counters.copied_index_pages=index_after.leaves-index_before.leaves;
+                parent_counters.copied_index_directories=index_after.directories-index_before.directories;
+                parent_counters.copied_index_bytes=index_after.bytes-index_before.bytes;
+                parent_counters.line_index_rebuilds=timing.parent_services[core].line_index_rebuilds()-
+                    response_parent_services_[core].line_index_rebuilds();
+                response_parent_services_[core] = std::move(timing.parent_services[core]);
+                stats_.unified_parent[core] += parent_counters;
             }
             if (config_.dtlb.hierarchy_walk) {
                 response_dtlb_walker_ready_cycles_[core] =
@@ -20021,7 +21835,7 @@ class Simulator::Impl {
                         next.store_engine_retire[job.core][job.index-next.memory_begin[job.core]];
                     stable=stable && job.retire==retired;
                 }
-                if(!stable && pass>=60 && std::getenv("FASTSIM_STORE_ENGINE_CLOSURE_DEBUG")) {
+                if(!stable && pass>=60 && store_closure_debug) {
                     std::size_t r=0,shown=0;
                     for(const auto& p:batch) {
                         const auto pos=p.index-next.memory_begin[p.core];
@@ -20796,7 +22610,9 @@ class Simulator::Impl {
         const auto sets = config_.llc.size_bytes /
             (static_cast<std::uint64_t>(config_.llc.associativity) *
              config_.llc.line_size);
-        return cache_set_index(line, sets);
+        const auto indexed = config_.cha_xor_hash && config_.cha_count == 52
+            ? spr_llc_mix_line(line) : line;
+        return cache_set_index(indexed, sets);
     }
 
     std::array<std::uint32_t, 2> shared_path_sets(
@@ -21036,6 +22852,31 @@ class Simulator::Impl {
             configured, lanes > 1 ? lanes - 1 : 1));
     }
 
+    struct FrfcfsRepairScratch {
+        struct Event {
+            BatchPending pending;
+            SharedTimingDescriptor descriptor;
+            std::uint64_t issue_cycle = 0;
+            std::uint64_t fair_ordinal = 0;
+        };
+        std::vector<Event> events, shared_arrivals;
+        std::vector<std::uint64_t> response_retime_entry_queue, fair_cha_ready;
+        std::unordered_map<std::uint64_t, std::uint64_t>
+            bucket_core_rank, fair_ordinal_by_event, fair_tag_ready,
+            fair_cha_queue, repaired_fills;
+        std::unordered_map<std::uint64_t, SharedFill> projected_fills;
+        std::vector<std::array<std::uint64_t, 4>> fill_remaps;
+        std::vector<DramModel::Request> requests;
+        std::vector<std::uint64_t> base_latency, base_exposed,
+            absolute_response, canonical_cha_start, issue_delay, first_queue;
+        std::unordered_set<std::uint32_t> affected_chas;
+        std::vector<MemoryReplay> first_feedback;
+    };
+    // A recursive response-retime pass owns another stable-address slot.
+    // All exits, including exceptions and fallback, release the depth guard.
+    std::deque<FrfcfsRepairScratch> frfcfs_repair_scratch_;
+    std::size_t frfcfs_repair_depth_ = 0;
+
     bool apply_frfcfs_dram_repair(
         const std::vector<BatchPending>& materialized,
         std::vector<std::vector<MemoryReplay>>& event_feedback,
@@ -21045,19 +22886,8 @@ class Simulator::Impl {
         std::uint64_t horizon_q16,
         TimingFeedback& timing,
         bool response_retime_pass = false) {
-        struct RepairEvent {
-            BatchPending pending;
-            SharedTimingDescriptor descriptor;
-            std::uint64_t issue_cycle = 0;
-            std::uint64_t fair_ordinal = 0;
-        };
-
-        struct SharedArrival {
-            BatchPending pending;
-            SharedTimingDescriptor descriptor;
-            std::uint64_t issue_cycle = 0;
-            std::uint64_t fair_ordinal = 0;
-        };
+        using RepairEvent = FrfcfsRepairScratch::Event;
+        using SharedArrival = FrfcfsRepairScratch::Event;
 
         std::uint64_t memory_requests = 0;
         std::uint64_t canonical_queue_cycles = 0;
@@ -21110,6 +22940,7 @@ class Simulator::Impl {
             ++stats_.dram_frfcfs_candidate_epochs;
             stats_.dram_frfcfs_requests += memory_requests;
             ++stats_.dram_frfcfs_fallback_epochs;
+            ++stats_.dram_frfcfs_fallback_nonreplayable_epochs;
             const auto ended = std::chrono::steady_clock::now();
             stats_.dram_frfcfs_wall_ns +=
                 static_cast<std::uint64_t>(
@@ -21118,7 +22949,16 @@ class Simulator::Impl {
             return false;
         }
 
-        std::vector<std::uint64_t> response_retime_entry_queue;
+        if (frfcfs_repair_depth_ == frfcfs_repair_scratch_.size())
+            frfcfs_repair_scratch_.emplace_back();
+        auto& scratch = frfcfs_repair_scratch_[frfcfs_repair_depth_];
+        struct DepthGuard {
+            std::size_t& depth;
+            explicit DepthGuard(std::size_t& value) : depth(value) { ++depth; }
+            ~DepthGuard() { --depth; }
+        } depth_guard(frfcfs_repair_depth_);
+        auto& response_retime_entry_queue = scratch.response_retime_entry_queue;
+        response_retime_entry_queue.clear();
         if (response_timing_retime_enabled() &&
             !response_retime_pass) {
             response_retime_entry_queue.reserve(config_.cha_count);
@@ -21127,13 +22967,14 @@ class Simulator::Impl {
             }
         }
 
-        std::vector<SharedArrival> shared_arrivals;
+        auto& shared_arrivals = scratch.shared_arrivals;
+        shared_arrivals.clear();
         shared_arrivals.reserve(materialized.size());
-        std::unordered_map<std::uint64_t, std::uint64_t>
-            bucket_core_rank;
+        auto& bucket_core_rank = scratch.bucket_core_rank;
+        bucket_core_rank.clear();
         bucket_core_rank.reserve(materialized.size());
-        std::unordered_map<std::uint64_t, std::uint64_t>
-            fair_ordinal_by_event;
+        auto& fair_ordinal_by_event = scratch.fair_ordinal_by_event;
+        fair_ordinal_by_event.clear();
         fair_ordinal_by_event.reserve(materialized.size());
         for (const auto& pending : materialized) {
             const auto& replay =
@@ -21174,9 +23015,12 @@ class Simulator::Impl {
                 }
                 return left.fair_ordinal < right.fair_ordinal;
             });
-        auto fair_cha_ready = timing_start.cha_ready;
-        std::unordered_map<std::uint64_t, std::uint64_t> fair_tag_ready;
-        std::unordered_map<std::uint64_t, std::uint64_t> fair_cha_queue;
+        auto& fair_cha_ready = scratch.fair_cha_ready;
+        fair_cha_ready = timing_start.cha_ready;
+        auto& fair_tag_ready = scratch.fair_tag_ready;
+        auto& fair_cha_queue = scratch.fair_cha_queue;
+        fair_tag_ready.clear();
+        fair_cha_queue.clear();
         fair_tag_ready.reserve(shared_arrivals.size());
         fair_cha_queue.reserve(shared_arrivals.size());
         for (const auto& shared : shared_arrivals) {
@@ -21194,7 +23038,8 @@ class Simulator::Impl {
                 cha_start + config_.llc.hit_latency);
         }
 
-        std::vector<RepairEvent> events;
+        auto& events = scratch.events;
+        events.clear();
         events.reserve(materialized.size());
         for (const auto& pending : materialized) {
             const auto& replay =
@@ -21238,23 +23083,11 @@ class Simulator::Impl {
         ++stats_.dram_frfcfs_candidate_epochs;
         stats_.dram_frfcfs_requests += events.size();
 
-        std::vector<std::uint64_t> previous_arrivals;
-        std::vector<std::uint64_t> previous_completions;
-        previous_arrivals.reserve(events.size());
-        previous_completions.reserve(events.size());
-        for (const auto& event : events) {
-            previous_arrivals.push_back(
-                event.descriptor.canonical_dram_arrival);
-            previous_completions.push_back(
-                event.descriptor.canonical_fill_completion);
-        }
-        std::vector<std::size_t> previous_service_order;
-
         DramModel stable_dram = timing_start.dram;
         std::vector<std::uint64_t> stable_mshrs;
         DramModel::BatchResult stable_batch;
-        std::vector<DramModel::Request> stable_requests;
-        bool stable = false;
+        auto& stable_requests = scratch.requests;
+        stable_requests.clear();
         std::function<void(
             std::uint32_t,
             const std::function<void(std::uint32_t)>&)>
@@ -21273,12 +23106,12 @@ class Simulator::Impl {
                 };
         }
 
-        if (config_.bounded_store_timing()) {
-            // Bounded mode forecasts the canonical arrivals, not the final
-            // CPU store sends. Schedule exactly once with immutable path-ready
-            // arrivals, then certify that no LLC MSHR would delay any arrival.
-            // Store-TBE nonbinding does not establish this separate condition.
-            std::vector<DramModel::Request> requests;
+        {
+            // Forecast once from the accepted model path-ready arrivals.
+            // Keep the configured LLC credits: reject the entire candidate
+            // if any arrival cannot acquire a real slice slot. No iterative
+            // request/response convergence and no capacity inflation.
+            auto& requests = stable_requests;
             requests.reserve(events.size());
             for (std::size_t index = 0; index < events.size(); ++index) {
                 const auto& event = events[index];
@@ -21307,6 +23140,7 @@ class Simulator::Impl {
                 if (begin == end || *begin > requests[index].arrival ||
                     completion < requests[index].arrival) {
                     ++stats_.dram_frfcfs_fallback_epochs;
+                    ++stats_.dram_frfcfs_fallback_credit_epochs;
                     record_wall_time();
                     return false;
                 }
@@ -21314,111 +23148,21 @@ class Simulator::Impl {
                 *(end - 1) = completion;
                 std::push_heap(begin, end, std::greater<>{});
             }
-            stable = true;
             stable_dram = std::move(repaired_dram);
             stable_mshrs = std::move(mshr_ready);
             stable_batch = std::move(batch);
-            stable_requests = std::move(requests);
-        } else for (std::uint32_t pass = 0;
-             pass < config_.dram.frfcfs_passes; ++pass) {
-            auto mshr_ready = timing_start.llc_mshr_ready;
-            std::vector<DramModel::Request> requests;
-            requests.reserve(events.size());
-
-            const auto replace_slice_min = [&] (
-                std::size_t begin, std::size_t count,
-                std::uint64_t value) {
-                if (count == 0) {
-                    throw std::logic_error(
-                        "FR-FCFS repair has no LLC MSHR entries");
-                }
-                mshr_ready[begin] = value;
-                std::size_t parent = 0;
-                while (true) {
-                    const auto left = parent * 2 + 1;
-                    if (left >= count) break;
-                    const auto right = left + 1;
-                    const auto child =
-                        right < count &&
-                                mshr_ready[begin + right] <
-                                    mshr_ready[begin + left]
-                            ? right
-                            : left;
-                    if (mshr_ready[begin + parent] <=
-                        mshr_ready[begin + child]) {
-                        break;
-                    }
-                    std::swap(mshr_ready[begin + parent],
-                              mshr_ready[begin + child]);
-                    parent = child;
-                }
-            };
-
-            std::vector<std::uint64_t> arrivals(events.size(), 0);
-            for (std::size_t index = 0; index < events.size(); ++index) {
-                const auto& event = events[index];
-                const auto cha = event.descriptor.cha;
-                const auto offset = static_cast<std::size_t>(cha) *
-                    config_.llc_mshrs;
-                const auto mshr_available = mshr_ready[offset];
-                const auto arrival = std::max(
-                    event.descriptor.canonical_tag_ready,
-                    mshr_available);
-                arrivals[index] = arrival;
-                requests.push_back(DramModel::Request{
-                    index, arrival, event.descriptor.memory_line,
-                    event.fair_ordinal,
-                    event.descriptor.source_core,
-                    event.descriptor.source_sequence,
-                    event.descriptor.source_ordinal});
-                replace_slice_min(
-                    offset, config_.llc_mshrs,
-                    std::max(previous_completions[index], arrival));
-            }
-
-            auto repaired_dram = timing_start.dram;
-            auto batch = repaired_dram.schedule_frfcfs(
-                requests, repair_selection_window,
-                parallel_for_channels);
-            std::vector<std::uint64_t> completions(events.size(), 0);
-            for (std::size_t index = 0; index < events.size(); ++index) {
-                completions[index] =
-                    batch.results[index].completion +
-                    config_.llc_fill_response_latency;
-            }
-            ++stats_.dram_frfcfs_passes;
-
-            const bool fixed_point = pass != 0 &&
-                arrivals == previous_arrivals &&
-                completions == previous_completions &&
-                batch.service_order == previous_service_order;
-            if (fixed_point) {
-                stable = true;
-                stable_dram = std::move(repaired_dram);
-                stable_mshrs = std::move(mshr_ready);
-                stable_batch = std::move(batch);
-                stable_requests = std::move(requests);
-                break;
-            }
-            previous_arrivals = std::move(arrivals);
-            previous_completions = std::move(completions);
-            previous_service_order = std::move(batch.service_order);
-        }
-
-        if (!stable) {
-            ++stats_.dram_frfcfs_fallback_epochs;
-            record_wall_time();
-            return false;
         }
 
         // Check fill identities and visibility BEFORE publishing feedback or
-        // queue state. Stable DRAM order alone does not preserve cache paths:
+        // queue state. A single forecast does not establish cache paths:
         // moving a fill across an LLC lookup changes merge/hit and replacement
         // effects. Those changes require a functional transaction, so reject
         // this timing-only candidate instead of retaining a stale descriptor.
-        std::unordered_map<std::uint64_t, std::uint64_t> repaired_fills;
+        auto& repaired_fills = scratch.repaired_fills;
+        repaired_fills.clear();
         repaired_fills.reserve(events.size());
-        std::vector<std::array<std::uint64_t, 4>> fill_remaps;
+        auto& fill_remaps = scratch.fill_remaps;
+        fill_remaps.clear();
         fill_remaps.reserve(events.size());
         for (std::size_t index = 0; index < events.size(); ++index) {
             const auto& descriptor = events[index].descriptor;
@@ -21429,7 +23173,8 @@ class Simulator::Impl {
                 descriptor.canonical_fill_completion, ready,
                 descriptor.fill_generation});
         }
-        auto projected_fills = timing_start.llc_transient_ready;
+        auto& projected_fills = scratch.projected_fills;
+        projected_fills = timing_start.llc_transient_ready;
         for (const auto& pending : materialized) {
             const auto& descriptor = event_feedback[pending.core][pending.index].shared_timing;
             if (!descriptor.uncore_request) continue;
@@ -21440,6 +23185,7 @@ class Simulator::Impl {
                 fill == projected_fills.end() ? nullptr : &fill->second);
             if (!accept_fill_service(validity)) {
                 ++stats_.dram_frfcfs_fallback_epochs;
+                ++stats_.dram_frfcfs_fallback_visibility_epochs;
                 record_wall_time();
                 return false;
             }
@@ -21449,10 +23195,14 @@ class Simulator::Impl {
             }
         }
 
-        std::vector<std::uint64_t> base_latency(events.size(), 0);
-        std::vector<std::uint64_t> base_exposed(events.size(), 0);
-        std::vector<std::uint64_t> absolute_response(events.size(), 0);
-        std::vector<std::uint64_t> canonical_cha_start(events.size(), 0);
+        auto& base_latency = scratch.base_latency;
+        auto& base_exposed = scratch.base_exposed;
+        auto& absolute_response = scratch.absolute_response;
+        auto& canonical_cha_start = scratch.canonical_cha_start;
+        base_latency.assign(events.size(), 0);
+        base_exposed.assign(events.size(), 0);
+        absolute_response.assign(events.size(), 0);
+        canonical_cha_start.assign(events.size(), 0);
         const auto update_feedback = [&] (
             std::size_t index, std::uint64_t issue_delay) {
             const auto& repair = events[index];
@@ -21598,9 +23348,10 @@ class Simulator::Impl {
             bool closure_stable = false;
             for (std::uint32_t pass = 0;
                  pass < config_.interval_causal_passes; ++pass) {
-                std::vector<std::uint64_t> issue_delay(
-                    events.size(), 0);
-                std::unordered_set<std::uint32_t> affected_chas;
+                auto& issue_delay = scratch.issue_delay;
+                issue_delay.assign(events.size(), 0);
+                auto& affected_chas = scratch.affected_chas;
+                affected_chas.clear();
                 std::uint64_t anchored_events = 0;
                 for (std::size_t index = 0;
                      index < events.size(); ++index) {
@@ -21740,6 +23491,7 @@ class Simulator::Impl {
             std::move(stable_dram), std::move(stable_mshrs),
             fill_remaps);
         ++stats_.dram_frfcfs_stable_epochs;
+        ++stats_.dram_frfcfs_single_pass_epochs;
         stats_.dram_frfcfs_reordered_requests +=
             stable_batch.reordered_requests;
         stats_.dram_frfcfs_row_hits += stable_batch.row_hits;
@@ -21826,13 +23578,15 @@ class Simulator::Impl {
             const auto first_timing_state =
                 shared_->capture_timing_state();
             const auto first_timing = timing;
-            std::vector<MemoryReplay> first_feedback;
+            auto& first_feedback = scratch.first_feedback;
+            first_feedback.clear();
             first_feedback.reserve(materialized.size());
             for (const auto& pending : materialized) {
                 first_feedback.push_back(
                     event_feedback[pending.core][pending.index]);
             }
-            std::vector<std::uint64_t> first_queue;
+            auto& first_queue = scratch.first_queue;
+            first_queue.clear();
             first_queue.reserve(config_.cha_count);
             for (const auto& cha : stats_.cha) {
                 first_queue.push_back(cha.queue_cycles);
@@ -22584,14 +24338,19 @@ class Simulator::Impl {
                     ? static_cast<unsigned>(PerfRetirementLedger::Unknown) : 0u;
                 unsigned event_source=source;
                 unsigned estimated_misses=0;
+                unsigned estimated_mask=0;
                 bool estimate_fallback=bound.perf_missing_source, estimated_merged=false;
+                unsigned fallback_reasons=bound.perf_missing_source ? unsigned(kRetiredFallbackMissingSource) : 0u;
                 const bool read=!bound.perf_hardware_entry &&
                     (((bound.memory_read || bound.locked_rmw) && !bound.software_prefetch) || bound.perf_spr_prefetch);
                 if (bound.perf_spr_prefetch) {
                     // SPR retirement membership is independent of the async
                     // request's cache result or early acknowledgement timing.
                     source=event_source=PerfRetirementLedger::L1;
-                    estimate_fallback=false;
+                    spr_retired::Result hint;
+                    hint.service=spr_retired::Service::SoftwarePrefetch;
+                    estimated_mask=spr_retired::convert(hint).estimated_mask;
+                    estimate_fallback=false; fallback_reasons=0;
                 } else if (read) {
                     const auto first=resident.first_memory(uop);
                     for (auto i=first; i<first+bound.memory_count; ++i) {
@@ -22603,12 +24362,13 @@ class Simulator::Impl {
                         // canonical replay clocks never feed target timing.
                         unsigned mask=0;
                         bool fallback=replay.private_level==HitLevel::kUnknown;
+                        unsigned member_fallback_reasons=fallback ? unsigned(kRetiredFallbackUnknownPrivate) : 0u;
                         if(replay.private_level==HitLevel::kL2) mask=1;
                         else if(replay.private_level!=HitLevel::kL1 && !fallback) {
                             mask=3;
                             const auto shared=retired_shared_cache_source(replay.shared_timing.path);
                             if (shared&PerfRetirementLedger::L3Miss) mask|=4;
-                            else if (shared&PerfRetirementLedger::L3Unknown) {mask|=4;fallback=true;}
+                            else if (shared&PerfRetirementLedger::L3Unknown) {mask|=4;fallback=true;member_fallback_reasons|=kRetiredFallbackUnknownShared;}
                         }
                         const auto position=i-timing.memory_begin[core];
                         const auto origin=config_.ruby_sequencer_line_coalescing
@@ -22621,8 +24381,9 @@ class Simulator::Impl {
                             ? replay.shared_stage_issue_cycle
                             : fixed_to_cycle_ceil(reference_time_q16(core,canonical_issue));
                         fallback|=!replay.shared_stage_issue_cycle;
+                        if (!replay.shared_stage_issue_cycle) member_fallback_reasons|=kRetiredFallbackMissingSharedClock;
                         if (event.forwarded_load || (replay.sequencer_coalesced && replay.private_level!=HitLevel::kUnknown))
-                            fallback=false; // known local service: no initiating data miss
+                            { fallback=false; member_fallback_reasons=0; } // known local service: no initiating data miss
                         auto response=replay.shared_response_cycle;
                         if(response<=issue) response=saturating_add(issue,
                             fixed_to_cycle_ceil(reference_duration_q16(core,
@@ -22631,7 +24392,11 @@ class Simulator::Impl {
                             event.line,issue,response,mask,event.forwarded_load,
                             replay.sequencer_coalesced);
                         estimated_misses|=estimate.misses;
+                        estimated_mask|=estimate.estimated_mask;
+                        if(fallback || estimate.fallback || bound.memory_count>1)
+                            estimated_mask|=7;
                         estimate_fallback|=fallback || estimate.fallback;
+                        fallback_reasons|=member_fallback_reasons | estimate.fallback_reasons;
                         estimated_merged|=estimate.merged;
                         if(llc_fill_audit_.enabled()) {
                             const auto& member=resident.llc_audit_member(uop);
@@ -22679,14 +24444,15 @@ class Simulator::Impl {
                     // MMIO escapes and missing read-side facts remain uncovered.
                     if(!source) source=PerfRetirementLedger::Unknown;
                     if(!event_source) event_source=PerfRetirementLedger::Unknown;
-                    if(source==PerfRetirementLedger::Unknown) estimate_fallback=true;
+                    if(source==PerfRetirementLedger::Unknown) { estimate_fallback=true; fallback_reasons|=kRetiredFallbackUnclassified; }
                 }
                 cores_[core]->perf_retirement.accept(
                     bound.completes_macro_instruction, read,
                     !bound.perf_hardware_entry && !bound.software_prefetch && (bound.memory_write || bound.locked_rmw),
                     bound.perf_kernel, recorded_scheduler_!=nullptr,
                     bound.perf_task, source, event_source, estimated_misses,
-                    estimate_fallback, estimated_merged);
+                    estimate_fallback, estimated_merged, fallback_reasons,
+                    estimated_mask | (estimate_fallback ? 7u : 0u));
             }
             cores_[core]->total.perf_retirement=cores_[core]->perf_retirement.snapshot();
         }
@@ -23238,7 +25004,7 @@ class Simulator::Impl {
                         static_cast<std::uint32_t>(next)});
                 }
             }
-            if ((config_.ruby_sequencer_line_coalescing ||
+            if ((config_.spr_l1_prefetch_l2_only || config_.ruby_sequencer_line_coalescing ||
                  config_.ruby_buffer_line_coalescing ||
                  config_.ruby_sequencer_load_admission || software_prefetch_timing_active_ ||
                  pending_fill_load_admission() ||
@@ -23319,6 +25085,7 @@ class Simulator::Impl {
             const auto batch_ready = std::chrono::steady_clock::now();
 
             prepare_buffer_tso_epoch(batch);
+            prepare_store_group_candidate(batch, accepted_begin, accepted_end);
             std::optional<SharedSystem::Transaction>
                 buffer_tso_transaction;
             std::vector<CoreCounters> buffer_tso_counters_before;
@@ -23341,7 +25108,7 @@ class Simulator::Impl {
                     : nullptr;
 
             const bool preview_enabled =
-                time_epoch && config_.interval_private_preview && !software_prefetch_timing_active_ && !config_.ruby_fixed_read_services &&
+                time_epoch && config_.interval_private_preview && !config_.spr_l2_llc_resident_prefetch && !software_prefetch_timing_active_ && !config_.ruby_fixed_read_services &&
                 !config_.store_post_commit_request;
             const bool preview_requested = !config_.reference_store_timing() && !config_.bounded_store_timing() &&
                 preview_enabled && !page_fault_state_epoch &&
@@ -23415,8 +25182,9 @@ class Simulator::Impl {
             const std::vector<BatchPending>* causal_events = &batch;
             std::optional<SharedSystem::TimingState> shared_timing_start;
             std::vector<std::uint64_t> shared_queue_cycles_start;
-            const bool reference_timing_repair =
-                !config_.bounded_store_timing() && frequency_domain_identity() && !dvfs_ever_active_;
+            bool reference_timing_repair =
+                !config_.bounded_store_timing() && frequency_domain_identity() && !dvfs_ever_active_ &&
+                !(config_.spr_l2_prefetch_follow && config_.dram.scheduler == "frfcfs");
             if (reference_timing_repair && !config_.projected_dram_feedback &&
                 (config_.interval_causal_timing ||
                  response_timing_retime_enabled() ||
@@ -23454,7 +25222,763 @@ class Simulator::Impl {
             // would invalidate the store-send fixed point just certified.
             bool post_commit_service_certified = false;
             bool post_commit_controller_repaired = false;
-            if (config_.bounded_store_timing()) {
+            std::vector<std::unordered_set<std::uint64_t>> prefetch_invalidated_lines(
+                config_.spr_l2_prefetch_follow ? config_.cores : 0);
+            if (config_.spr_store_group_merge && active_store_group_count_) {
+                if (!buffer_tso_transaction)
+                    throw std::logic_error("store group requires buffered transaction");
+                // An FR forecast is speculative until the group watermark is
+                // certified. Save only its bounded scalar counters; cache,
+                // controller and CHA state are owned by the outer transaction.
+                std::vector<std::pair<std::uint64_t*, std::uint64_t>> fr_undo;
+                bool group_fr_forecast_accepted = false;
+                if (config_.dram.scheduler == "frfcfs") {
+                    if (!shared_timing_start)
+                        throw std::logic_error("store-group FR forecast requires the Q-entry timing snapshot");
+                    for (auto* counter : {
+                        &stats_.dram_frfcfs_candidate_epochs,
+                        &stats_.dram_frfcfs_bypass_epochs,
+                        &stats_.dram_frfcfs_bypass_requests,
+                        &stats_.dram_frfcfs_candidate_queue_cycles,
+                        &stats_.dram_frfcfs_bypass_queue_cycles,
+                        &stats_.dram_frfcfs_selection_window_sum,
+                        &stats_.dram_frfcfs_selection_window_max,
+                        &stats_.dram_frfcfs_effective_selection_window,
+                        &stats_.dram_frfcfs_stable_epochs,
+                        &stats_.dram_frfcfs_fallback_epochs,
+                        &stats_.dram_frfcfs_single_pass_epochs,
+                        &stats_.dram_frfcfs_fallback_nonreplayable_epochs,
+                        &stats_.dram_frfcfs_fallback_credit_epochs,
+                        &stats_.dram_frfcfs_fallback_visibility_epochs,
+                        &stats_.dram_frfcfs_requests,
+                        &stats_.dram_frfcfs_passes,
+                        &stats_.dram_frfcfs_reordered_requests,
+                        &stats_.dram_frfcfs_row_hits,
+                        &stats_.dram_frfcfs_row_misses,
+                        &stats_.dram_frfcfs_max_pending,
+                        &stats_.dram_frfcfs_max_admitted_pending,
+                        &stats_.dram_frfcfs_saturated_selections,
+                        &stats_.dram_frfcfs_page_policy_scanned_requests,
+                        &stats_.dram_frfcfs_outside_window_row_hits,
+                        &stats_.dram_frfcfs_outside_window_bank_conflicts,
+                        &stats_.dram_frfcfs_row_cap_precharges,
+                        &stats_.dram_frfcfs_adaptive_precharges})
+                        fr_undo.emplace_back(counter, *counter);
+                }
+                // Only the lines touched in this candidate batch can change
+                // the FB observer. Snapshot each key once, without copying
+                // unrelated per-core shadow maps on the hot path.
+                std::vector<std::unordered_map<std::uint64_t,
+                    std::optional<PerfFbHitShadowEntry>>> fb_undo(config_.cores);
+                if (config_.perf_fb_hit_mirror) for (const auto& pending : batch) {
+                    const auto& event = current_chunks_[pending.core].memory(pending.index);
+                    if (event.write || event.atomic || event.instruction_fetch || event.forwarded_load) continue;
+                    auto& undo = fb_undo[pending.core];
+                    if (undo.find(event.line) != undo.end()) continue;
+                    const auto& shadow = perf_fb_hit_shadow_[pending.core];
+                    const auto existing = shadow.find(event.line);
+                    undo.emplace(event.line, existing == shadow.end()
+                        ? std::nullopt : std::optional<PerfFbHitShadowEntry>(existing->second));
+                }
+                const auto fallback_store_pair = [&](bool permission_failed) {
+                    shared_->restore(*buffer_tso_transaction);
+                    if (group_fr_forecast_accepted)
+                        ++stats_.spr_store_group_fr_discarded_accepted;
+                    if (!fr_undo.empty()) {
+                        for (const auto& item : fr_undo) {
+                            if (item.first == &stats_.dram_frfcfs_passes)
+                                stats_.spr_store_group_fr_discarded_passes += *item.first - item.second;
+                            *item.first = item.second;
+                        }
+                    }
+                    for (std::uint32_t c = 0; c < config_.cores; ++c)
+                        for (const auto& item : fb_undo[c]) {
+                            if (item.second) perf_fb_hit_shadow_[c][item.first] = *item.second;
+                            else perf_fb_hit_shadow_[c].erase(item.first);
+                        }
+                    for (std::uint32_t c = 0; c < config_.cores; ++c)
+                        cores_[c]->total = buffer_tso_counters_before[c];
+                    clear_active_groups();
+                    for (const auto& pending : batch) {
+                        const auto& event = current_chunks_[pending.core].memory(pending.index);
+                        if (permission_failed && event.tso_buffer_eligible)
+                            buffer_tso_conflict_lines_.insert(event.line);
+                    }
+                    for (const auto& pending : batch) {
+                        const auto& event = current_chunks_[pending.core].memory(pending.index);
+                        event_feedback[pending.core][pending.index] = replay_memory_event(
+                            pending.core, event, pending.issue_q16, true);
+                    }
+                    if (!permission_failed && !buffered_tso_permissions_intact(batch, event_feedback))
+                        throw std::logic_error("store-group ungrouped replay lost buffered permission");
+                };
+                const auto group_feedback_once = [&] {
+                    if (config_.dram.scheduler == "frfcfs") {
+                        const auto* input = &batch;
+                        std::vector<BatchPending> grouped_requests;
+                        if (active_store_group_count_) {
+                            grouped_requests.reserve(batch.size());
+                            for (const auto& pending : batch) {
+                                const auto* group=group_for_core(pending.core);
+                                if (!group || !group->follower_event_of(pending.index))
+                                    grouped_requests.push_back(pending);
+                            }
+                            input = &grouped_requests;
+                        }
+                        const bool repaired = apply_frfcfs_dram_repair(
+                            *input,event_feedback,accepted_begin,accepted_end,
+                            *shared_timing_start,horizon_q16,timing);
+                        group_fr_forecast_accepted = active_store_group_count_ && repaired;
+                        if (!repaired)
+                            compute_timing_feedback(event_feedback,accepted_begin,accepted_end,timing);
+                        // The generic outer path must not run FR again.
+                        post_commit_service_certified = true;
+                        post_commit_controller_repaired = true;
+                    } else {
+                        compute_timing_feedback(event_feedback,accepted_begin,accepted_end,timing);
+                    }
+                };
+                for (const auto& pending : batch) {
+                    const auto* group=group_for_core(pending.core);
+                    if (group && group->follower_event_of(pending.index)) {
+                        MemoryReplay follower;
+                        follower.store_group_follower = true;
+                        event_feedback[pending.core][pending.index] = follower;
+                    } else {
+                        const auto& event = current_chunks_[pending.core].memory(pending.index);
+                        event_feedback[pending.core][pending.index] = replay_memory_event(
+                            pending.core, event, pending.issue_q16, true, &*buffer_tso_transaction);
+                    }
+                }
+                bool all_group_permissions=true;
+                for (const auto& group : active_store_groups_)
+                    if (group && !event_feedback[group->core][group->owner_event].buffered_store_prepare)
+                        all_group_permissions=false;
+                if (!all_group_permissions || !buffered_tso_permissions_intact(batch, event_feedback)) {
+                    ++stats_.spr_store_group_permission_fallbacks;
+                    fallback_store_pair(true);
+                }
+                group_feedback_once();
+                if (active_store_group_count_) {
+                    // The producer lookahead certifies all unseen dispatches
+                    // after this horizon. A trimmed resident prefix can end
+                    // earlier, so include its first unconsumed memory edge.
+                    auto future_ref = std::numeric_limits<std::uint64_t>::max();
+                    for (std::uint32_t c = 0; c < config_.cores; ++c) {
+                        if (finished_[c]) {
+                            // Warmup completion is not full-stream EOF.
+                            if (functional_warmup_phase) { future_ref = 0; break; }
+                            continue;
+                        }
+                        const auto& chunk = current_chunks_[c];
+                        if (chunk.empty()) { future_ref = 0; break; }
+                        // Warmup EOF and sync seams are not source EOF.
+                        auto local = chunk.reached_end() && !functional_warmup_phase &&
+                            !(sync_plan_ && sync_frontier_known_[c])
+                            ? std::numeric_limits<std::uint64_t>::max()
+                            : local_horizon_q16(c, horizon_q16);
+                        if (accepted_end[c] < chunk.uop_size()) {
+                            const auto next = chunk.first_memory(accepted_end[c]);
+                            if (next < chunk.memory_size())
+                                local = std::min(local,
+                                    saturating_add(chunk.memory(next).delta_q16, interval_gap_q16_[c]));
+                        }
+                        if (local != std::numeric_limits<std::uint64_t>::max())
+                            future_ref = std::min(future_ref, reference_time_q16(c, local));
+                    }
+                    bool all_safe=true;
+                    for (const auto& group:active_store_groups_) if(group) {
+                        const auto owner=group->core;
+                        const auto& edges=timing.store_group_edges[owner];
+                        if(!edges || reference_time_q16(owner,
+                            cycles_to_fixed(edges->callback,"store group callback"))>=future_ref)
+                            all_safe=false;
+                    }
+                    if (!all_safe) {
+                        ++stats_.spr_store_group_future_fallbacks;
+                        fallback_store_pair(false);
+                        group_feedback_once();
+                    }
+                }
+            } else if (config_.spr_l1_prefetch_l2_only) {
+                auto before=*spr_l2_prefetch_;
+                std::optional<SprLlcResidentPrefetch> llc_resident_before;
+                if (buffered_tso_store() && spr_llc_resident_prefetch_)
+                    llc_resident_before = *spr_llc_resident_prefetch_;
+                // The shared predictor, outstanding requests, frontier and
+                // counters are part of the same speculative batch as caches
+                // and DRAM. Copies share the monotonic ticket allocator.
+                std::optional<SprL2SharedPrefetchState> shared_prefetch_before;
+                if (buffered_tso_store() && spr_l2_shared_prefetch_)
+                    shared_prefetch_before = *spr_l2_shared_prefetch_;
+                std::optional<SprL2SharedPrefetchState::FrfcfsCheckpoint> prefetch_frfcfs_start;
+                if (spr_l2_shared_prefetch_ && config_.dram.scheduler == "frfcfs")
+                    prefetch_frfcfs_start = spr_l2_shared_prefetch_->frfcfs_checkpoint();
+                bool prefetch_dirty_writeback=false;
+                if (prefetch_invalidated_lines.empty()) prefetch_invalidated_lines.resize(config_.cores);
+                const auto replay_prefetch_batch = [&](SharedSystem::Transaction* transaction) {
+                    for (auto& lines : prefetch_invalidated_lines) lines.clear();
+                    if(config_.spr_l2_prefetch_follow && !batch.empty()) {
+                        spr_l2_shared_prefetch_->resources.expire(spr_l2_shared_prefetch_->frontier);
+                    }
+                    std::vector<PrivateHierarchy*> caches;
+                    std::vector<PrivateTransaction*> private_transactions;
+                    std::unordered_set<std::uint64_t> unresolved_llc_fills;
+                    for(std::uint32_t core=0;core<config_.cores;++core) {
+                        caches.push_back(private_caches_[core].get());
+                        private_transactions.push_back(transaction?&transaction->private_caches[core]:nullptr);
+                    }
+                    // Advance only to a known demand edge. Candidates are
+                    // issued at their queue-ready edge, and service/fill
+                    // completions are processed in timestamp order.
+                    const auto lower_prefetch_service = [&](std::uint32_t core,std::uint64_t line,
+                                                             std::uint64_t edge,
+                                                             SprControllerResources::Origin origin=SprControllerResources::Origin::kL2Prefetch)
+                        ->std::optional<std::uint64_t> {
+                                auto& l2=*spr_l2_shared_prefetch_;
+                                if(l2.store_line_until.count(line))
+                                    return std::nullopt;
+                                if(const auto* service=l2.resources.known_data_service(core,line,edge))
+                                    if(service->data_ready>edge || private_caches_[core]->prepare_probe_l2(line).hit)
+                                        return std::max(edge,service->data_ready);
+                                if(const auto* existing=l2.resources.shared_data_service(line,edge)) {
+                                    const auto parent=*existing;
+                                    if(l2.resources.admission(core,false,true,edge)>edge)return std::nullopt;
+                                    const auto ready=saturating_add(parent.data_ready,config_.noc_one_way_latency);
+                                    const auto ticket=l2.ids.allocate();
+                                    l2.pending.push_back({core,line,edge,ready,false,false,ticket,parent.ticket});
+                                    l2.resources.reserve(ticket,core,false,true,ready,line,edge,
+                                        origin,parent.ticket);
+                                    ++l2.shared_parent_follows;
+                                    return ready;
+                                }
+                                if(unresolved_llc_fills.count(line))return std::nullopt;
+                                if(l2.resources.admission(core,false,true,edge)>edge)return std::nullopt;
+                                const auto count=std::count_if(l2.pending.begin(),l2.pending.end(),
+                                    [&](const auto& service){return service.core==core;});
+                                if(l2.pending.size()>=l2.capacity ||
+                                   count>=config_.spr_l2_fill_entries)
+                                    return std::nullopt;
+                                auto response=shared_->begin_l2_shared_prefetch(
+                                    core,line,edge,transaction,true);
+                                if(!response)return std::nullopt;
+                                l2.pending.push_back({core,line,edge,response->response,
+                                    response->llc_source,false,l2.ids.allocate()});
+                                l2.resources.reserve(l2.pending.back().ticket,core,false,true,response->response,line,edge,
+                                    origin);
+                                ++l2.issued;
+                                if(response->llc_source)++l2.llc_issued;else ++l2.dram_issued;
+                                return response->response;
+                    };
+                    const auto advance_l1 = [&](std::uint64_t edge) {
+                        spr_l2_shared_prefetch_->expire_store_edges(edge);
+                        std::vector<std::pair<std::uint32_t,std::uint64_t>> victims;
+                        const auto evict=[&](std::uint32_t core,std::uint64_t line,bool dirty,std::uint64_t ready) {
+                            prefetch_dirty_writeback |= shared_->private_evict(core,line,dirty,ready,false,transaction,true);
+                            spr_l2_shared_prefetch_->invalidate_demand_fill(core,line);
+                            prefetch_invalidated_lines[core].insert(line);
+                            victims.emplace_back(core,line);
+                        };
+                        spr_l2_prefetch_->advance(edge,caches,private_transactions,evict);
+                        for(const auto& victim:victims)
+                            spr_l2_prefetch_->cancel_eviction(victim.first,victim.second,edge);
+                        for(std::uint32_t core=0;core<config_.cores;++core) {
+                            const auto latency=fixed_to_cycle_ceil(reference_duration_q16(core,cycles_to_fixed(config_.l2.hit_latency)));
+                            spr_l2_prefetch_->issue_queued(core,edge,latency,*private_caches_[core],private_transactions[core],
+                                [&](std::uint64_t line){return lower_prefetch_service(core,line,edge);},
+                                &spr_l2_shared_prefetch_->resources);
+                        }
+                    };
+                    const auto advance_shared = [&](std::uint64_t limit, bool inclusive) {
+                        auto& l2=*spr_l2_shared_prefetch_;
+                        auto l1_checked=std::uint64_t{0};
+                        for (;;) {
+                            const auto none=std::numeric_limits<std::uint64_t>::max();
+                            auto edge=none;
+                            std::size_t service=l2.pending.size(), fill=l2.demand_fills.size();
+                            std::uint32_t candidate=config_.cores;
+                            for (std::size_t i=0;i<l2.pending.size();++i)
+                                if (l2.pending[i].response<edge) {
+                                    edge=l2.pending[i].response; service=i; fill=l2.demand_fills.size();
+                                }
+                            for (std::size_t i=0;i<l2.demand_fills.size();++i)
+                                if (l2.demand_fills[i].response<edge) {
+                                    edge=l2.demand_fills[i].response; fill=i; service=l2.pending.size();
+                                }
+                            for (std::uint32_t core=0;core<config_.cores;++core) {
+                                const auto ready=l2.predictors[core].next_ready();
+                                if (ready && *ready<limit && *ready<edge) {
+                                    edge=*ready; candidate=core;
+                                    service=l2.pending.size(); fill=l2.demand_fills.size();
+                                }
+                            }
+                            bool l1_event=false;
+                            if(spr_l2_prefetch_->queued_pending()) {
+                                const auto ready=l2.resources.next_release(std::max(l1_checked,l2.frontier));
+                                if(ready<edge) {edge=ready;l1_event=true;}
+                                if(!l2.store_edges.empty() && l2.store_edges.top().first>std::max(l1_checked,l2.frontier) &&
+                                   l2.store_edges.top().first<edge) {
+                                    edge=l2.store_edges.top().first;l1_event=true;
+                                }
+                            }
+                            if(const auto ready=spr_l2_prefetch_->next_response(l1_checked); ready && *ready<edge) {
+                                edge=*ready; l1_event=true;
+                            }
+                            if (edge==none || edge>limit || (!inclusive && edge==limit)) break;
+                            l2.frontier=std::max(l2.frontier,edge);
+                            if(l1_event) { advance_l1(edge); l1_checked=edge; continue; }
+                            if (service<l2.pending.size()) {
+                                const auto entry=l2.pending[service];
+                                bool dirty=false;
+                                std::optional<std::uint64_t> victim;
+                                const bool published=!entry.invalidated && shared_->complete_l2_shared_prefetch(
+                                    entry.core,entry.line,entry.issue,entry.response,edge,
+                                    transaction,dirty,entry.llc_source,entry.consumed_by_demand,victim,&l2.unused_evictions);
+                                if (victim) {
+                                    l2.invalidate_demand_fill(entry.core,*victim);
+                                    prefetch_invalidated_lines[entry.core].insert(*victim);
+                                    spr_l2_prefetch_->cancel_eviction(entry.core,*victim,edge);
+                                }
+                                prefetch_dirty_writeback |= dirty;
+                                if (dirty) ++l2.dirty_writebacks;
+                                if (published) ++l2.completed; else ++l2.cancelled_state;
+                                l2.pending.erase(l2.pending.begin()+service);
+                                advance_l1(edge); l1_checked=edge;
+                            } else if (fill<l2.demand_fills.size()) {
+                                const auto item=l2.demand_fills[fill];
+                                l2.demand_fills.erase(l2.demand_fills.begin()+fill);
+                                if (private_caches_[item.core]->prepare_probe_l2(item.line).hit) {
+                                    CoreCounters scratch;
+                                    const auto result=private_caches_[item.core]->complete_fill(
+                                        item.line,false,scratch,private_transactions[item.core]);
+                                    if (result.l2_evicted) {
+                                        l2.invalidate_demand_fill(item.core,result.l2_evicted_line);
+                                        prefetch_invalidated_lines[item.core].insert(result.l2_evicted_line);
+                                        spr_l2_prefetch_->cancel_eviction(item.core,result.l2_evicted_line,edge);
+                                        prefetch_dirty_writeback |= shared_->private_evict(
+                                            item.core,result.l2_evicted_line,result.l2_evicted_dirty,
+                                            edge,false,transaction,false);
+                                    }
+                                } else ++l2.demand_fill_dropped;
+                            } else {
+                                auto& predictor=l2.predictors[candidate];
+                                const auto head=predictor.peek(edge);
+                                const auto line=head->line/config_.l2.line_size;
+                                if (config_.spr_l2_prefetch_suppress_issue) {
+                                    predictor.consume(edge,head->handle);
+                                    ++l2.suppressed;
+                                    continue;
+                                }
+                                l2.expire_store_edges(edge);
+                                const auto store=l2.store_line_until.find(line);
+                                if (store!=l2.store_line_until.end()) {
+                                    ++l2.store_line_skipped;
+                                    predictor.recycle(edge,head->handle,store->second);
+                                    continue;
+                                }
+                                const auto source_ready=l2.source_ready[line % l2.source_ready.size()];
+                                if (source_ready>edge) {
+                                    ++l2.source_waits;
+                                    predictor.recycle(edge,head->handle,source_ready);
+                                    continue;
+                                }
+                                const auto same=std::any_of(l2.pending.begin(),l2.pending.end(),
+                                    [line](const auto& p){return p.line==line && !p.invalidated;});
+                                const auto per_core=std::count_if(l2.pending.begin(),l2.pending.end(),
+                                    [candidate](const auto& p){return p.core==candidate;});
+                                if(same) {
+                                    if(lower_prefetch_service(candidate,line,edge))
+                                        predictor.consume(edge,head->handle);
+                                    else {
+                                        auto wake=l2.resources.admission(candidate,false,true,edge);
+                                        if(wake<=edge) {
+                                            wake=none;
+                                            for(const auto& service:l2.pending)
+                                                if(service.response>edge)wake=std::min(wake,service.response);
+                                        }
+                                        predictor.recycle(edge,head->handle,wake);
+                                    }
+                                    continue;
+                                }
+                                const auto resource_ready=l2.resources.admission(candidate,false,true,edge);
+                                if(!same && resource_ready>edge) {
+                                    ++l2.resource_retries;
+                                    predictor.recycle(edge,head->handle,resource_ready);
+                                    continue;
+                                }
+                                if (!same && (l2.pending.size()>=l2.capacity ||
+                                    per_core>=config_.spr_l2_fill_entries)) {
+                                    auto wake=none;
+                                    for (const auto& p:l2.pending)
+                                        if (l2.pending.size()>=l2.capacity || p.core==candidate)
+                                            wake=std::min(wake,p.response);
+                                    predictor.recycle(edge,head->handle,wake);
+                                    continue;
+                                }
+                                std::optional<std::uint64_t> ready;
+                                if(!private_caches_[candidate]->prepare_probe_l2(line).hit)
+                                    ready=lower_prefetch_service(candidate,line,edge);
+                                predictor.consume(edge,head->handle);
+                                if(!ready)++l2.dropped;
+                            }
+                        }
+                    };
+                    for(const auto& pending:batch) {
+                        auto now=fixed_to_cycle_ceil(pending.reference_issue_q16);
+                        auto actual_issue_q16=pending.issue_q16;
+                        std::optional<SprPrefetchService::Follower> follower_ready;
+                        bool skip_prefetch_event = false;
+                        bool skip_line_store = false;
+                        if (spr_llc_resident_prefetch_ && now < spr_l2_shared_prefetch_->frontier) {
+                            // A later store was already published by the two-stage
+                            // batch. Cancel possible aliases and drop prefetch work
+                            // until model time catches up; do not delay demand.
+                            const auto& event = current_chunks_[pending.core].memory(pending.index);
+                            const auto frontier = spr_l2_shared_prefetch_->frontier;
+                            spr_llc_resident_prefetch_->cancel_line(event.line, frontier,
+                                event.write || event.atomic);
+                            spr_l2_prefetch_->cancel_line(event.line, frontier);
+                            ++spr_l2_shared_prefetch_->skipped_past_frontier;
+                            skip_prefetch_event = true;
+                        }
+                        if (spr_l2_shared_prefetch_ && !skip_prefetch_event) {
+                            auto& l2 = *spr_l2_shared_prefetch_;
+                            const auto& accepted_event = current_chunks_[pending.core].memory(pending.index);
+                            if (now < l2.frontier) {
+                                now=l2.frontier;
+                                actual_issue_q16=std::max(actual_issue_q16,
+                                    local_horizon_q16(pending.core,cycles_to_fixed(now)));
+                                ++l2.clamped_events;
+                                l2.clamped_cycles += fixed_to_cycle_ceil(actual_issue_q16-pending.issue_q16);
+                            }
+                            if (config_.spr_l2_prefetch_follow) advance_shared(now,false);
+                            l2.frontier = now;
+                            if (config_.spr_l2_prefetch_follow) {
+                                l2.expire_store_edges(now);
+                                skip_line_store=l2.store_line_until.count(accepted_event.line)!=0;
+                                if (skip_line_store) ++l2.store_line_skipped;
+                            }
+                            if (spr_llc_resident_prefetch_) {
+                                const bool write = accepted_event.write || accepted_event.atomic;
+                                if (write)
+                                    spr_llc_resident_prefetch_->cancel_line(accepted_event.line, now, true);
+                                shared_->advance_l2_llc_resident_prefetch(*spr_llc_resident_prefetch_,now,
+                                    caches,private_transactions,transaction);
+                                if (!write)
+                                    spr_llc_resident_prefetch_->cancel_line(accepted_event.line, now, false);
+                            }
+                            if (accepted_event.write || accepted_event.atomic) {
+                                l2.cancel_before_write(accepted_event.line, pending.core);
+                                spr_l2_prefetch_->cancel_line(accepted_event.line,now);
+                            }
+                            if (config_.spr_l2_prefetch_follow) advance_shared(now,true);
+                            if (!config_.spr_l2_prefetch_follow) {
+                            while (true) {
+                                auto next=l2.pending.end();
+                                for (auto it=l2.pending.begin(); it!=l2.pending.end(); ++it)
+                                    if (it->response<=now &&
+                                        (next==l2.pending.end() || it->response<next->response))
+                                        next=it;
+                                if (next==l2.pending.end()) break;
+                                const auto entry=*next;
+                                bool dirty_writeback=false;
+                                std::optional<std::uint64_t> private_victim;
+                                const bool published=shared_->complete_l2_shared_prefetch(
+                                    entry.core,entry.line,entry.issue,entry.response,now,
+                                    transaction,dirty_writeback,entry.llc_source,entry.consumed_by_demand,private_victim);
+                                if (private_victim) {
+                                    l2.invalidate_demand_fill(entry.core,*private_victim);
+                                    prefetch_invalidated_lines[entry.core].insert(*private_victim);
+                                }
+                                prefetch_dirty_writeback |= dirty_writeback;
+                                if (dirty_writeback) ++l2.dirty_writebacks;
+                                if (published) ++l2.completed; else ++l2.cancelled_state;
+                                l2.pending.erase(next);
+                            }
+                            for (auto it=l2.demand_fills.begin(); it!=l2.demand_fills.end();) {
+                                if (it->response>now) { ++it; continue; }
+                                if (private_caches_[it->core]->prepare_probe_l2(it->line).hit) {
+                                    CoreCounters scratch;
+                                    const auto fill=private_caches_[it->core]->complete_fill(
+                                        it->line,false,scratch,private_transactions[it->core]);
+                                    if (fill.l2_evicted)
+                                        prefetch_dirty_writeback |= shared_->private_evict(
+                                            it->core,fill.l2_evicted_line,fill.l2_evicted_dirty,
+                                            now,false,transaction,false);
+                                } else ++l2.demand_fill_dropped;
+                                it=l2.demand_fills.erase(it);
+                            }
+                            auto& predictor=l2.predictors[pending.core];
+                            if (const auto head=predictor.peek(now)) {
+                                const auto line=head->line / config_.l2.line_size;
+                                const auto same_line=std::any_of(l2.pending.begin(),l2.pending.end(),
+                                    [line](const auto& p) { return p.line==line; });
+                                const auto core_pending=std::count_if(l2.pending.begin(),l2.pending.end(),
+                                    [&](const auto& p) { return p.core==pending.core; });
+                                std::optional<SharedSystem::L2PrefetchStart> response;
+                                bool llc_issued = false;
+                                if (!same_line && l2.pending.size()<l2.capacity &&
+                                    core_pending<config_.spr_prefetch_host_inflight_per_core &&
+                                    !private_caches_[pending.core]->prepare_probe_l2(line).hit) {
+                                    if (spr_llc_resident_prefetch_)
+                                        llc_issued = shared_->begin_l2_llc_resident_prefetch(
+                                            *spr_llc_resident_prefetch_,pending.core,line,now,
+                                            unresolved_llc_fills.count(line) != 0,transaction) ==
+                                            SprLlcResidentPrefetch::Begin::kIssued;
+                                    else
+                                        response=shared_->begin_l2_shared_prefetch(pending.core,line,now,
+                                            transaction,config_.spr_l2_prefetch_follow);
+                                }
+                                if (!predictor.consume(now,head->handle))
+                                    throw std::logic_error("L2 prefetch queue identity changed");
+                                if (response) {
+                                    l2.pending.push_back({pending.core,line,now,response->response,
+                                        response->llc_source,false,l2.ids.allocate()});
+                                    ++l2.issued;
+                                    if (response->llc_source) ++l2.llc_issued; else ++l2.dram_issued;
+                                } else if (!llc_issued) ++l2.dropped;
+                            }
+                            }
+                            const auto& event=current_chunks_[pending.core].memory(pending.index);
+                            if(config_.spr_l2_prefetch_follow && !event.write && !event.atomic &&
+                               !event.forwarded_load && !event.page_walk && !event.instruction_fetch &&
+                               !event.software_prefetch) {
+                                const auto same=std::find_if(l2.pending.begin(),l2.pending.end(),[&](const auto& service) {
+                                    return service.core==pending.core && service.line==event.line && !service.invalidated;
+                                });
+                                if(same==l2.pending.end() && l2.resources.shared_data_service(event.line,now))
+                                    lower_prefetch_service(pending.core,event.line,now,SprControllerResources::Origin::kDemand);
+                                const auto local=std::find_if(l2.pending.begin(),l2.pending.end(),[&](const auto& service) {
+                                    return service.core==pending.core && service.line==event.line && !service.invalidated;
+                                });
+                                if(local==l2.pending.end()) {
+                                    const auto parent=std::find_if(l2.pending.begin(),l2.pending.end(),[&](const auto& service) {
+                                        return service.line==event.line && !service.invalidated;
+                                    });
+                                    if(parent!=l2.pending.end()) {
+                                        const auto source=*parent;
+                                        const auto ticket=l2.ids.allocate();
+                                        const auto admitted=l2.resources.admission(pending.core,false,true,now);
+                                        const auto ready=saturating_add(std::max(source.response,admitted),config_.noc_one_way_latency);
+                                        l2.pending.push_back({pending.core,event.line,now,ready,source.llc_source,false,ticket,source.ticket});
+                                        l2.resources.reserve(ticket,pending.core,false,true,ready,event.line,now,
+                                            SprControllerResources::Origin::kDemand,source.ticket);
+                                        ++l2.shared_parent_follows;
+                                    }
+                                }
+                            }
+                            for (auto it=l2.pending.begin(); it!=l2.pending.end();) {
+                                if (it->line==event.line && !it->invalidated) {
+                                    if(config_.spr_l2_prefetch_follow && it->core!=pending.core &&
+                                       !event.write && !event.atomic) {++it;continue;}
+                                    if (config_.spr_l2_prefetch_follow && it->core==pending.core &&
+                                        !event.write && !event.atomic && !event.page_walk &&
+                                        !event.instruction_fetch && !event.software_prefetch &&
+                                        !event.forwarded_load &&
+                                        !private_caches_[pending.core]->prepare_probe_l2(event.line).hit) {
+                                        follower_ready=SprPrefetchService::Follower{it->ticket,it->response,
+                                            SprPrefetchService::Level::kL2,l2.resources.prefetch_origin(it->ticket)};
+                                        it->consumed_by_demand=true;
+                                        ++l2.followed;
+                                        ++it;
+                                        continue;
+                                    }
+                                    if (it->core != pending.core) ++l2.cancelled_cross_core;
+                                    if (event.write || event.atomic) ++l2.cancelled_write;
+                                    if(config_.spr_l2_prefetch_follow) {it->invalidated=true;++it;}
+                                    else it=l2.pending.erase(it);
+                                    ++l2.cancelled_demand;
+                                } else ++it;
+                            }
+                        }
+                        std::vector<std::pair<std::uint32_t,std::uint64_t>> evicted;
+                        const auto& resident=current_chunks_[pending.core];
+                        const auto& event=resident.memory(pending.index);
+                        const auto on_prefetch_evict = [&](std::uint32_t core,std::uint64_t line,bool dirty,std::uint64_t completion) {
+                                prefetch_dirty_writeback |= shared_->private_evict(
+                                    core,line,dirty,completion,false,transaction,true);
+                                evicted.emplace_back(core,line);
+                            };
+                        if (skip_prefetch_event) {
+                            // No completion is published across the future edge.
+                        } else if (event.write || event.atomic)
+                            spr_l2_prefetch_->advance_before_write(event.line,now,caches,private_transactions,on_prefetch_evict);
+                        else
+                            spr_l2_prefetch_->advance(now,caches,private_transactions,on_prefetch_evict);
+                        for(const auto& victim:evicted)
+                            spr_l2_prefetch_->cancel_eviction(victim.first,victim.second,now);
+                        if (spr_l2_shared_prefetch_) for (const auto& victim:evicted) {
+                            spr_l2_shared_prefetch_->invalidate_demand_fill(victim.first,victim.second);
+                            prefetch_invalidated_lines[victim.first].insert(victim.second);
+                        }
+                        bool stream_hit=false;
+                        const bool stream_eligible=config_.spr_l1_prefetch_stream_hits && !event.write && !event.atomic &&
+                           !event.page_walk && !event.instruction_fetch && !event.software_prefetch &&
+                           !event.forwarded_load && resident.prefetch_input(resident.memory_uop(pending.index)).status==SprPrefetchInputStatus::kEligible;
+                        const bool line_lookup=!event.page_walk && !event.instruction_fetch &&
+                           !event.forwarded_load;
+                        if(!skip_line_store && config_.spr_l1_prefetch_stream_hits &&
+                           (stream_eligible || (config_.spr_l1_prefetch_line_marks && line_lookup)))
+                            stream_hit=spr_l2_prefetch_->consume_stream_hit(pending.core,event.line,
+                                *private_caches_[pending.core],private_transactions[pending.core]);
+                        if(config_.spr_l2_prefetch_follow && !event.write && !event.atomic &&
+                           !event.forwarded_load && !event.page_walk && !event.instruction_fetch && !event.software_prefetch) {
+                            if(!follower_ready) {
+                                if(const auto* parent=spr_l2_shared_prefetch_->resources.data_service(pending.core,event.line,now,false))
+                                    follower_ready=SprPrefetchService::Follower{parent->ticket,parent->data_ready,
+                                        parent->l1 ? SprPrefetchService::Level::kL1 : SprPrefetchService::Level::kL2,parent->prefetch_service};
+                            }
+                            if(const auto l1=spr_l2_prefetch_->follower(pending.core,event.line,now))follower_ready=l1;
+                        }
+                        std::uint64_t resource_ticket=0;
+                        auto resource_admission=now;
+                        if(config_.spr_l2_prefetch_follow &&
+                           (!follower_ready || follower_ready->level==SprPrefetchService::Level::kL2) && !event.forwarded_load &&
+                           !event.instruction_fetch && !event.page_walk) {
+                            auto& l2=*spr_l2_shared_prefetch_;
+                            const auto probe=private_caches_[pending.core]->prepare_probe(event.line);
+                            if(!probe.l1.hit) {
+                                const bool lower=!follower_ready && (!probe.has_l2 || !probe.l2.hit);
+                                const auto admitted=l2.resources.admission(pending.core,true,lower,now);
+                                resource_ticket=l2.ids.allocate();
+                                l2.resources.reserve(resource_ticket,pending.core,true,lower,
+                                    saturating_add(admitted,std::uint64_t{1}),event.line,admitted,
+                                    event.software_prefetch ? SprControllerResources::Origin::kSoftwarePrefetch :
+                                        SprControllerResources::Origin::kDemand,0,false,now);
+                                if(admitted>now) {
+                                    l2.resource_wait_cycles+=admitted-now;
+                                    resource_admission=admitted;
+                                    actual_issue_q16=std::max(actual_issue_q16,
+                                        local_horizon_q16(pending.core,cycles_to_fixed(admitted)));
+                                }
+                            }
+                        }
+                        if(resource_ticket && !follower_ready && !event.write && !event.atomic &&
+                           !event.forwarded_load && !event.page_walk && !event.instruction_fetch && !event.software_prefetch) {
+                            for(auto& service:spr_l2_shared_prefetch_->pending)
+                                if(service.core==pending.core && service.line==event.line && !service.invalidated) {
+                                    follower_ready=SprPrefetchService::Follower{service.ticket,service.response,
+                                        SprPrefetchService::Level::kL2,spr_l2_shared_prefetch_->resources.prefetch_origin(service.ticket)};
+                                    service.consumed_by_demand=true;break;
+                                }
+                            if(const auto l1=spr_l2_prefetch_->follower(pending.core,event.line,now))follower_ready=l1;
+                            if(follower_ready)spr_l2_shared_prefetch_->resources.set_targets(resource_ticket,
+                                follower_ready->level!=SprPrefetchService::Level::kL1,false);
+                        }
+                        auto replay = follower_ready
+                            ? replay_l2_prefetch_follower(pending.core,event,actual_issue_q16,
+                                  *follower_ready,transaction)
+                            : replay_memory_event(pending.core,event,actual_issue_q16,true,transaction);
+                        replay.prefetch_resource_ticket=resource_ticket;
+                        if(resource_ticket) {
+                            const auto duration=fixed_to_cycle_ceil(reference_duration_q16(
+                                pending.core,cycles_to_fixed(replay.latency_cycles)));
+                            spr_l2_shared_prefetch_->resources.finish(resource_ticket,saturating_add(resource_admission,duration));
+                            spr_l2_shared_prefetch_->resources.select_data(resource_ticket,saturating_add(resource_admission,duration));
+                            replay.fixed_service_ready=saturating_add(resource_admission,duration);
+                        }
+                        if ((spr_llc_resident_prefetch_ || config_.spr_l2_prefetch_follow) &&
+                            replay.shared_timing.path == SharedTimingPath::kMemory)
+                            unresolved_llc_fills.insert(event.line);
+                        if ((spr_llc_resident_prefetch_ || config_.spr_l2_prefetch_follow) && !event.forwarded_load &&
+                            replay.private_level != HitLevel::kL1 && replay.private_level != HitLevel::kL2) {
+                            spr_l2_prefetch_->mark_unresolved_source(pending.core,event.line);
+                        }
+                        if (actual_issue_q16>pending.issue_q16) {
+                            const auto wait=fixed_to_cycle_ceil(actual_issue_q16-pending.issue_q16);
+                            replay.latency_cycles=saturating_add(replay.latency_cycles,wait);
+                            const auto exposed=replay.latency_cycles>event.lower_bound_latency
+                                ? replay.latency_cycles-event.lower_bound_latency : 0;
+                            replay.exposed_cycles=static_cast<std::uint64_t>(std::ceil(
+                                static_cast<double>(exposed)*config_.memory_exposure));
+                        }
+                        if(stream_hit && (!stream_eligible || replay.sequencer_coalesced || replay.private_level!=HitLevel::kL1))
+                            spr_l2_prefetch_->note_stream_consumed_not_used();
+                        event_feedback[pending.core][pending.index]=replay;
+                        const bool l2_store_request=config_.spr_l2_prefetch_follow && (event.write || event.atomic) &&
+                            event.spr_l2_train_eligible &&
+                            (replay.private_level==HitLevel::kL2 || replay.private_level==HitLevel::kLlc ||
+                             replay.private_level==HitLevel::kRemote || replay.private_level==HitLevel::kMemory);
+                        if (spr_l2_shared_prefetch_ && !skip_prefetch_event && !skip_line_store &&
+                            (!follower_ready || follower_ready->level!=SprPrefetchService::Level::kL1) &&
+                            (!event.write || l2_store_request) &&
+                            !event.page_walk && !event.instruction_fetch && !event.software_prefetch &&
+                            !event.forwarded_load && !replay.sequencer_coalesced &&
+                            ((config_.spr_l2_prefetch_follow && replay.private_level==HitLevel::kL2) ||
+                             replay.private_level==HitLevel::kLlc ||
+                             replay.private_level==HitLevel::kRemote ||
+                             replay.private_level==HitLevel::kMemory)) {
+                            const auto uop=resident.memory_uop(pending.index);
+                            const auto& input=resident.prefetch_input(uop);
+                            if ((config_.spr_l2_prefetch_follow && event.spr_l2_train_eligible) ||
+                                input.status==SprPrefetchInputStatus::kEligible) {
+                                using P=SprL2RubyPrefetcher;
+                                const bool hit=replay.private_level==HitLevel::kL2;
+                                const bool was_prefetched=hit && private_caches_[pending.core]->consume_l2_prefetched(
+                                    event.line,private_transactions[pending.core]);
+                                const auto action=hit ? P::Action::kHit :
+                                    (follower_ready && follower_ready->prefetch ? P::Action::kLateLoad : P::Action::kMiss);
+                                spr_l2_shared_prefetch_->predictors[pending.core].observe(
+                                    {action,l2_store_request ? P::Request::kGetX : P::Request::kGetS,
+                                     config_.spr_l2_prefetch_follow ? event.line*config_.l2.line_size : input.physical_address,
+                                     now,true,hit ? std::optional<bool>(was_prefetched) : std::nullopt});
+                                ++spr_l2_shared_prefetch_->trained;
+                            } else ++spr_l2_shared_prefetch_->unsupported_input;
+                        }
+                        if(replay.l2_evicted) {
+                            spr_l2_prefetch_->cancel_eviction(pending.core,replay.l2_evicted_line,now);
+                            if (spr_l2_shared_prefetch_) {
+                                spr_l2_shared_prefetch_->invalidate_demand_fill(pending.core,replay.l2_evicted_line);
+                                prefetch_invalidated_lines[pending.core].insert(replay.l2_evicted_line);
+                            }
+                        }
+                        if(!skip_prefetch_event && !skip_line_store && !event.write && !event.atomic && !event.page_walk &&
+                           !event.instruction_fetch && !event.software_prefetch &&
+                           !event.forwarded_load && !replay.sequencer_coalesced) {
+                            const auto uop=resident.memory_uop(pending.index);
+                            const auto latency=fixed_to_cycle_ceil(reference_duration_q16(
+                                pending.core,cycles_to_fixed(config_.l2.hit_latency)));
+                            std::function<std::optional<std::uint64_t>(std::uint64_t)> lower_service;
+                            if(config_.spr_l2_prefetch_follow) lower_service=[&](std::uint64_t line) {
+                                return lower_prefetch_service(pending.core,line,now);
+                            };
+                            spr_l2_prefetch_->observe(pending.core,resident.prefetch_input(uop),
+                                replay.private_level,now,latency,*private_caches_[pending.core],
+                                private_transactions[pending.core],stream_hit && stream_eligible,lower_service,
+                                config_.spr_l2_prefetch_follow ? &spr_l2_shared_prefetch_->resources : nullptr,
+                                follower_ready && follower_ready->prefetch && follower_ready->level==SprPrefetchService::Level::kL1);
+                        }
+                    }
+                };
+                replay_prefetch_batch(suffix_transaction);
+                if(buffered_tso_store() && !buffered_tso_permissions_intact(batch,event_feedback)) {
+                    shared_->restore(*buffer_tso_transaction);
+                    for(std::uint32_t core=0;core<config_.cores;++core)
+                        cores_[core]->total=buffer_tso_counters_before[core];
+                    *spr_l2_prefetch_=before;
+                    if (llc_resident_before)
+                        *spr_llc_resident_prefetch_ = *llc_resident_before;
+                    if (shared_prefetch_before)
+                        *spr_l2_shared_prefetch_ = *shared_prefetch_before;
+                    prefetch_dirty_writeback=false;
+                    for(const auto& pending:batch) {
+                        const auto& event=current_chunks_[pending.core].memory(pending.index);
+                        if(event.tso_buffer_eligible)buffer_tso_conflict_lines_.insert(event.line);
+                    }
+                    replay_prefetch_batch(nullptr);
+                }
+                // Demand-only FR repair cannot reconstruct prefetch or dirty
+                // writeback traffic. Keep canonical service in those epochs.
+                const bool shared_prefetch_activity = prefetch_frfcfs_start &&
+                    spr_l2_shared_prefetch_->frfcfs_requires_fallback(*prefetch_frfcfs_start);
+                if(prefetch_dirty_writeback || shared_prefetch_activity ||
+                   (config_.spr_l2_prefetch_follow && config_.dram.scheduler == "frfcfs")) {
+                    reference_timing_repair=false;
+                    ++stats_.spr_prefetch_dram_repair_skipped_epochs;
+                }
+                if(!defer_initial_timing_feedback)
+                    compute_timing_feedback(event_feedback,accepted_begin,accepted_end,timing);
+            } else if (config_.bounded_store_timing()) {
                 std::optional<SharedSystem::TimingState> bounded_timing_start;
                 if (config_.dram.scheduler == "frfcfs" &&
                     frequency_domain_identity() && !dvfs_ever_active_ && !batch.empty())
@@ -23997,6 +26521,54 @@ class Simulator::Impl {
                     *shared_timing_start, shared_queue_cycles_start,
                     horizon_q16, timing);
             }
+            if (config_.spr_store_group_merge && active_store_group_count_) {
+              for (const auto& selected_group : active_store_groups_) if (selected_group) {
+                const auto* active_store_group_=&*selected_group;
+                const auto owner_core = active_store_group_->core;
+                if (!timing.store_group_edges[owner_core])
+                    throw std::logic_error("committed store group lacks final edges");
+                const auto edges = *timing.store_group_edges[owner_core];
+                for (auto& sample : timing.response_frontier_audit[owner_core]) {
+                    const auto member = active_store_group_->member_of(sample.sequence);
+                    if (member >= active_store_group_->member_count) continue;
+                    const bool owner = member == 0;
+                    sample.store_group_id = active_store_group_->id;
+                    sample.store_group_window_id = active_store_group_->window_id;
+                    sample.store_group_batch_rank = active_store_group_->batch_rank + member;
+                    sample.store_group_offload_cycle = edges.offload;
+                    sample.store_group_callback_cycle = edges.callback;
+                    sample.store_group_credit_release_cycle = owner ? edges.callback : edges.offload;
+                    sample.store_sq_release_cycle = owner ? edges.callback : edges.offload;
+                    if (owner) {
+                        sample.store_send_cycle = edges.offload;
+                        sample.store_sq_release_cycle = edges.callback;
+                        sample.store_service_cycles = edges.callback - edges.offload;
+                    }
+                }
+                // The grouped follower never entered the hierarchy classifier;
+                // count its retired-store event once, after successful commit.
+                cores_[owner_core]->total.perf_retired_stores += active_store_group_->member_count - 1;
+                ++stats_.spr_store_group_committed;
+                stats_.spr_store_group_committed_members += active_store_group_->member_count;
+                if (active_store_group_->member_count == 2) ++stats_.spr_store_group_size2;
+                else if (active_store_group_->member_count == 3) ++stats_.spr_store_group_size3;
+                else if (active_store_group_->member_count == 4) ++stats_.spr_store_group_size4;
+              }
+            }
+            if (spr_llc_resident_prefetch_ || config_.spr_l2_prefetch_follow) {
+                for (const auto& pending : batch) {
+                    const auto& event = current_chunks_[pending.core].memory(pending.index);
+                    const auto& replay = event_feedback[pending.core][pending.index];
+                    if (event.forwarded_load || replay.private_level == HitLevel::kL1 ||
+                        replay.private_level == HitLevel::kL2) continue;
+                    const auto issue = fixed_to_cycle_ceil(pending.reference_issue_q16);
+                    const auto duration = fixed_to_cycle_ceil(reference_duration_q16(
+                        pending.core, cycles_to_fixed(replay.latency_cycles)));
+                    spr_l2_prefetch_->note_l2_miss(pending.core,event.line,issue,
+                        saturating_add(issue,duration));
+                }
+                spr_l2_prefetch_->finish_source_batch();
+            }
             publish_buffered_tso_stores(
                 batch, event_feedback, timing);
             publish_fixed_read_services(batch, event_feedback, timing);
@@ -24058,6 +26630,48 @@ class Simulator::Impl {
                     }
                 }
             }
+            if (config_.spr_l2_prefetch_follow) {
+                auto& l2=*spr_l2_shared_prefetch_;
+                for (const auto& pending : batch) {
+                    const auto& replay=event_feedback[pending.core][pending.index];
+                    if(replay.prefetch_resource_ticket) {
+                        const auto pos=pending.index-timing.memory_begin[pending.core];
+                        const auto callback=timing.prefetch_callback_cycles[pending.core][pos];
+                        l2.resources.finish(replay.prefetch_resource_ticket,fixed_to_cycle_ceil(
+                            reference_time_q16(pending.core,cycles_to_fixed(callback))));
+                    }
+                    if (replay.shared_timing.path!=SharedTimingPath::kMemory &&
+                        replay.shared_timing.path!=SharedTimingPath::kMergedMemory) continue;
+                    const auto& event=current_chunks_[pending.core].memory(pending.index);
+                    const auto pos=pending.index-timing.memory_begin[pending.core];
+                    const auto callback=timing.prefetch_callback_cycles[pending.core][pos];
+                    l2.note_source_response(event.line,fixed_to_cycle_ceil(
+                        reference_time_q16(pending.core,cycles_to_fixed(callback))));
+                }
+                std::unordered_set<std::uint64_t> later_writes;
+                for (auto it=batch.rbegin(); it!=batch.rend(); ++it) {
+                    const auto& event=current_chunks_[it->core].memory(it->index);
+                    if (event.write || event.atomic) { later_writes.insert(event.line); continue; }
+                    const auto& replay=event_feedback[it->core][it->index];
+                    if (!replay.prefetch_follow_ready) continue;
+                    if (later_writes.count(event.line) ||
+                        prefetch_invalidated_lines[it->core].count(event.line)) {
+                        ++l2.demand_fill_dropped;
+                        continue;
+                    }
+                    const auto pos=it->index-timing.memory_begin[it->core];
+                    const auto response=timing.prefetch_callback_cycles[it->core][pos];
+                    const auto reference_response=fixed_to_cycle_ceil(
+                        reference_time_q16(it->core,cycles_to_fixed(response)));
+                    const auto existing=std::find_if(l2.demand_fills.begin(),l2.demand_fills.end(),
+                        [&](const auto& fill) { return fill.core==it->core && fill.line==event.line; });
+                    if (existing!=l2.demand_fills.end()) {
+                        existing->response=std::min(existing->response,reference_response);
+                    } else if (l2.demand_fills.size()<l2.capacity) {
+                        l2.demand_fills.push_back({it->core,event.line,reference_response});
+                    } else ++l2.demand_fill_dropped;
+                }
+            }
             const auto weave_ready = std::chrono::steady_clock::now();
 
             for (const auto& pending : batch) {
@@ -24065,6 +26679,18 @@ class Simulator::Impl {
                                         .memory(pending.index);
                 const auto& replay =
                     event_feedback[pending.core][pending.index];
+                if (context_execution_enabled_ && !is_context_request(pending.core, event) &&
+                    replay.shared_timing.uncore_request) {
+                    auto& execution = stats_.context_execution[pending.core];
+                    ++execution.scored_uncore_requests;
+                    if (replay.shared_response_cycle == 0) {
+                        ++execution.scored_uncore_response_unknown;
+                    } else {
+                        execution.last_scored_uncore_response_reference_q16 = std::max(
+                            execution.last_scored_uncore_response_reference_q16,
+                            cycles_to_fixed(replay.shared_response_cycle));
+                    }
+                }
                 if (event.page_walk) {
                     auto& counters = cores_[pending.core]->total;
                     const auto level = static_cast<std::size_t>(
@@ -24741,6 +27367,48 @@ class Simulator::Impl {
             std::ceil(static_cast<double>(exposed) * config_.memory_exposure));
     }
 
+    MemoryReplay replay_l2_prefetch_follower(
+        std::uint32_t core, const ChunkMemoryEvent& event,
+        std::uint64_t issue_q16, SprPrefetchService::Follower follower,
+        SharedSystem::Transaction* transaction) {
+        std::optional<ContextPrivatePmuScope> context_scope;
+        if (is_context_request(core,event)) context_scope.emplace(cores_[core]->total);
+        std::optional<TaskDataPmuScope> task_scope;
+        if (recorded_scheduler_ && !event.instruction_fetch && !event.page_walk)
+            task_scope.emplace(cores_[core]->total,event.task_pmu_member);
+        if (auto alias = replay_sequencer_line_alias(
+                core, event, issue_q16, true, transaction)) {
+            alias->prefetch_follow_ready = follower;
+            return *alias;
+        }
+        auto* private_transaction = transaction ? &transaction->private_caches[core] : nullptr;
+        const auto probe = private_caches_[core]->probe(
+            event.line, false, cores_[core]->total, private_transaction);
+        const auto issue = fixed_to_cycle_ceil(issue_q16);
+        const auto local_ready = fixed_to_cycle_ceil(local_horizon_q16(core, cycles_to_fixed(follower.ready)));
+        const auto response = SprPrefetchService::response_for({follower.ticket,local_ready},
+            issue,private_response_latency(event,follower.level==SprPrefetchService::Level::kL1 ? HitLevel::kL1 : HitLevel::kL2),
+            config_.l1d.hit_latency);
+        MemoryReplay replay;
+        replay.private_level = probe.level;
+        replay.prefetch_follow_ready = follower;
+        replay.latency_cycles = response - issue;
+        const auto exposed = replay.latency_cycles > event.lower_bound_latency
+            ? replay.latency_cycles - event.lower_bound_latency : 0;
+        replay.exposed_cycles = static_cast<std::uint64_t>(
+            std::ceil(static_cast<double>(exposed) * config_.memory_exposure));
+        replay.shared_stage_issue_cycle = fixed_to_cycle_ceil(reference_time_q16(core, issue_q16));
+        replay.shared_response_cycle = fixed_to_cycle_ceil(reference_time_q16(core, cycles_to_fixed(response)));
+        replay.shared_timing.path = SharedTimingPath::kLocal;
+        replay.shared_timing.replayable = false;
+        observe_perf_cache_request(core, event, HitLevel::kUnknown, PerfCacheLookup::NotObserved);
+        ++cores_[core]->total.perf_retired_loads;
+        ++cores_[core]->total.perf_l1d_load_misses;
+        ++cores_[core]->total.perf_l2_accesses;
+        track_sequencer_parent(core, event, replay.shared_stage_issue_cycle, replay, transaction);
+        return replay;
+    }
+
     MemoryReplay replay_memory_event(
         std::uint32_t core, const ChunkMemoryEvent& event,
         std::uint64_t issue_q16, bool subtract_lower_bound,
@@ -24783,6 +27451,8 @@ class Simulator::Impl {
                   cores_[core]->total,
                   private_transaction);
         MemoryReplay preview;
+        preview.parent_pre_resident = private_result.level==HitLevel::kL1 ||
+            private_result.level==HitLevel::kL2;
         preview.private_level = private_result.level;
         preview.l2_evicted = private_result.l2_evicted;
         preview.l2_evicted_dirty = private_result.l2_evicted_dirty;
@@ -24865,6 +27535,15 @@ class Simulator::Impl {
                     "modeled instruction DRAM placement exceeds capacity");
             }
         }
+        auto parent_state = ParentServicePool::State::kUnknown;
+        if (unified_parent_v2_ && event.write && !event.page_walk && !event.instruction_fetch &&
+            !preview.functional_carried) {
+            parent_state = !preview.parent_pre_resident ? ParentServicePool::State::kInvalid :
+                !config_.coherence || shared_->owner_of(event.line)==static_cast<std::int16_t>(core)
+                    ? (shared_->modified(event.line) ? ParentServicePool::State::kModified :
+                        ParentServicePool::State::kExclusive)
+                    : ParentServicePool::State::kShared;
+        }
         const auto shared_result = shared_->access(
             core, event.line, memory_line, event.write,
             preview.private_level, issue_cycle,
@@ -24925,6 +27604,22 @@ class Simulator::Impl {
             ++cores_[core]->total.l2_data_demand_tag_misses;
         }
         auto replay = preview;
+        if (unified_parent_v2_) {
+            using P=ParentServicePool;
+            replay.parent_facts.pre_state=parent_state;
+            replay.parent_facts.lower_issued=shared_result.uncore_request;
+            replay.parent_facts.lower_return=shared_result.completion;
+            replay.parent_facts.lower_return_valid=shared_result.uncore_request &&
+                shared_result.timing.path!=SharedTimingPath::kRemoteSupply &&
+                shared_result.timing.replayable && timing_replayable;
+            if (parent_state==P::State::kExclusive || parent_state==P::State::kModified)
+                replay.parent_facts.action=shared_result.uncore_request ? P::Action::kUnknown : P::Action::kNone;
+            else if (parent_state==P::State::kShared && event.write &&
+                     shared_result.timing.path==SharedTimingPath::kPermissionUpgrade)
+                replay.parent_facts.action=P::Action::kUpgrade;
+            else if (parent_state==P::State::kInvalid && shared_result.uncore_request)
+                replay.parent_facts.action=event.write ? P::Action::kFetchExclusive : P::Action::kFetchShared;
+        }
         replay.shared_timing = shared_result.timing;
         replay.shared_timing.replayable =
             replay.shared_timing.replayable && timing_replayable;
@@ -25131,7 +27826,7 @@ class Simulator::Impl {
                 }
             }
         }
-        if (std::getenv("FASTSIM_TSO_TRACE") && preview.buffered_store_prepare) {
+        if (tso_trace && preview.buffered_store_prepare) {
             std::fprintf(stderr,
                 "TSOT core=%u seq=%llu line=%llu plev=%d path=%d uncore=%d "
                 "issue=%llu comp=%llu lat=%llu owner=%d modified=%d\n",
@@ -25375,6 +28070,9 @@ class Simulator::Impl {
     std::vector<std::unique_ptr<ThreadState>> threads_;
     ProcessMemoryState process_memory_;
     std::vector<std::unique_ptr<PrivateHierarchy>> private_caches_;
+    std::optional<SprL2ResidentPrefetch> spr_l2_prefetch_;
+    std::optional<SprL2SharedPrefetchState> spr_l2_shared_prefetch_;
+    std::optional<SprLlcResidentPrefetch> spr_llc_resident_prefetch_;
     std::unique_ptr<SharedSystem> shared_;
 
     std::vector<std::deque<std::unique_ptr<CoreChunk>>> chunk_queues_;
@@ -25424,6 +28122,16 @@ class Simulator::Impl {
     std::optional<std::uint64_t> advance_time_limit_reference_q16_;
     std::optional<std::uint64_t> advance_instruction_target_;
     std::vector<std::vector<std::uint64_t>> response_iq_ready_cycles_;
+    std::vector<SprStoreWindow> response_spr_store_window_;
+    std::vector<SprSharedStoreCredits> response_spr_shared_store_credits_;
+    std::array<std::optional<StoreGroupCandidate>,4> active_store_groups_{};
+    std::size_t active_store_group_count_=0;
+    SprTransactionId store_group_ids_;
+    std::uint64_t store_group_window_id_ = 0;
+    std::vector<SprLoadBank> response_spr_load_bank_;
+    std::vector<SprFillCalendar> response_spr_l1_load_fill_ready_;
+    std::vector<SprFillCalendar> response_spr_l2_load_fill_ready_;
+    std::vector<std::array<std::vector<std::uint64_t>, 3>> response_partition_iq_ready_cycles_;
     std::vector<std::deque<ResponseRenameRelease>>
         response_rename_releases_;
     std::vector<std::array<std::uint64_t, kTrackedRegisterClasses>>
@@ -25484,6 +28192,9 @@ class Simulator::Impl {
     // and reweave candidates operate on copies, so retries cannot consume a
     // Sequencer slot twice.
     std::vector<std::vector<std::uint64_t>> sequencer_ready_cycles_;
+    std::vector<LegacyPrepareTiming> legacy_prepare_state_;
+    // A fixed accepted-order lower bound; never replaces the callback heap.
+    std::vector<std::uint64_t> sequencer_acceptance_frontier_;
     std::vector<std::uint64_t> private_read_prior_response_;
     // Completion-driven timing-walker calendars use the same copy/commit
     // discipline. Rejected transactional passes cannot reserve a walker.
@@ -25533,6 +28244,17 @@ class Simulator::Impl {
         line_generation_lower_bound_ledgers_;
     std::vector<LineGenerationLedger> line_generation_actual_ledgers_;
     std::vector<PendingFillTable> response_pending_fills_;
+    bool parent_line_safe(std::uint32_t core,std::uint64_t line) const {
+        if (parent_write_budget_exceeded_) return false;
+        if (!unified_parent_v2_) return parent_write_lines_.count(line)==0;
+        const auto it=parent_write_owners_.find(line);
+        return it==parent_write_owners_.end() || it->second==core;
+    }
+    bool unified_parent_active_ = false, unified_parent_wait_ = false, unified_parent_v2_ = false;
+    std::unordered_map<std::uint64_t,std::uint32_t> parent_write_owners_;
+    std::vector<ParentServicePool> response_parent_services_;
+    std::unordered_set<std::uint64_t> parent_write_lines_;
+    bool parent_write_budget_exceeded_ = false;
     std::vector<bool> finished_;
     std::vector<bool> producer_finished_;
 
@@ -25580,6 +28302,9 @@ class Simulator::Impl {
     const std::vector<std::size_t>* timing_end_ = nullptr;
     const std::vector<std::uint32_t>* timing_active_cores_ = nullptr;
     TimingFeedback* timing_output_ = nullptr;
+    // Valid only during the synchronous domain phase; cleared at its barrier.
+    const std::function<void(std::uint32_t)>* timing_initialize_core_ = nullptr;
+    TimingFeedback sequencer_proposal_scratch_;
     mutable TimingScratch timing_scratch_;
     mutable std::vector<SharedServiceComponent> shared_service_components_;
     const SharedSystem::TimingState* shared_service_start_ = nullptr;

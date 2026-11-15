@@ -12,7 +12,7 @@ from pathlib import Path
 from audit_perf_retirement import (audit_perf_retirement, scan_functional_retirement,
                                    load_macro_boundaries, validate_boundary_provenance,
                                    POP_FIELDS, TAIL_FIELDS, SCOPES)
-from thread_state_graph import load_capture_evidence
+from thread_state_graph import has_certified_functional_ownership, load_capture_evidence
 from perf_cache_contract import load_dictionary, integer, validate_metric
 from time_accounting import assemble_gem5_time_accounting
 
@@ -111,7 +111,7 @@ def audit_request_population(trace):
     """
     evidence=load_capture_evidence(trace)
     meta=evidence['metadata'];graph=evidence['graph']
-    if not meta or graph['summary']['active_status']!='available':
+    if not meta or not has_certified_functional_ownership(graph):
         raise ValueError('cache population requires certified functional ownership')
     tasks=sorted(t['os_tid'] for t in graph['tasks'])
     clocks=[json.loads((trace/f'oracle/time-accounting-core{m["core_id"]}.json').read_text()) for m in meta]
@@ -209,8 +209,21 @@ def audit_perf_cache(trace_dir, *, include_input_identity=False, allow_incomplet
                 or any(raw.get(k)!=ret.get(k) for k in BOUNDS)):
             raise ValueError('native v2 cache source/participant/boundary mismatch')
         observer=raw.get('observer',{})
-        if observer.get('schema')!='native-cache-request-observer-v1':raise ValueError('missing native request observer facts')
+        if observer.get('schema') not in (
+                'native-cache-request-observer-v1',
+                'native-cache-request-observer-v2'):
+            raise ValueError('missing native request observer facts')
         if integer(observer.get('overflow'),'native observer overflow'):raise ValueError('native request observer overflow')
+        # v2 adds per-window transaction conservation; the identity must
+        # close even when transactions legitimately cross the common end.
+        if observer.get('schema')=='native-cache-request-observer-v2':
+            # residual = issued + inflight_begin - released - superseded - inflight_end
+            cons=raw.get('native_observer',{}).get('window_conservation',{})
+            for k in ('inflight_begin','inflight_end','released','superseded',
+                      'balance_residual'):
+                integer(cons.get(k),'window_conservation:'+k)
+            if cons['balance_residual'] != 0:
+                raise ValueError('native request window conservation mismatch')
         unknown=integer(observer.get('unknown_requests'),'native unknown requests')
         if set(raw.get('scopes',{}))!=set(SCOPES):raise ValueError('native cache scope mismatch')
         scopes={}

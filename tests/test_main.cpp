@@ -3310,6 +3310,58 @@ void test_branch_golden_direct_target() {
     check(counters.misses == 2, "direct target golden miss count");
 }
 
+void test_branch_unconditional_sequential_target() {
+    const auto sequential = branch_record(0x100, 0x107, false, false, true);
+    auto config = small_branch_config();
+    config.indirect_hash_ghr = false;
+    config.indirect_hash_targets = false;
+
+    fastsim::BranchPredictor cold_predictor(config);
+    fastsim::BranchCounters cold_counters;
+    const auto cold = cold_predictor.process(sequential, cold_counters);
+    check(!cold.predicted_taken && !cold.miss &&
+              cold_counters.miss_population_conserved(),
+          "a cold sequential target must match the fall-through prediction");
+
+    fastsim::BranchPredictor matching_predictor(config);
+    fastsim::BranchCounters matching_counters;
+    matching_predictor.process(
+        branch_record(0x100, 0x107, true, false, true), matching_counters);
+    const auto matching = matching_predictor.process(sequential, matching_counters);
+    check(matching.predicted_taken && matching.target_available &&
+              matching.predicted_target == 0x107 && !matching.miss &&
+              matching_counters.miss_population_conserved(),
+          "a predicted sequential target must not be counted as a miss");
+
+    fastsim::BranchPredictor wrong_predictor(config);
+    fastsim::BranchCounters wrong_counters;
+    wrong_predictor.process(
+        branch_record(0x100, 0x180, true, false, true), wrong_counters);
+    const auto wrong = wrong_predictor.process(sequential, wrong_counters);
+    check(wrong.predicted_taken && wrong.target_available &&
+              wrong.predicted_target != 0x107 && wrong.target_miss && wrong.miss &&
+              wrong_counters.wrong_target_misses == 1 &&
+              wrong_counters.miss_population_conserved(),
+          "a wrong predicted target for an observed sequential PC must be "
+          "counted in the target miss population");
+
+    config.type = "gshare";
+    config.global_entries = 1;
+    fastsim::BranchPredictor conditional_predictor(config);
+    fastsim::BranchCounters conditional_counters;
+    for (int index = 0; index < 6; ++index) {
+        conditional_predictor.process(
+            branch_record(0x200, 0x205, true, true), conditional_counters);
+    }
+    const auto conditional = conditional_predictor.process(
+        branch_record(0x200, 0x205, false, true), conditional_counters);
+    check(conditional.conditional_prediction && conditional.direction_miss &&
+              conditional.predicted_taken && conditional.predicted_target == 0x205 &&
+              !conditional.miss && conditional_counters.masked_direction_misses == 1 &&
+              conditional_counters.miss_population_conserved(),
+          "a correct next PC must mask a raw conditional direction disagreement");
+}
+
 void test_branch_golden_ras_learning() {
     fastsim::BranchPredictor predictor(small_branch_config());
     fastsim::BranchCounters counters;
@@ -5378,6 +5430,18 @@ void test_context_execution_boundary() {
               scored.total_core().l2.accesses == 136 &&
               scored.llc.accesses == 136,
           "context cache requests must not pollute scored PMU");
+    for (unsigned core = 0; core < 2; ++core) {
+        const auto& evidence = scored.context_execution[core];
+        check(evidence.scored_uncore_requests > 0 &&
+                  evidence.scored_uncore_requests <= (core == 0 ? 8u : 128u) &&
+                  evidence.scored_uncore_response_unknown == 0 &&
+                  evidence.last_scored_uncore_response_reference_q16 > 0,
+              "scored uncore evidence must exclude suffix and include modeled responses");
+        check(evidence.execution_covers_scored_uncore_responses ==
+                  (evidence.execution_end_reference_q16 >=
+                   evidence.last_scored_uncore_response_reference_q16),
+              "uncore-response coverage must use the actual execution end");
+    }
     config.response_materialized_uop_fast_kernel = true;
     config.validate();
     const auto fast = run(true, 8);
@@ -10990,6 +11054,8 @@ void test_projected_dram_capture() {
 }  // namespace
 
 void test_cache_probe_fill();
+void test_spr_l1_prefetch_runtime();
+void test_spr_legacy_store_perf();
 void test_cross_q_config();
 void test_cross_q_runtime();
 void test_shared_pending_fill();
@@ -11003,6 +11069,7 @@ void test_store_engine_noaccess_chain();
 void test_line_generation_coordinator();
 void test_load_component_preflight();
 void test_interval_dependencies();
+void test_spr_store_group_runtime();
 void test_response_completion();
 void test_mixed_dram();
 void test_dram_address();
@@ -11016,8 +11083,19 @@ void test_task_pmu_runtime();
 
 void test_memory_request_roles();
 
+void test_spr_rename_elimination();
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--branch-only") {
+            test_branch_speculative_history_checkpoint();
+            test_branch_golden_direct_target();
+            test_branch_unconditional_sequential_target();
+            test_branch_golden_ras_learning();
+            test_branch_golden_indirect_learning();
+            std::cout << "branch tests passed\n";
+            return 0;
+        }
+        test_spr_rename_elimination();
         if (argc == 2 && std::string(argv[1]) == "--fixed-work-only") {
             test_fixed_work_score_range();
             std::cout << "fixed-work tests passed\n";
@@ -11045,6 +11123,7 @@ int main(int argc, char** argv) {
         test_dram_refresh();
         test_projected_dram_capture();
         test_interval_dependencies();
+        test_spr_store_group_runtime();
         test_config();
         test_cache_transaction();
         test_private_dirty_victim_merge();
@@ -11063,6 +11142,7 @@ int main(int argc, char** argv) {
         test_periodic_irq_kernel_event_model();
         test_branch_speculative_history_checkpoint();
         test_branch_golden_direct_target();
+        test_branch_unconditional_sequential_target();
         test_branch_golden_ras_learning();
         test_branch_golden_ras_static_fallthrough();
         test_branch_golden_ras_address_space_isolation();
@@ -11174,6 +11254,8 @@ int main(int argc, char** argv) {
         test_modeled_instruction_lower_hierarchy();
         test_modeled_instruction_epoch_boundary();
         test_cache_probe_fill();
+        test_spr_l1_prefetch_runtime();
+        test_spr_legacy_store_perf();
         test_cross_q_config();
         test_cross_q_runtime();
         test_shared_pending_fill();

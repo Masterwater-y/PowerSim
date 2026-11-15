@@ -26,6 +26,7 @@ struct StaticUopFactsRow {
     std::uint32_t hot_record_hash=0,flags=0;
     std::uint64_t store_group=0,address_operands=0,data_operands=0;
     std::uint16_t candidate_ports=0,nominal_latency=1,source_count=0,destination_count=0;
+    // Native IntExecutionFamily: None, ALU, SHFT, SlowInt, BM, Branch, Divider.
     std::uint8_t integer_family=0,zero_idiom=0;
     StaticStoreRole store_role=StaticStoreRole::None;
     std::uint8_t reserved=0;
@@ -56,7 +57,7 @@ inline std::uint32_t static_uop_record_hash(const void* record) {
     return h;
 }
 inline void validate_static_uop(const StaticUopFactsRow& row,const std::vector<StaticUopOperand>& operands) {
-    if(row.flags&~kStaticKnownFlags || row.reserved || row.reserved2 || row.integer_family>5 || row.zero_idiom>4 ||
+    if(row.flags&~kStaticKnownFlags || row.reserved || row.reserved2 || row.integer_family>6 || row.zero_idiom>4 ||
        static_cast<unsigned>(row.store_role)>3 || row.candidate_ports>0xfff || !row.nominal_latency ||
        row.operand_count!=operands.size() || row.source_count!=operands.size() || operands.size()>256)
         throw std::runtime_error("invalid static UOP descriptor");

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 #include "fastsim/trace.hpp"
@@ -739,12 +740,16 @@ BranchPredictionResult BranchPredictor::process_impl(
     result.direction_miss =
         conditional &&
         result.conditional_prediction != actual_taken;
+    // kTaken records whether the gem5 PC state redirected, not whether an
+    // unconditional branch executed. A branch can target its sequential PC.
+    // If we predicted a target, compare that PC to the observed next PC even
+    // when kTaken is clear; equal PCs do not require a redirect. With no
+    // target, the prediction is fall-through and only a redirect can miss.
     const bool final_direction_miss =
-        result.predicted_taken != actual_taken;
+        !result.predicted_taken && actual_taken;
     result.target_miss =
-        result.predicted_taken && actual_taken &&
-        (!result.target_available ||
-         result.predicted_target != record.next_pc);
+        result.predicted_taken && result.target_available &&
+        result.predicted_target != record.next_pc;
     result.miss = final_direction_miss || result.target_miss;
     counters.direction_misses += result.direction_miss;
     counters.target_misses += result.target_miss;
@@ -763,7 +768,20 @@ BranchPredictionResult BranchPredictor::process_impl(
     }
     if (!counters.miss_population_conserved()) {
         throw std::logic_error(
-            "branch miss population attribution did not conserve");
+            "branch miss population attribution did not conserve: pc=" +
+            std::to_string(record.pc) + " next_pc=" + std::to_string(record.next_pc) +
+            " flags=" + std::to_string(record.flags) +
+            " conditional=" + std::to_string(conditional) +
+            " actual_taken=" + std::to_string(actual_taken) +
+            " raw_prediction=" + std::to_string(result.conditional_prediction) +
+            " predicted_taken=" + std::to_string(result.predicted_taken) +
+            " target_available=" + std::to_string(result.target_available) +
+            " predicted_target=" + std::to_string(result.predicted_target) +
+            " target_miss=" + std::to_string(result.target_miss) +
+            " misses=" + std::to_string(counters.misses) +
+            " direction=" + std::to_string(counters.direction_only_misses) +
+            " no_target=" + std::to_string(counters.target_unavailable_misses) +
+            " wrong_target=" + std::to_string(counters.wrong_target_misses));
     }
 
     // Capture wrong-path PCs before squash repair, BTB correction, and the

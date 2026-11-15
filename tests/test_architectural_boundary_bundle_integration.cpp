@@ -1,6 +1,7 @@
 #include "fastsim/trace.hpp"
 #include "mem/functional_architectural_boundaries.hh"
 #include <cassert>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -9,7 +10,8 @@ namespace a = gem5::functional_arch;
 namespace m = gem5::functional_mmu;
 void create_bundle(const std::string &path, unsigned prefix = 0,
                    bool partial = false, bool missing_entry = false,
-                   bool cut_short = false, bool entry_prefix_only = false) {
+                   bool cut_short = false, bool entry_prefix_only = false,
+                   bool control_write = false) {
   std::array<std::uint8_t, 32> policy{};
   policy[0] = 1;
   BinaryTraceWriter hot(path, 0);
@@ -26,12 +28,13 @@ void create_bundle(const std::string &path, unsigned prefix = 0,
   ch.header_size = 128;
   ch.magic[6] = '2';
   fst::CoreFunctionalWriter core(path + ".core.gz", ch);
-  int tc = 0, irq = 0;
+  int tc = 0, irq = 0, isa = 0;
   std::uint64_t cr2 = 0;
   a::MacroOrigin prefix_origin;
   fst::mmuctl::State state{};
   m::Observer mmu(0, [&] { return state; });
   mmu.registerEndpoint(&tc, fst::mmuctl::Domain::ContextAllTranslations);
+  mmu.registerEndpoint(&isa, fst::mmuctl::Domain::Unknown);
   mmu.resume();
   a::Observer observer(7, &tc, mmu, [&] { return state; }, [&] { return cr2; });
   fst::archb::Header ah;
@@ -68,6 +71,12 @@ void create_bundle(const std::string &path, unsigned prefix = 0,
     std::vector<fst::StaticUopOperand> ops;
     hot.append(rec, nullptr, {}, fst::MemoryRequestRole::Data, 0, false, false,
                nullptr, &stat, &ops);
+    if (control_write && n == 0) {
+      m::OwnerScope owner(&tc, 10 + n, fst::mmuctl::Application::Deferred);
+      m::WriteScope write(&isa, fst::mmuctl::Register::Cr3, 0x1003,
+                          fst::mmuctl::Mode::WithEffect, [&] { return state; });
+      state[1] = 0x1003;
+    }
     mmu.bind(10 + n, n, &rec);
     prefix_origin = observer.newMacroOrigin();
     observer.successfulHot(10 + n, &rec, n, n, prefix_origin, !partial_member,
@@ -541,14 +550,46 @@ unsigned rom_ancestry_tests(const std::string &path) {
   }
   return failures;
 }
+// A source claiming readiness must not make an unreplayable initial event
+// disappear from the wrapper's readiness decision after the first record.
+struct InitialBoundaryFixture final : TraceSource {
+  std::vector<fst::ArchitecturalBoundaryEvent> initial;
+  unsigned emitted = 0;
+  bool next(TraceRecord &record) override {
+    initial.clear();
+    record = {};
+    return emitted++ < 2;
+  }
+  bool architectural_boundary_bundle_ready() const override { return true; }
+  const std::vector<fst::ArchitecturalBoundaryEvent> &
+  initial_architectural_boundaries() const override { return initial; }
+  std::string description() const override { return "initial boundary fixture"; }
+};
 int main() {
+  for (bool no_operations : {false, true}) {
+    auto fixture = std::make_unique<InitialBoundaryFixture>();
+    fst::ArchitecturalBoundaryEvent event;
+    event.terminal.status = 1;
+    event.terminal.entry_begin = no_operations ? 0 : fst::archb::Absent;
+    if (!no_operations)
+      event.operations.emplace();
+    fixture->initial.push_back(event);
+    ScoreRangeTraceSource invalid_initial(std::move(fixture), 1, 2, 2);
+    assert(!invalid_initial.architectural_boundary_bundle_ready());
+    TraceRecord first;
+    assert(invalid_initial.next(first));
+    assert(invalid_initial.initial_architectural_boundaries().empty());
+    assert(!invalid_initial.architectural_boundary_bundle_ready());
+  }
   const std::string path = "tmp/p4-architectural-bundle/integration.fst";
+  std::filesystem::create_directories("tmp/p4-architectural-bundle");
   create_bundle(path);
   BinaryTraceSource source(path);
   assert(source.core_functional_version() == 2);
   assert(source.mmu_control_version() == 2);
   assert(!source.mmu_control_coverage());
   assert(source.architectural_boundary_bundle_ready());
+  assert(!source.current_mmu_control_state_v2());
   assert(source.initial_architectural_boundaries().size() == 1);
   assert(source.initial_architectural_boundaries()[0].operations->empty());
   TraceRecord rec;
@@ -557,6 +598,8 @@ int main() {
     assert(source.initial_architectural_boundaries().empty());
     assert(source.current_architectural_boundary_member());
     assert(source.current_mmu_controls_v2());
+    assert(source.current_mmu_control_state_v2() &&
+           (*source.current_mmu_control_state_v2())[1] == 0);
     if (i == 0) {
       const auto &before = source.boundaries_before(i);
       assert(before.size() == 1);
@@ -569,6 +612,20 @@ int main() {
   assert(!source.next(rec));
   assert(!source.current_architectural_boundary_member());
   assert(!source.current_mmu_controls_v2());
+  assert(!source.current_mmu_control_state_v2());
+  create_bundle(path, 1, false, false, false, false, true);
+  {
+    BinaryTraceSource control_transition(path);
+    assert(control_transition.architectural_boundary_bundle_ready());
+    assert(control_transition.next(rec));
+    assert(control_transition.current_mmu_controls_v2()->operations.size() == 1);
+    assert(!control_transition.current_mmu_control_state_v2());
+    assert(control_transition.next(rec));
+    assert(control_transition.current_mmu_control_state_v2() &&
+           (*control_transition.current_mmu_control_state_v2())[1] == 0x1003);
+    while (control_transition.next(rec)) {}
+  }
+  create_bundle(path);
   InstructionSliceTraceSource slice(std::make_unique<BinaryTraceSource>(path),
                                     0, 1);
   assert(slice.next(rec));
@@ -578,6 +635,19 @@ int main() {
   assert(!slice.architectural_boundary_bundle_ready());
   assert(!slice.next(rec));
   assert(!slice.current_architectural_boundary_member());
+  // The initial event is a two-uop macro. A valid BEGIN can only follow it;
+  // inspect this prefix without asking the deliberately short fixture for its
+  // later score endpoint.
+  ScoreRangeTraceSource full_prefix(std::make_unique<BinaryTraceSource>(path),
+                                    2, 3, 3);
+  assert(full_prefix.architectural_boundary_bundle_ready());
+  assert(full_prefix.initial_architectural_boundaries().size() == 1);
+  assert(full_prefix.next(rec));
+  assert(full_prefix.boundaries_before(0).size() == 1);
+  assert(full_prefix.architectural_boundary_bundle_ready());
+  assert(full_prefix.current_mmu_control_state_v2() &&
+         (*full_prefix.current_mmu_control_state_v2())[1] == 0);
+  assert(full_prefix.next(rec));
   create_bundle(path, true);
   BinaryTraceSource prefixed(path);
   assert(prefixed.architectural_boundary_bundle_ready());
@@ -588,6 +658,15 @@ int main() {
   assert(prefixed.boundaries_before(1)[0].accepted.predecessor_ordinal == 0);
   assert(prefixed.next(rec));
   assert(!prefixed.next(rec));
+  ScoreRangeTraceSource later_boundary(std::make_unique<BinaryTraceSource>(path),
+                                       1, 3, 3);
+  assert(later_boundary.architectural_boundary_bundle_ready());
+  assert(later_boundary.initial_architectural_boundaries().empty());
+  assert(later_boundary.next(rec));
+  assert(later_boundary.next(rec));
+  assert(later_boundary.boundaries_before(1).size() == 1);
+  assert(later_boundary.next(rec));
+  assert(!later_boundary.next(rec));
   WarmupInstructionTraceSource warm(std::make_unique<BinaryTraceSource>(path),
                                     1, 1, 1, 2, true);
   assert(warm.next(rec));
@@ -626,8 +705,67 @@ int main() {
   assert(no_head.initial_architectural_boundaries().size() == 1);
   assert(no_head.initial_architectural_boundaries()[0].terminal.entry_begin ==
          fst::archb::Absent);
+  ScoreRangeTraceSource unready(std::make_unique<BinaryTraceSource>(path),
+                                1, 2, 2);
+  assert(!unready.architectural_boundary_bundle_ready());
   assert(!no_head.next(rec));
   assert(no_head.initial_architectural_boundaries().empty());
+  // A partial boundary without entry members can be read ahead of the hot
+  // prefix whose FFE row proves it. The full audit must wait for that row.
+  create_bundle(path, 2, true, true);
+  BinaryTraceSource partial_no_head(path);
+  assert(!partial_no_head.architectural_boundary_bundle_ready());
+  assert(partial_no_head.next(rec));
+  assert(partial_no_head.next(rec));
+  assert(!partial_no_head.next(rec));
+  {
+    // Alter both copies so the independent-copy check still passes. The
+    // resulting complete FFE span must disagree with the retired hot record,
+    // even with a valid core payload hash.
+    const auto core = unpack(path + ".core.gz"), ffe = unpack(path + ".ffe.gz");
+    auto changed_core = core, changed_ffe = ffe;
+    changed_core[128 + 129 + 81 + 129 + 1 + 48] |= fst::kFrontendComplete;
+    changed_ffe[32 + 81 + 1 + 48] |= fst::kFrontendComplete;
+    put64(changed_core, changed_core.size() - 32,
+          fst::mmuctl::hash_bytes(fst::core_v2::payload_seed(),
+                                  changed_core.data() + 128,
+                                  changed_core.size() - 128 - 65));
+    pack(path + ".core.gz", changed_core);
+    pack(path + ".ffe.gz", changed_ffe);
+    bool rejected = false;
+    try {
+      BinaryTraceSource invalid(path);
+    } catch (const std::runtime_error &e) {
+      rejected = std::string(e.what()).find("macro completion disagrees with retired records") !=
+                 std::string::npos;
+    }
+    assert(rejected);
+    pack(path + ".core.gz", core);
+    pack(path + ".ffe.gz", ffe);
+  }
+  {
+    // Keep the predecessor, end, and all hashes valid, but widen the claimed
+    // partial prefix across two actual FFE spans. The deferred join itself
+    // must reject this, rather than accepting a pending event at EOF.
+    const auto arch = unpack(path + ".archb.gz");
+    rewrite_frames(path + ".archb.gz", false, [](unsigned kind, auto &frame) {
+      if (kind == 2) {
+        auto accepted = fst::archb::decode_accepted(frame);
+        assert(accepted.prefix_begin == 1 && accepted.prefix_end == 2);
+        accepted.prefix_begin = 0;
+        frame = fst::archb::encode(accepted);
+      }
+    });
+    bool rejected = false;
+    try {
+      BinaryTraceSource invalid(path);
+    } catch (const std::runtime_error &e) {
+      rejected = std::string(e.what()).find("boundary partial prefix ffe mismatch") !=
+                 std::string::npos;
+    }
+    assert(rejected);
+    pack(path + ".archb.gz", arch);
+  }
   create_bundle(path, false, false, false, true);
   BinaryTraceSource cut(path);
   assert(!cut.architectural_boundary_bundle_ready());

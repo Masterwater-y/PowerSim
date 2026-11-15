@@ -63,6 +63,13 @@ void observe_speculative_dependencies(
 
 IntervalCoreModel::IntervalCoreModel(const SimulatorConfig& config)
     : config_(config), l1i_(config.l1i) {
+    if (config_.spr_integer_family_enabled) {
+        const auto& hash=config_.spr_integer_family_policy_sha256;
+        if (!config_.spr_shared_fu || !config_.spr_integer_family_resources_verified || hash.size()!=64 ||
+            !std::all_of(hash.begin(),hash.end(),[](unsigned char c){return (c>='0'&&c<='9')||(c>='a'&&c<='f');}))
+            throw std::invalid_argument("managed integer routing lacks a certified target policy/resources");
+        spr_integer_family_=std::make_unique<SprIntegerFamilyArbiter>();
+    }
     if (config_.spr_retired_frontend) spr_frontend_.emplace(config_.spr_frontend);
     rename_free_entries_ = {
         config_.rename_int_free_entries,
@@ -79,19 +86,23 @@ IntervalCoreModel::IntervalCoreModel(const SimulatorConfig& config)
         }
         // Latencies and pipelining from the current deployment SPR proxy;
         // issue intervals are tracked separately per physical port/op class.
-        for (const auto op : {4, 5, 6, 25}) trait_table_[op].latency = 2;
-        for (const auto op : {7, 31}) trait_table_[op].latency = 4;
-        trait_table_[8].latency = 5;
-        trait_table_[9].latency = 14;
-        trait_table_[9].pipelined = true;
-        trait_table_[10].latency = 1;
-        trait_table_[11].latency = 24;
-        trait_table_[11].pipelined = false;
-        trait_table_[18].latency = 3;
-        trait_table_[29].latency = 11;
-        trait_table_[kSprSimdPack].latency = 3;
-        trait_table_[kSprSimdExtract].latency = 3;
-        trait_table_[kSprSimdInsert].latency = 1;
+        // The explicit diagnostic preserves the port allocator while using
+        // generic configured traits, isolating latency-table sensitivity.
+        if (!config_.spr_shared_fu_generic_latency) {
+            for (const auto op : {4, 5, 6, 25}) trait_table_[op].latency = 2;
+            for (const auto op : {7, 31}) trait_table_[op].latency = 4;
+            trait_table_[8].latency = 5;
+            trait_table_[9].latency = 14;
+            trait_table_[9].pipelined = true;
+            trait_table_[10].latency = 1;
+            trait_table_[11].latency = 24;
+            trait_table_[11].pipelined = false;
+            trait_table_[18].latency = 3;
+            trait_table_[29].latency = 11;
+            trait_table_[kSprSimdPack].latency = 3;
+            trait_table_[kSprSimdExtract].latency = 3;
+            trait_table_[kSprSimdInsert].latency = 1;
+        }
     }
     fu_ready_[static_cast<std::size_t>(FuPool::kInteger)].resize(
         config_.integer_alu_units);
@@ -118,6 +129,8 @@ IntervalCoreModel::IntervalCoreModel(const SimulatorConfig& config)
     if (config_.dtlb.enabled) {
         architectural_dtlb_lru_.reserve(config_.dtlb.entries * 2u);
     }
+    if (config_.spr_dtlb_stlb_proxy)
+        spr_dtlb_stlb_ = std::make_unique<SprStlb>(config_.spr_stlb_index_shift);
     if (config_.dtlb.enabled &&
         config_.dtlb.miss_model == "timing_walk") {
         dtlb_lru_.reserve(config_.dtlb.entries * 2u);
@@ -749,12 +762,28 @@ std::uint64_t IntervalCoreModel::allocate_stage(
 
 std::uint64_t IntervalCoreModel::allocate_issue(
     std::uint64_t earliest, const OpTraits& op,
-    const TraceRecord& record) {
+    const TraceRecord& record, std::uint64_t dispatch_lower_bound,
+    const SprIntegerFamilyInput* managed) {
     if (config_.spr_shared_fu) {
-        const auto mask = spr_port_mask(record);
+        const auto mask = managed ? managed->candidates : spr_port_mask(record);
         const auto raw_class = record.canonical_op_class();
         const auto op_class = raw_class >= 0 && raw_class < 128
             ? static_cast<std::size_t>(raw_class) : std::size_t{88};
+        const auto occupancy = op.pipelined ? std::uint64_t{1} : op.latency;
+        const auto interval = managed ? 1u : spr_issue_interval(record);
+        const auto available = [&](unsigned port, std::uint64_t cycle,
+                                   std::uint64_t duration, bool same_op) {
+            if (!config_.spr_shared_fu_gap_aware)
+                return spr_port_ready_[port] <= cycle &&
+                    (!same_op || spr_port_next_op_[port][op_class] <= cycle);
+            auto& calendar = spr_port_calendar_[port];
+            calendar.prune(dispatch_lower_bound);
+            if (!calendar.available(cycle, duration)) return false;
+            if (!same_op || interval == 1) return true;
+            auto& op_calendar = spr_port_op_calendar_[port][op_class];
+            op_calendar.prune(dispatch_lower_bound);
+            return op_calendar.available(cycle, interval);
+        };
         auto cycle = earliest;
         while (true) {
             if (cycle >= issue_slots_.size())
@@ -775,18 +804,41 @@ std::uint64_t IntervalCoreModel::allocate_issue(
             // split STA/STD records instead schedule their two parts separately.
             if (has_flag(record.flags, kStore) && raw_class != kSprStoreAddress) {
                 for (const auto port : {4u, 9u}) {
-                    if (spr_port_ready_[port] <= cycle) {
+                    if (available(port, cycle, 1, false)) {
                         paired_data = static_cast<int>(port);
                         break;
                     }
                 }
                 if (paired_data < 0) { ++cycle; continue; }
             }
-            for (unsigned port = 0; port < spr_port_ready_.size(); ++port) {
-                if ((mask & (1u << port)) && spr_port_ready_[port] <= cycle &&
-                    spr_port_next_op_[port][op_class] <= cycle) {
-                    selected = static_cast<int>(port);
-                    break;
+            if (managed) {
+                std::uint32_t available_mask=0;
+                for (unsigned port=0;port<spr_port_ready_.size();++port)
+                    if ((mask & (1u<<port)) && available(port,cycle,occupancy,true))
+                        available_mask|=1u<<port;
+                selected=spr_integer_family_->probe_available(managed->family,mask,available_mask);
+            } else if (config_.spr_shared_fu_round_robin && mask != 0) {
+                // gem5 rotates over the entire op-class capability queue;
+                // branch-port eligibility filters candidates, not that queue.
+                auto capability_mask = mask;
+                if (has_flag(record.flags, kBranch) && raw_class == 1) {
+                    auto nonbranch = record;
+                    nonbranch.flags &= static_cast<std::uint16_t>(~kBranch);
+                    capability_mask = spr_port_mask(nonbranch);
+                }
+                std::uint32_t available_mask = 0;
+                for (unsigned port = 0; port < spr_port_ready_.size(); ++port) {
+                    if ((mask & (1u << port)) && static_cast<int>(port) != paired_data &&
+                        available(port, cycle, occupancy, true))
+                        available_mask |= (1u << port);
+                }
+                selected = spr_fu_round_robin_.select(op_class, capability_mask, available_mask);
+            } else {
+                for (unsigned port = 0; port < spr_port_ready_.size(); ++port) {
+                    if ((mask & (1u << port)) && available(port, cycle, occupancy, true)) {
+                        selected = static_cast<int>(port);
+                        break;
+                    }
                 }
             }
             // No_OpClass has no execution-port requirement in gem5.
@@ -795,11 +847,24 @@ std::uint64_t IntervalCoreModel::allocate_issue(
             if (memory_slots) ++(*memory_slots)[cycle];
             if (selected >= 0) {
                 const auto port = static_cast<std::size_t>(selected);
-                spr_port_ready_[port] = cycle + (op.pipelined ? 1u : op.latency);
-                spr_port_next_op_[port][op_class] = cycle + spr_issue_interval(record);
+                if (config_.spr_shared_fu_gap_aware) {
+                    spr_port_calendar_[port].reserve(cycle, occupancy);
+                    if (interval > 1)
+                        spr_port_op_calendar_[port][op_class].reserve(cycle, interval);
+                } else {
+                    spr_port_ready_[port] = cycle + occupancy;
+                    spr_port_next_op_[port][op_class] = cycle + interval;
+                }
+                if (managed && !spr_integer_family_->commit_cursor(managed->family,mask,port))
+                    throw std::logic_error("invalid managed integer grant");
             }
-            if (paired_data >= 0)
-                spr_port_ready_[static_cast<std::size_t>(paired_data)] = cycle + 1;
+            if (paired_data >= 0) {
+                const auto port = static_cast<std::size_t>(paired_data);
+                if (config_.spr_shared_fu_gap_aware)
+                    spr_port_calendar_[port].reserve(cycle, 1);
+                else
+                    spr_port_ready_[port] = cycle + 1;
+            }
             return cycle;
         }
     }
@@ -1173,6 +1238,8 @@ void IntervalCoreModel::fill_dtlb(
         if (victim == dtlb_lru_.end()) {
             throw std::logic_error("nonempty DTLB has no LRU victim");
         }
+        if (dynamic_translation_mode_)
+            translation_reclaim_candidates_.push_back(victim->first);
         dtlb_lru_.erase(victim);
     }
     dtlb_lru_.emplace(
@@ -1196,6 +1263,8 @@ void IntervalCoreModel::fill_architectural_dtlb(const DtlbKey& key) {
             throw std::logic_error(
                 "nonempty architectural DTLB has no LRU victim");
         }
+        if (dynamic_translation_mode_)
+            translation_reclaim_candidates_.push_back(victim->first);
         architectural_dtlb_lru_.erase(victim);
     }
     architectural_dtlb_lru_.emplace(
@@ -1216,7 +1285,11 @@ void IntervalCoreModel::activate_address_space(
     // global evidence and flush all entries and not-yet-installed results.
     if (dynamic_translation_mode_) {
         for (auto it=dynamic_dtlb_mappings_.begin();it!=dynamic_dtlb_mappings_.end();) {
-            if (!it->first.global) {++dynamic_dtlb_versions_[it->first];it=dynamic_dtlb_mappings_.erase(it);} else ++it;
+            if (!it->first.global) {
+                ++dynamic_dtlb_versions_[it->first];
+                translation_reclaim_candidates_.push_back(it->first);
+                it=dynamic_dtlb_mappings_.erase(it);
+            } else ++it;
         }
         for (auto it=architectural_dtlb_lru_.begin();it!=architectural_dtlb_lru_.end();)
             if (!it->first.global) it=architectural_dtlb_lru_.erase(it); else ++it;
@@ -1228,6 +1301,7 @@ void IntervalCoreModel::activate_address_space(
         architectural_dtlb_lru_.clear(); dtlb_lru_.clear(); pending_page_walks_.clear();
         page_walk_completions_ = decltype(page_walk_completions_){};
         dynamic_dtlb_mappings_.clear(); dynamic_dtlb_versions_.clear(); outstanding_dynamic_walks_.clear();
+        translation_reclaim_candidates_.clear();
     }
 
     // These committed-stream maps are speculative-path diagnostics keyed by
@@ -1263,7 +1337,10 @@ void IntervalCoreModel::retire_page_walks_through(std::uint64_t cycle) {
         page_walk_completions_.pop();
         auto outstanding = outstanding_dynamic_walks_.find(walk.key);
         if (outstanding != outstanding_dynamic_walks_.end() && outstanding->second) {
-            if (!--outstanding->second) outstanding_dynamic_walks_.erase(outstanding);
+            if (!--outstanding->second) {
+                outstanding_dynamic_walks_.erase(outstanding);
+                translation_reclaim_candidates_.push_back(walk.key);
+            }
         }
         const auto version = dynamic_dtlb_versions_.find(walk.key);
         if (version != dynamic_dtlb_versions_.end() && version->second != walk.mapping_version) {
@@ -1288,18 +1365,36 @@ void IntervalCoreModel::retire_page_walks_through(std::uint64_t cycle) {
 void IntervalCoreModel::reclaim_translation_metadata() {
     // Invalidated keys retain their version until every queued completion has
     // checked it; neither LRU eviction nor mapping removal alone is enough.
-    for (auto it = dynamic_dtlb_versions_.begin(); it != dynamic_dtlb_versions_.end();) {
-        const auto& key = it->first;
+    for (const auto& key : translation_reclaim_candidates_) {
         if (!architectural_dtlb_lru_.count(key) && !dtlb_lru_.count(key) &&
             !outstanding_dynamic_walks_.count(key)) {
-            dynamic_dtlb_mappings_.erase(key);
-            it = dynamic_dtlb_versions_.erase(it);
-        } else ++it;
+            if (dynamic_dtlb_versions_.erase(key))
+                dynamic_dtlb_mappings_.erase(key);
+        }
     }
+    translation_reclaim_candidates_.clear();
+}
+
+void IntervalCoreModel::clear_retired_itlb() {
+    spr_retired_itlb_={};
+    if (config_.spr_id_stlb_allow_large) { spr_retired_itlb_pool_={};spr_retired_itlb_lru_=0; }
 }
 
 void IntervalCoreModel::observe_translation_mapping(
     const DtlbKey& key, const fst::TranslationMapping& mapping) {
+    if (config_.spr_id_stlb_retired_order && spr_dtlb_stlb_ &&
+        (key.page_bits==12 || (config_.spr_id_stlb_allow_large &&
+         (key.page_bits==21 || key.page_bits==22 || key.page_bits==30))) &&
+        (!key.global || config_.spr_id_stlb_allow_global)) {
+        const auto proxy_asid=key.global ? mapping.address_space_id : key.address_space_id;
+        const auto existing=spr_dtlb_stlb_->lookup(proxy_asid,0,key.token<<key.page_bits,false);
+        if (existing && (!existing->mapping_known || existing->physical_base!=mapping.physical_base ||
+                         existing->walk_root!=mapping.walk_root || existing->global!=key.global ||
+                         (config_.spr_id_stlb_allow_large && existing->page_bits!=key.page_bits))) {
+            spr_dtlb_stlb_->flush_all();spr_dtlb_stlb_has_entries_=false;
+            clear_retired_itlb();
+        }
+    }
     const auto same_leaf = [&](const fst::TranslationMapping& old) {
         return old.physical_base == mapping.physical_base && old.page_bits == mapping.page_bits &&
             old.walk_root == mapping.walk_root && old.levels == mapping.levels &&
@@ -1318,6 +1413,7 @@ void IntervalCoreModel::observe_translation_mapping(
             begin <= (old_begin|old_mask) && old_begin <= (begin|mask);
         if (overlaps) {
             ++dynamic_dtlb_versions_[old];
+            translation_reclaim_candidates_.push_back(old);
             architectural_dtlb_lru_.erase(old); dtlb_lru_.erase(old); pending_page_walks_.erase(old);
             it=dynamic_dtlb_mappings_.erase(it);
         } else if (!architectural_dtlb_lru_.count(old) && !dtlb_lru_.count(old) && !outstanding_dynamic_walks_.count(old)) {
@@ -1338,6 +1434,38 @@ std::uint64_t IntervalCoreModel::translate(
         if (!record.size) return earliest;
         const auto& fragments=source->current_translation_fragments();
         if (fragments.empty()) throw std::runtime_error("dynamic translation evidence missing for memory record");
+        const bool unknown_leaf = std::any_of(fragments.begin(), fragments.end(),
+            [](const auto& fragment) {
+                return fragment.mapping.kind == fst::TranslationKind::kPaged &&
+                    !(fragment.mapping.flags & fst::kTranslationLeafKnown);
+            });
+        const bool unknown_context = spr_dtlb_stlb_ && spr_dtlb_stlb_source_usable_ &&
+            std::any_of(fragments.begin(), fragments.end(), [&](const auto& fragment) {
+                return fragment.mapping.kind == fst::TranslationKind::kPaged &&
+                    (!spr_dtlb_stlb_current_pcid_ ||
+                     ((fragment.mapping.flags & fst::kTranslationLeafKnown) &&
+                      fragment.mapping.pcid != *spr_dtlb_stlb_current_pcid_));
+            });
+        if (unknown_leaf || unknown_context) {
+            // Unknown leaf geometry or a different translation context cannot
+            // supply a qualified hit, miss, path or delay, even in a mixed
+            // access. Unknown aliasing also invalidates old translation state.
+            architectural_dtlb_lru_.clear(); dtlb_lru_.clear(); pending_page_walks_.clear();
+            page_walk_completions_ = decltype(page_walk_completions_){};
+            dynamic_dtlb_mappings_.clear(); dynamic_dtlb_versions_.clear();
+            outstanding_dynamic_walks_.clear();
+            translation_reclaim_candidates_.clear();
+            if (config_.spr_id_stlb_retired_order) {
+                clear_retired_itlb(); spr_fetch_buffer_mapping_={}; fetch_buffer_valid_=false;
+            }
+            if (spr_dtlb_stlb_has_entries_) {
+                spr_dtlb_stlb_->flush_all(); spr_dtlb_stlb_has_entries_=false;
+                ++timing.spr_dtlb_stlb_flushes;
+            }
+            timing.dtlb_access=true; timing.dtlb_untracked=true;
+            timing.dtlb_timing_access=true; timing.dtlb_timing_untracked=true;
+            return earliest;
+        }
         std::vector<DtlbKey> seen;
         auto ready=earliest;
         for (const auto& fragment:fragments) {
@@ -1366,6 +1494,10 @@ std::uint64_t IntervalCoreModel::translate(
             timing.translation_timing_hits+=part.dtlb_timing_hit;
             timing.translation_timing_misses+=part.dtlb_timing_miss && !part.dtlb_timing_merged_miss;
             timing.translation_timing_merged_misses+=part.dtlb_timing_merged_miss;
+            timing.spr_dtlb_stlb_hits += part.spr_dtlb_stlb_hits;
+            timing.spr_dtlb_stlb_misses += part.spr_dtlb_stlb_misses;
+            timing.spr_dtlb_stlb_fallbacks += part.spr_dtlb_stlb_fallbacks;
+            timing.spr_dtlb_stlb_flushes += part.spr_dtlb_stlb_flushes;
             timing.dtlb_access=true;timing.dtlb_timing_access=true;
             timing.dtlb_hit|=part.dtlb_hit;timing.dtlb_miss|=part.dtlb_miss;
             timing.dtlb_timing_hit|=part.dtlb_timing_hit;timing.dtlb_timing_miss|=part.dtlb_timing_miss;
@@ -1443,13 +1575,50 @@ std::uint64_t IntervalCoreModel::translate_key(const DtlbKey& key,std::uint64_t 
         }
     }
 
+    bool stlb_hit = false;
+    if (spr_dtlb_stlb_) {
+        const auto mapping = dynamic_dtlb_mappings_.find(key);
+        const auto proxy_asid = key.global && mapping!=dynamic_dtlb_mappings_.end()
+            ? mapping->second.address_space_id : key.address_space_id;
+        const bool eligible = spr_dtlb_stlb_source_usable_ && dynamic_translation_mode_ &&
+            mapping != dynamic_dtlb_mappings_.end() &&
+            (key.page_bits == 12 || (config_.spr_id_stlb_allow_large &&
+             (key.page_bits==21 || key.page_bits==22 || key.page_bits==30))) &&
+            (!key.global || config_.spr_id_stlb_allow_global) &&
+            spr_dtlb_stlb_current_pcid_ &&
+            mapping->second.pcid == *spr_dtlb_stlb_current_pcid_ &&
+            proxy_asid == active_address_space_id_ &&
+            (!config_.spr_id_stlb_retired_order || mapping->second.walk_root == proxy_asid);
+        if (eligible) {
+            const auto va = key.token << key.page_bits;
+            stlb_hit = spr_dtlb_stlb_->lookup(proxy_asid, 0, va).has_value();
+            if (stlb_hit) ++timing.spr_dtlb_stlb_hits;
+            else {
+                ++timing.spr_dtlb_stlb_misses;
+                // Deliberately immediate retired-order fill, not native timing.
+                if (config_.spr_id_stlb_retired_order)
+                    spr_dtlb_stlb_->insert(proxy_asid,0,va,key.page_bits,key.global,
+                        std::make_pair(mapping->second.physical_base,mapping->second.walk_root));
+                else spr_dtlb_stlb_->insert(key.address_space_id, 0, va, 12, false);
+                spr_dtlb_stlb_has_entries_ = true;
+            }
+        } else {
+            ++timing.spr_dtlb_stlb_fallbacks;
+            if (config_.spr_id_stlb_retired_order) clear_retired_itlb();
+            if (spr_dtlb_stlb_has_entries_) {
+                spr_dtlb_stlb_->flush_all();
+                spr_dtlb_stlb_has_entries_ = false;
+                ++timing.spr_dtlb_stlb_flushes;
+            }
+        }
+    }
     auto walker = std::min_element(page_walker_ready_.begin(),
                                    page_walker_ready_.end());
     if (walker == page_walker_ready_.end()) {
         throw std::logic_error("enabled DTLB has no page walker");
     }
-    const auto start = std::max(earliest, *walker);
-    const auto walk_latency = page_walk_latency_override.value_or(
+    const auto start = stlb_hit ? earliest : std::max(earliest, *walker);
+    const auto walk_latency = stlb_hit ? config_.spr_dtlb_stlb_hit_latency : page_walk_latency_override.value_or(
         config_.dtlb.page_walk_latency);
     const auto ready = start + walk_latency;
     if (dtlb_fill_generation_sequence_ ==
@@ -1459,7 +1628,7 @@ std::uint64_t IntervalCoreModel::translate_key(const DtlbKey& key,std::uint64_t 
     const auto generation = ++dtlb_fill_generation_sequence_;
     timing.dtlb_fill_generation = generation;
     timing.dtlb_page_walk_start_cycle = start;
-    *walker = ready;
+    if (!stlb_hit) *walker = ready;
     if (config_.dtlb.coalesce_misses) {
         pending_page_walks_.emplace(
             key, PendingPageWalk{ready, generation});
@@ -1529,6 +1698,8 @@ IntervalTiming IntervalCoreModel::schedule(
         frontend_needs_bytes = frontend_begins && !frontend_macro.pseudo &&
             spr_frontend_->source_for(frontend_macro) != SprFrontendSource::Dsb;
     }
+    const bool spr_address_space_change = spr_dtlb_stlb_ && active_address_space_valid_ &&
+        active_address_space_id_ != address_space_id;
     activate_address_space(address_space_id);
     const auto index = completion_.size();
     const bool complete_dependencies =
@@ -1550,6 +1721,51 @@ IntervalTiming IntervalCoreModel::schedule(
                        distance) != dependency_extensions.end());
     };
     IntervalTiming timing;
+    if (spr_dtlb_stlb_) {
+        const auto* control = trace_source && trace_source->mmu_control_version() == 2
+            ? trace_source->current_mmu_controls_v2() : nullptr;
+        const bool control_sealed = control &&
+            control->owner.owner_kind == fst::mmuctl_v2::OwnerKind::RetiredInstruction &&
+            control->owner.status == fst::mmuctl_v2::Sealed;
+        const bool boundary_ready = trace_source &&
+            trace_source->architectural_boundary_bundle_ready();
+        spr_dtlb_stlb_source_usable_ = control_sealed && boundary_ready;
+        spr_dtlb_stlb_current_pcid_.reset();
+        const auto* state = spr_dtlb_stlb_source_usable_
+            ? trace_source->current_mmu_control_state_v2() : nullptr;
+        if (state && ((*state)[1] & ~std::uint64_t(0xfff)) == address_space_id) {
+            constexpr std::uint64_t pcide = std::uint64_t{1} << 17;
+            spr_dtlb_stlb_current_pcid_ = static_cast<std::uint16_t>(
+                ((*state)[2] & pcide) ? ((*state)[1] & 0xfff) : 0);
+        }
+        // These diagnostics count mutually exclusive scored records, not walks.
+        if (!control_sealed) ++timing.spr_dtlb_stlb_missing_controls;
+        else if (!boundary_ready) ++timing.spr_dtlb_stlb_unqualified_boundary;
+        bool boundary = false;
+        if (trace_source) {
+            const auto ordinal = trace_source->current_source_record_ordinal();
+            boundary = ordinal && !trace_source->boundaries_before(*ordinal).empty();
+        }
+        const bool control_effect = control && !control->operations.empty();
+        if (spr_address_space_change || !spr_dtlb_stlb_source_usable_ || boundary || control_effect) {
+            if (config_.spr_id_stlb_retired_order) { clear_retired_itlb(); spr_fetch_buffer_mapping_={}; fetch_buffer_valid_=false; }
+            if (spr_dtlb_stlb_has_entries_) {
+                spr_dtlb_stlb_->flush_all();
+                spr_dtlb_stlb_has_entries_ = false;
+                ++timing.spr_dtlb_stlb_flushes;
+            }
+            // Missing bundle qualification disables shared STLB knowledge,
+            // but by itself does not invalidate the fallback L1 DTLB on each
+            // record. Observed effects and unsealed controls still do.
+            if (spr_address_space_change || boundary || control_effect || (control && !control_sealed)) {
+                architectural_dtlb_lru_.clear(); dtlb_lru_.clear(); pending_page_walks_.clear();
+                page_walk_completions_ = decltype(page_walk_completions_){};
+                dynamic_dtlb_mappings_.clear(); dynamic_dtlb_versions_.clear();
+                outstanding_dynamic_walks_.clear();
+                translation_reclaim_candidates_.clear();
+            }
+        }
+    }
     const bool completes_macro_instruction =
         !has_flag(record.flags, kMicroOp) ||
         has_flag(record.flags, kLastMicroOp);
@@ -1707,9 +1923,141 @@ IntervalTiming IntervalCoreModel::schedule(
             fetch_supply_macro_in_progress_ = false;
         }
 
+        const auto instruction_facts = config_.spr_id_stlb_retired_order && trace_source
+            ? trace_source->current_instruction_fetch() : nullptr;
+        const auto instruction_fragment = [&](std::uint64_t va) -> const fst::TranslationFragment* {
+            const auto& facts=instruction_facts;
+            const fst::TranslationFragment* fragment=nullptr;
+            if (facts && facts->status==fst::InstructionFetchStatus::Mapped &&
+                facts->pc==record.pc && facts->decode_context_known &&
+                facts->decode_address_space_id==address_space_id &&
+                va>=facts->pc && va-facts->pc<facts->bytes) {
+                for (const auto& piece:facts->fragments) {
+                    if (va>=piece.virtual_address && va-piece.virtual_address<piece.size) {
+                        if (fragment) return nullptr;
+                        fragment=&piece;
+                    }
+                }
+            }
+            if (!fragment || !spr_dtlb_stlb_source_usable_) return nullptr;
+            const auto& m=fragment->mapping;
+            if (!(m.page_bits==12 || (config_.spr_id_stlb_allow_large &&
+                  (m.page_bits==21 || m.page_bits==22 || m.page_bits==30)))) return nullptr;
+            const auto page_bytes=std::uint64_t{1}<<m.page_bits;
+            const auto page_mask=page_bytes-1;
+            if (!(m.kind==fst::TranslationKind::kPaged &&
+                (m.flags&fst::kTranslationLeafKnown) &&
+                (!(m.flags&fst::kTranslationGlobal) || config_.spr_id_stlb_allow_global) &&
+                spr_dtlb_stlb_current_pcid_ && m.pcid==*spr_dtlb_stlb_current_pcid_ &&
+                m.address_space_id==address_space_id &&
+                m.walk_root==address_space_id && !(m.virtual_base&page_mask) && !(m.physical_base&page_mask) &&
+                va>=m.virtual_base && va-m.virtual_base<page_bytes &&
+                fragment->virtual_address>=m.virtual_base &&
+                fragment->virtual_address-m.virtual_base<page_bytes &&
+                fragment->size<=page_bytes-(fragment->virtual_address-m.virtual_base) &&
+                m.physical_base<=std::numeric_limits<std::uint64_t>::max()-(fragment->virtual_address-m.virtual_base) &&
+                fragment->physical_address==m.physical_base+(fragment->virtual_address-m.virtual_base))) return nullptr;
+            return fragment;
+        };
+        if (config_.spr_id_stlb_retired_order && frontend_begins && fetch_buffer_valid_ &&
+            fetch_buffer_block_==record.pc/config_.fetch_buffer_bytes) {
+            const auto* fragment=instruction_fragment(record.pc);
+            if (!fragment) {
+                // No new request or lookup: invalidate shared knowledge only.
+                ++timing.spr_itlb_unknown;clear_retired_itlb();spr_fetch_buffer_mapping_={};
+                if (spr_dtlb_stlb_has_entries_) {spr_dtlb_stlb_->flush_all();spr_dtlb_stlb_has_entries_=false;++timing.spr_dtlb_stlb_flushes;}
+            } else {
+                const auto& m=fragment->mapping;
+                const auto& old=spr_fetch_buffer_mapping_;
+                if (!old.valid || old.asid!=address_space_id || old.page!=(record.pc>>12) ||
+                    old.physical_base!=m.physical_base || old.walk_root!=m.walk_root ||
+                    old.global!=bool(m.flags&fst::kTranslationGlobal) || old.page_bits!=m.page_bits) {
+                    // A proven change invalidates buffered bytes before refetch.
+                    fetch_buffer_valid_=false;spr_fetch_buffer_mapping_={};
+                }
+            }
+        }
         const auto admit_block = [&](std::uint64_t block) {
             const bool new_block =
                 !fetch_buffer_valid_ || block != fetch_buffer_block_;
+            if (new_block && config_.spr_id_stlb_retired_order) {
+                // The modeled request covers instruction bytes, not necessarily
+                // the first virtual byte of the aligned cache block.
+                const auto start = block * static_cast<std::uint64_t>(config_.fetch_buffer_bytes);
+                const auto va = std::max(start, record.pc);
+                const auto* fragment=instruction_fragment(va);
+                if (!fragment) {
+                    ++timing.spr_itlb_unknown; clear_retired_itlb();spr_fetch_buffer_mapping_={};
+                    if (spr_dtlb_stlb_has_entries_) {
+                        spr_dtlb_stlb_->flush_all();spr_dtlb_stlb_has_entries_=false;
+                        ++timing.spr_dtlb_stlb_flushes;
+                    }
+                } else {
+                    const auto& m=fragment->mapping;
+                    const bool global=bool(m.flags&fst::kTranslationGlobal);
+                    spr_fetch_buffer_mapping_=RetiredItlbEntry{address_space_id,va>>12,m.physical_base,m.walk_root,true,global,m.page_bits};
+                    const DtlbKey key{global?0:address_space_id,va>>m.page_bits,m.page_bits,global};
+                    observe_translation_mapping(key,m);
+                    bool itlb_hit=false;
+                    if (config_.spr_id_stlb_allow_large) {
+                        // Bounded scan only for an actual modeled fetch block.
+                        // Every page size occupies the same 256-entry pool.
+                        for (auto& slot:spr_retired_itlb_pool_) {
+                            const auto& e=slot.entry;
+                            if (!e.valid || e.asid!=address_space_id || e.page!=(va>>e.page_bits)) continue;
+                            if (e.page_bits!=m.page_bits || e.physical_base!=m.physical_base ||
+                                e.walk_root!=m.walk_root || e.global!=global) {
+                                clear_retired_itlb();
+                                if (spr_dtlb_stlb_has_entries_) {spr_dtlb_stlb_->flush_all();spr_dtlb_stlb_has_entries_=false;++timing.spr_dtlb_stlb_flushes;}
+                                break;
+                            }
+                            slot.lru=++spr_retired_itlb_lru_;itlb_hit=true;break;
+                        }
+                    } else {
+                        auto& set=spr_retired_itlb_[(va>>12)&31];
+                        std::size_t i=0;while(i<set.size() &&
+                            !(set[i].valid && set[i].asid==address_space_id && set[i].page==(va>>12) &&
+                              set[i].physical_base==m.physical_base && set[i].walk_root==m.walk_root && set[i].global==global)) ++i;
+                        if(i<set.size()) {const auto entry=set[i];for(;i>0;--i)set[i]=set[i-1];set[0]=entry;itlb_hit=true;}
+                    }
+                    if (itlb_hit) ++timing.spr_itlb_hits;
+                    else {
+                        // Translate at the modeled fetch frontier. Using only
+                        // frontend_ready_cycle_ can restart at zero for the
+                        // next macro and silently hide the walk latency.
+                        fetch_earliest=std::max(fetch_earliest,fetch_cycle_);
+                        const bool hit=spr_dtlb_stlb_->lookup(address_space_id,0,va).has_value();
+                        if(hit) {++timing.spr_itlb_stlb_hits;fetch_earliest=saturating_u64(static_cast<__uint128_t>(fetch_earliest)+config_.spr_itlb_stlb_hit_latency);}
+                        else {++timing.spr_itlb_stlb_misses;
+                            spr_dtlb_stlb_->insert(address_space_id,0,va,m.page_bits,global,std::make_pair(m.physical_base,m.walk_root));
+                            spr_dtlb_stlb_has_entries_=true;
+                            fetch_earliest=saturating_u64(static_cast<__uint128_t>(fetch_earliest)+config_.dtlb.page_walk_latency);}
+                        if (config_.spr_id_stlb_allow_large) {
+                            constexpr std::size_t none=256;
+                            std::size_t free_slot=none,oldest=none,set_oldest=none,small_count=0;
+                            const auto target_set=(va>>12)&31;
+                            for (std::size_t j=0;j<spr_retired_itlb_pool_.size();++j) {
+                                const auto& p=spr_retired_itlb_pool_[j];
+                                if (!p.entry.valid) {if(free_slot==none)free_slot=j;continue;}
+                                if (oldest==none || p.lru<spr_retired_itlb_pool_[oldest].lru) oldest=j;
+                                if (m.page_bits==12 && p.entry.page_bits==12 && (p.entry.page&31)==target_set) {
+                                    ++small_count;
+                                    if (set_oldest==none || p.lru<spr_retired_itlb_pool_[set_oldest].lru) set_oldest=j;
+                                }
+                            }
+                            const auto chosen=small_count>=8 ? set_oldest : free_slot!=none ? free_slot : oldest;
+                            if (chosen==none) throw std::logic_error("no ITLB pool victim");
+                            auto& slot=spr_retired_itlb_pool_[chosen];
+                            slot.entry=RetiredItlbEntry{address_space_id,va>>m.page_bits,m.physical_base,m.walk_root,true,global,m.page_bits};
+                            slot.lru=++spr_retired_itlb_lru_;
+                        } else {
+                            auto& set=spr_retired_itlb_[(va>>12)&31];
+                            for(auto j=set.size()-1;j>0;--j)set[j]=set[j-1];
+                            set[0]=RetiredItlbEntry{address_space_id,va>>12,m.physical_base,m.walk_root,true,global};
+                        }
+                    }
+                }
+            }
             std::uint64_t local_miss_stall = 0;
             IntervalTiming::InstructionFetchRequest* physical_request =
                 nullptr;
@@ -1951,6 +2299,7 @@ IntervalTiming IntervalCoreModel::schedule(
         timing.spr_frontend_enabled = true;
         timing.spr_frontend_macro_begin = delivery.macro_begin;
         timing.spr_frontend_slot_cost = delivery.slot_cost;
+        timing.spr_frontend_model_batch_id = delivery.model_batch_id;
         timing.spr_frontend_source = delivery.source;
         timing.fetch_cycle = delivery.cycle;
         fetch_cycle_ = std::max(fetch_cycle_, delivery.cycle);
@@ -2019,6 +2368,32 @@ IntervalTiming IntervalCoreModel::schedule(
         timing.syscall_drain_cycles =
             rename_earliest - nominal_rename;
     }
+    if (config_.spr_rename_elimination) {
+        bool matching = false;
+        if (trace_source) {
+            auto found = spr_rename_policy_cache_.find(trace_source);
+            if (found == spr_rename_policy_cache_.end())
+                found = spr_rename_policy_cache_.emplace(trace_source,
+                    trace_source->static_uop_policy_identity() == config_.spr_rename_policy_sha256).first;
+            matching = found->second;
+        }
+        timing.rename_decision = spr_rename_decision(record, trace_source, matching,
+            config_.rename_free_list || config_.response_rename_feedback);
+        switch (timing.rename_decision.kind) {
+          case SprRenameKind::GprAlias: ++committed_pipeline_audit_.spr_rename_gpr_alias; break;
+          case SprRenameKind::XmmAlias: ++committed_pipeline_audit_.spr_rename_xmm_alias; break;
+          case SprRenameKind::Zero: ++committed_pipeline_audit_.spr_rename_zero; break;
+          case SprRenameKind::Execute:
+            switch (timing.rename_decision.reason) {
+              case SprRenameDecision::Reason::Missing: ++committed_pipeline_audit_.spr_rename_missing; break;
+              case SprRenameDecision::Reason::Shape: ++committed_pipeline_audit_.spr_rename_shape; break;
+              case SprRenameDecision::Reason::Pins: ++committed_pipeline_audit_.spr_rename_pins; break;
+              case SprRenameDecision::Reason::Resources: ++committed_pipeline_audit_.spr_rename_resources; break;
+              case SprRenameDecision::Reason::Ordinary: break;
+            }
+        }
+    }
+    const bool rename_eliminated = timing.rename_decision.eliminated();
     const auto destination_classes =
         record.destination_class_counts();
     if (config_.rename_free_list &&
@@ -2121,16 +2496,37 @@ IntervalTiming IntervalCoreModel::schedule(
             dispatch_gate = DispatchGate::kRob;
         }
     }
-    release_iq_through(dispatch_earliest);
-    if (iq_occupancy_ >= config_.iq_entries) {
-        const auto iq_ready = next_iq_release_cycle() +
-            config_.iew_to_rename +
-            config_.rename_to_dispatch;
-        if (iq_ready > dispatch_earliest) {
-            dispatch_earliest = iq_ready;
-            dispatch_gate = DispatchGate::kIq;
+    const auto iq_partition = spr_iq_partition(record.canonical_op_class());
+    if (rename_eliminated) {
+        // Allocation/ROB admission above remains live, but no IQ entry.
+    } else if (config_.spr_partitioned_iq) {
+        auto& releases = partition_iq_releases_[iq_partition];
+        const std::array<std::uint32_t, 3> capacities{
+            config_.spr_execution_iq_entries, config_.spr_memory_iq_entries,
+            config_.spr_store_data_iq_entries};
+        while (!releases.empty() && releases.top() <= dispatch_earliest)
+            releases.pop();
+        if (releases.size() >= capacities[iq_partition]) {
+            const auto iq_ready = releases.top() + config_.iew_to_rename +
+                config_.rename_to_dispatch;
+            if (iq_ready > dispatch_earliest) {
+                dispatch_earliest = iq_ready;
+                dispatch_gate = DispatchGate::kIq;
+            }
+            while (!releases.empty() && releases.top() <= dispatch_earliest)
+                releases.pop();
         }
+    } else {
         release_iq_through(dispatch_earliest);
+        if (iq_occupancy_ >= config_.iq_entries) {
+            const auto iq_ready = next_iq_release_cycle() +
+                config_.iew_to_rename + config_.rename_to_dispatch;
+            if (iq_ready > dispatch_earliest) {
+                dispatch_earliest = iq_ready;
+                dispatch_gate = DispatchGate::kIq;
+            }
+            release_iq_through(dispatch_earliest);
+        }
     }
     if (record.is_memory()) {
         const auto& queue = record.is_write()
@@ -2247,6 +2643,50 @@ IntervalTiming IntervalCoreModel::schedule(
         }
     }
     auto op = traits(record);
+    SprIntegerFamilyInput managed_input;
+    if (config_.spr_integer_family_enabled) {
+        using Route=IntervalTiming::IntegerRoute;
+        bool policy_matches=false;
+        if (trace_source) {
+            const auto found=spr_integer_family_policy_cache_.find(trace_source);
+            if(found!=spr_integer_family_policy_cache_.end()) policy_matches=found->second;
+            else {
+                policy_matches=trace_source->static_uop_policy_identity()==config_.spr_integer_family_policy_sha256;
+                spr_integer_family_policy_cache_.emplace(trace_source,policy_matches);
+            }
+        }
+        const auto input=SprIntegerFamilyInput::classify(
+            trace_source?trace_source->current_static_uop_facts():nullptr,policy_matches);
+        const auto* core_facts=trace_source?trace_source->current_core_functional_facts():nullptr;
+        if(input.status==SprIntegerFamilyInput::Status::Unknown) timing.spr_integer_route=Route::Unknown;
+        else if(input.status==SprIntegerFamilyInput::Status::StaticZero) timing.spr_integer_route=Route::StaticZeroFallback;
+        else if(!core_facts || !(core_facts->known_flags&fst::kCoreStaticKnown)) timing.spr_integer_route=Route::Unknown;
+        else if(core_facts->static_flags & (fst::kCoreFullGprMove|fst::kCoreFullXmmMove)) timing.spr_integer_route=Route::MoveFallback;
+        else if(has_flag(record.flags,kBranch)) timing.spr_integer_route=Route::FusionFallback;
+        else if(input.status==SprIntegerFamilyInput::Status::Generic) timing.spr_integer_route=Route::Generic;
+        else if(input.family==1 && !(core_facts->known_flags&fst::kCoreFusionKnown)) timing.spr_integer_route=Route::Unknown;
+        else if(input.family==1 && core_facts->fusion_producer_family) timing.spr_integer_route=Route::FusionFallback;
+        else {
+            const bool valid_shape =
+                (input.family==1 && input.candidates==0x863 && input.nominal_latency==1) ||
+                (input.family==2 && input.candidates==0x41 && input.nominal_latency==1) ||
+                (input.family==3 && input.candidates==0x2 && input.nominal_latency==3) ||
+                (input.family==4 && input.candidates==0x822 && input.nominal_latency==1) ||
+                (input.family==5 && (input.candidates==0x40 || input.candidates==0x41) && input.nominal_latency==1);
+            if(!valid_shape || record.is_memory() || record.is_syscall() ||
+               spr_issue_interval(record)!=1) timing.spr_integer_route=Route::Unknown;
+            else {timing.spr_integer_route=Route::Managed;managed_input=input;op.latency=input.nominal_latency;op.pipelined=true;}
+        }
+        switch(timing.spr_integer_route) {
+          case Route::Managed:++committed_pipeline_audit_.spr_integer_managed;break;
+          case Route::Generic:++committed_pipeline_audit_.spr_integer_generic;break;
+          case Route::Unknown:++committed_pipeline_audit_.spr_integer_unknown;break;
+          case Route::StaticZeroFallback:++committed_pipeline_audit_.spr_integer_zero_fallback;break;
+          case Route::MoveFallback:++committed_pipeline_audit_.spr_integer_move_fallback;break;
+          case Route::FusionFallback:++committed_pipeline_audit_.spr_integer_fusion_fallback;break;
+          case Route::Disabled:break;
+        }
+    }
     if (config_.software_prefetch_early_ack && trace_source != nullptr &&
         trace_source->current_memory_request_role() == fst::MemoryRequestRole::SoftwarePrefetch) {
         // This is an address-generation hint, not a load-result producer.
@@ -2306,8 +2746,12 @@ IntervalTiming IntervalCoreModel::schedule(
         dependency_ready = std::max(
             dependency_ready, completion_[index - distance]);
     };
-    for (const auto distance : record.producer_dists) observe_dependency(distance);
-    for (const auto distance : dependency_extensions) observe_dependency(distance);
+    if (rename_eliminated) {
+        for (const auto distance : timing.rename_decision.producers) observe_dependency(distance);
+    } else {
+        for (const auto distance : record.producer_dists) observe_dependency(distance);
+        for (const auto distance : dependency_extensions) observe_dependency(distance);
+    }
     if (observe_store_set && regular_load) {
         ++committed_pipeline_audit_.store_set_same_pc_load_candidates;
     } else if (observe_store_set && regular_store) {
@@ -2419,7 +2863,7 @@ IntervalTiming IntervalCoreModel::schedule(
                     extension);
         }
     }
-    if (static_dependency_feedback &&
+    if (!rename_eliminated && static_dependency_feedback &&
         static_dependency_available &&
         static_dependency_supplemental &&
         record.n_src > record.producer_dists.size()) {
@@ -2466,7 +2910,10 @@ IntervalTiming IntervalCoreModel::schedule(
                   page_walk_latency_override, trace_source);
     const auto issue_earliest =
         std::max(dependency_ready, translation_ready);
-    if (config_.committed_pipeline_audit ||
+    if (rename_eliminated) {
+        timing.fu_occupancy_cycles = 0;
+        timing.issue_cycle = issue_earliest;
+    } else if (config_.committed_pipeline_audit ||
         config_.fu_gap_aware_schedule) {
         // A future UOP can never request an issue slot before its monotone
         // dispatch lower bound. Retain reservations newer than that boundary,
@@ -2482,7 +2929,8 @@ IntervalTiming IntervalCoreModel::schedule(
             ++committed_pipeline_audit_.fu_gap_aware_scheduled_uops;
         } else {
             timing.issue_cycle = allocate_issue(
-                issue_earliest, op, record);
+                issue_earliest, op, record, dependency_base_ready,
+                timing.spr_integer_route==IntervalTiming::IntegerRoute::Managed ? &managed_input : nullptr);
             if (gap_issue > timing.issue_cycle) {
                 throw std::logic_error(
                     "legacy FU issue violates gap-calendar feasibility");
@@ -2509,11 +2957,12 @@ IntervalTiming IntervalCoreModel::schedule(
         }
     } else {
         timing.issue_cycle = allocate_issue(
-            issue_earliest, op, record);
+            issue_earliest, op, record, dependency_base_ready,
+            timing.spr_integer_route==IntervalTiming::IntegerRoute::Managed ? &managed_input : nullptr);
     }
-    timing.execute_cycle =
-        timing.issue_cycle + config_.issue_to_execute;
-    timing.completion_cycle = allocate_writeback(
+    timing.execute_cycle = timing.issue_cycle +
+        (rename_eliminated ? 0 : config_.issue_to_execute);
+    timing.completion_cycle = rename_eliminated ? timing.issue_cycle : allocate_writeback(
         timing.execute_cycle + op.latency);
     if (observe_store_set && regular_store) {
         same_pc_store_producers_[record.pc] = SamePcStoreProducer{
@@ -2549,7 +2998,12 @@ IntervalTiming IntervalCoreModel::schedule(
     }
     const auto iq_release_cycle =
         record.is_memory() ? timing.completion_cycle : timing.issue_cycle;
-    if (iq_release_cycle >= iq_release_cursor_) {
+    if (rename_eliminated) {
+        // Data readiness is not an IQ release or an ordinary writeback.
+    } else if (config_.spr_partitioned_iq) {
+        if (iq_release_cycle >= dispatch_earliest)
+            partition_iq_releases_[iq_partition].push(iq_release_cycle);
+    } else if (iq_release_cycle >= iq_release_cursor_) {
         if (iq_release_cycle >= iq_release_slots_.size()) {
             iq_release_slots_.resize(
                 static_cast<std::size_t>(iq_release_cycle + 1), 0);
@@ -2606,7 +3060,7 @@ IntervalTiming IntervalCoreModel::schedule(
         }
         const auto rob_residency =
             timing.retire_cycle - timing.dispatch_cycle;
-        const auto iq_residency =
+        const auto iq_residency = rename_eliminated ? 0 :
             iq_release_cycle - timing.dispatch_cycle;
         committed_pipeline_audit_.rob_residency_cycles += rob_residency;
         committed_pipeline_audit_.rob_max_residency_cycles = std::max(
@@ -3068,6 +3522,21 @@ void IntervalCoreModel::inject_kernel_pause(
 
 void IntervalCoreModel::reset_measurement_audit() {
     if (spr_frontend_) spr_frontend_->reset_counters();
+    committed_pipeline_audit_.spr_rename_gpr_alias = 0;
+    committed_pipeline_audit_.spr_rename_xmm_alias = 0;
+    committed_pipeline_audit_.spr_rename_zero = 0;
+    committed_pipeline_audit_.spr_rename_missing = 0;
+    committed_pipeline_audit_.spr_rename_shape = 0;
+    committed_pipeline_audit_.spr_rename_pins = 0;
+    committed_pipeline_audit_.spr_rename_resources = 0;
+    if (config_.spr_integer_family_enabled) {
+        committed_pipeline_audit_.spr_integer_managed=0;
+        committed_pipeline_audit_.spr_integer_generic=0;
+        committed_pipeline_audit_.spr_integer_unknown=0;
+        committed_pipeline_audit_.spr_integer_zero_fallback=0;
+        committed_pipeline_audit_.spr_integer_move_fallback=0;
+        committed_pipeline_audit_.spr_integer_fusion_fallback=0;
+    }
     if (!config_.committed_pipeline_audit &&
         !config_.rename_free_list &&
         !config_.fu_gap_aware_schedule) return;

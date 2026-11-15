@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <queue>
 #include <unordered_map>
@@ -15,7 +16,13 @@
 #include "fastsim/config.hpp"
 #include "fastsim/types.hpp"
 #include "fastsim/op_traits.hpp"
+#include "fastsim/spr_port_calendar.hpp"
+#include "fastsim/spr_fu_round_robin.hpp"
+#include "fastsim/spr_integer_family_arbiter.hpp"
+#include "fastsim/spr_integer_family_input.hpp"
+#include "fastsim/spr_rename_elimination.hpp"
 #include "fastsim/fst_translation_facts.hpp"
+#include "fastsim/spr_stlb.hpp"
 
 namespace fastsim {
 
@@ -23,9 +30,19 @@ class TraceSource;
 
 
 struct IntervalTiming {
+    SprRenameDecision rename_decision;
+    std::uint32_t spr_dtlb_stlb_hits = 0, spr_dtlb_stlb_misses = 0;
+    std::uint32_t spr_dtlb_stlb_fallbacks = 0, spr_dtlb_stlb_flushes = 0;
+    std::uint32_t spr_dtlb_stlb_missing_controls = 0;
+    std::uint32_t spr_dtlb_stlb_unqualified_boundary = 0;
+    std::uint32_t spr_itlb_hits = 0, spr_itlb_stlb_hits = 0, spr_itlb_stlb_misses = 0, spr_itlb_unknown = 0;
+    enum class IntegerRoute : std::uint8_t {Disabled,Managed,Generic,Unknown,
+                                            StaticZeroFallback,MoveFallback,FusionFallback};
+    IntegerRoute spr_integer_route = IntegerRoute::Disabled;
     bool spr_frontend_enabled = false;
     bool spr_frontend_macro_begin = false;
     std::uint32_t spr_frontend_slot_cost = 0;
+    std::uint64_t spr_frontend_model_batch_id = 0; // 0 = unavailable; model-owned only
     SprFrontendSource spr_frontend_source = SprFrontendSource::Mite;
     struct TranslationWalk {
         fst::TranslationMapping mapping;
@@ -322,7 +339,9 @@ class IntervalCoreModel {
     std::uint64_t allocate_dispatch(std::uint64_t earliest);
     std::uint64_t allocate_issue(std::uint64_t earliest,
                                  const OpTraits& traits,
-                                 const TraceRecord& record);
+                                 const TraceRecord& record,
+                                 std::uint64_t dispatch_lower_bound,
+                                 const SprIntegerFamilyInput* managed = nullptr);
     std::uint64_t find_gap_aware_issue(std::uint64_t earliest,
                                        const OpTraits& traits,
                                        const TraceRecord& record) const;
@@ -395,6 +414,11 @@ class IntervalCoreModel {
     // interval feedback path.
     std::uint64_t iq_release_cursor_ = 0;
     std::uint64_t iq_occupancy_ = 0;
+    // Bounded by the configured partition capacities; releases are ordered
+    // by issue/completion, without advancing a cycle-by-cycle simulator.
+    using IqReleaseHeap = std::priority_queue<std::uint64_t,
+        std::vector<std::uint64_t>, std::greater<std::uint64_t>>;
+    std::array<IqReleaseHeap, 3> partition_iq_releases_;
     std::vector<std::uint64_t> load_retirement_;
     std::vector<std::uint64_t> store_retirement_;
     using DestinationRelease =
@@ -451,6 +475,12 @@ class IntervalCoreModel {
     // Physical shared-port availability and per-port/per-op issue interval.
     std::array<std::uint64_t, 12> spr_port_ready_{};
     std::array<std::array<std::uint64_t, 128>, 12> spr_port_next_op_{};
+    std::array<SprPortCalendar, 12> spr_port_calendar_{};
+    std::array<std::array<SprPortCalendar, 128>, 12> spr_port_op_calendar_{};
+    SprFuRoundRobin spr_fu_round_robin_;
+    std::unique_ptr<SprIntegerFamilyArbiter> spr_integer_family_;
+    std::unordered_map<const TraceSource*,bool> spr_integer_family_policy_cache_;
+    std::unordered_map<const TraceSource*,bool> spr_rename_policy_cache_;
     struct FuOccupancyCalendar {
         std::uint64_t begin_cycle = 0;
         std::deque<std::uint32_t> slots;
@@ -593,7 +623,24 @@ class IntervalCoreModel {
     std::unordered_map<DtlbKey, fst::TranslationMapping, DtlbKeyHash> dynamic_dtlb_mappings_;
     std::unordered_map<DtlbKey, std::uint64_t, DtlbKeyHash> dynamic_dtlb_versions_;
     std::unordered_map<DtlbKey, std::uint64_t, DtlbKeyHash> outstanding_dynamic_walks_;
+    // Only these keys can have lost their last residency/walk reference.
+    // Drain at the original GC boundaries; snapshots copy the queue too.
+    std::vector<DtlbKey> translation_reclaim_candidates_;
     bool dynamic_translation_mode_ = false;
+    std::unique_ptr<SprStlb> spr_dtlb_stlb_;
+    bool spr_dtlb_stlb_source_usable_ = false;
+    // Valid only for the current retained record after the complete control
+    // stream has established its CR3/CR4 state.
+    std::optional<std::uint16_t> spr_dtlb_stlb_current_pcid_;
+    bool spr_dtlb_stlb_has_entries_ = false;
+    // SPR config.ini ITLB: 256 entries, 8 ways, 32 sets, 4K subdomain.
+    struct RetiredItlbEntry { std::uint64_t asid=0,page=0,physical_base=0,walk_root=0; bool valid=false,global=false; std::uint8_t page_bits=12; };
+    std::array<std::array<RetiredItlbEntry,8>,32> spr_retired_itlb_{};
+    RetiredItlbEntry spr_fetch_buffer_mapping_{};
+    struct RetiredItlbPoolEntry { RetiredItlbEntry entry; std::uint64_t lru=0; };
+    std::array<RetiredItlbPoolEntry,256> spr_retired_itlb_pool_{};
+    std::uint64_t spr_retired_itlb_lru_=0;
+    void clear_retired_itlb();
     std::uint64_t dtlb_sequence_ = 0;
     std::uint64_t dtlb_fill_generation_sequence_ = 0;
     std::uint64_t active_address_space_id_ = 0;

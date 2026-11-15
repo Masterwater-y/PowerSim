@@ -6,8 +6,9 @@
 
 namespace fastsim {
 
-SetAssociativeCache::SetAssociativeCache(const CacheConfig& config)
-    : config_(config) {
+SetAssociativeCache::SetAssociativeCache(const CacheConfig& config,
+                                         bool spr_llc_index)
+    : config_(config), spr_llc_index_(spr_llc_index) {
     const auto denominator =
         static_cast<std::uint64_t>(config.associativity) * config.line_size;
     set_count_ = static_cast<std::uint32_t>(config.size_bytes / denominator);
@@ -25,16 +26,18 @@ std::uint32_t SetAssociativeCache::set_of(std::uint64_t line) const {
     // `line & (set_count_ - 1)` mask.  `tag_of`/`line_of` already use the
     // matching division/multiplication, so the (tag, set) decomposition stays
     // consistent whether or not set_count_ is a power of two.
-    return cache_set_index(line, set_count_);
+    return cache_set_index(spr_llc_index_ ? spr_llc_mix_line(line) : line,
+                           set_count_);
 }
 
 std::uint64_t SetAssociativeCache::tag_of(std::uint64_t line) const {
-    return line / set_count_;
+    return (spr_llc_index_ ? spr_llc_mix_line(line) : line) / set_count_;
 }
 
 std::uint64_t SetAssociativeCache::line_of(std::uint32_t set,
                                            std::uint64_t tag) const {
-    return tag * set_count_ + set;
+    const auto mapped = tag * set_count_ + set;
+    return spr_llc_index_ ? spr_llc_unmix_line(mapped) : mapped;
 }
 
 CacheLine* SetAssociativeCache::set_base(std::uint32_t set) {
@@ -84,7 +87,13 @@ void SetAssociativeCache::snapshot_if_needed(
 }
 
 void SetAssociativeCache::restore(const CacheTransaction& transaction) {
-    for (const auto& snapshot : transaction.snapshots) {
+    // An intervening transaction can change a set's snapshot-generation
+    // marker, causing this transaction to save that set more than once.
+    // Undo in reverse order so the earliest image wins on rollback. This
+    // does not enroll untouched inner-transaction sets in an outer undo log.
+    for (auto it = transaction.snapshots.rbegin();
+         it != transaction.snapshots.rend(); ++it) {
+        const auto& snapshot = *it;
         assert(snapshot.ways_offset + config_.associativity <=
                transaction.ways_before.size());
         auto* base = set_base(snapshot.set);
@@ -99,6 +108,14 @@ void SetAssociativeCache::restore(const CacheTransaction& transaction) {
 PreparedCacheLookup SetAssociativeCache::prepare_lookup(
     std::uint64_t line) const {
     return prepare_lookup_indexed(line, line);
+}
+
+CacheAccessResult SetAssociativeCache::preview_fill_victim(std::uint64_t line) const {
+    if (contains(line)) return CacheAccessResult{true, false, false, 0};
+    const auto set = set_of(line);
+    const auto& victim = set_base(set)[choose_victim(set)];
+    if (!victim.valid) return {};
+    return CacheAccessResult{false, true, victim.dirty, line_of(set, victim.tag)};
 }
 
 PreparedCacheLookup SetAssociativeCache::prepare_lookup_indexed(
@@ -309,10 +326,12 @@ CacheAccessResult SetAssociativeCache::install(
         result.evicted_dirty = base[victim].dirty;
         result.evicted_line = line_of(set, base[victim].tag);
         ++counters.evictions;
+        if(base[victim].prefetched)++counters.unused_prefetch_evictions;
         if (base[victim].dirty) ++counters.writebacks;
     }
     base[victim].valid = true;
     base[victim].dirty = write;
+    base[victim].prefetched = false;
     base[victim].tag = tag;
     base[victim].age =
         static_cast<std::uint8_t>(config_.associativity - 1);
@@ -327,6 +346,36 @@ bool SetAssociativeCache::contains(std::uint64_t line) const {
     const auto* base = set_base(set);
     for (std::uint32_t way = 0; way < config_.associativity; ++way) {
         if (base[way].valid && base[way].tag == tag) return true;
+    }
+    return false;
+}
+
+bool SetAssociativeCache::mark_prefetched(std::uint64_t line, CacheTransaction* transaction) {
+    const auto set=set_of(line);
+    const auto tag=tag_of(line);
+    auto* base=set_base(set);
+    for(std::uint32_t way=0;way<config_.associativity;++way) {
+        if(base[way].valid && base[way].tag==tag) {
+            snapshot_if_needed(set,transaction);
+            base[way].prefetched=true;
+            note_mutation(set);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SetAssociativeCache::consume_prefetched(std::uint64_t line, CacheTransaction* transaction) {
+    const auto set=set_of(line);
+    const auto tag=tag_of(line);
+    auto* base=set_base(set);
+    for(std::uint32_t way=0;way<config_.associativity;++way) {
+        if(base[way].valid && base[way].tag==tag && base[way].prefetched) {
+            snapshot_if_needed(set,transaction);
+            base[way].prefetched=false;
+            note_mutation(set);
+            return true;
+        }
     }
     return false;
 }
@@ -354,6 +403,7 @@ bool SetAssociativeCache::invalidate(std::uint64_t line, bool* dirty,
             if (dirty != nullptr) *dirty = base[way].dirty;
             base[way].valid = false;
             base[way].dirty = false;
+            base[way].prefetched = false;
             note_mutation(set);
             return true;
         }
@@ -371,6 +421,9 @@ void SetAssociativeCache::mark_dirty(std::uint64_t line,
         if (base[way].valid && base[way].tag == tag) {
             snapshot_if_needed(set, transaction);
             base[way].dirty = true;
+            // A modeled write/publication consumes a prefetch mark even if
+            // it bypasses the demand replay entry point (buffered TSO).
+            base[way].prefetched = false;
             note_mutation(set);
             return;
         }
@@ -423,6 +476,16 @@ PreparedPrivateLookup PrivateHierarchy::prepare_probe(
 PreparedCacheLookup PrivateHierarchy::prepare_probe_l2(
     std::uint64_t line) const {
     return l2_.prepare_lookup(line);
+}
+
+bool PrivateHierarchy::l2_prefetch_safe_victim(std::uint64_t line) const {
+    const auto victim = l2_.preview_fill_victim(line);
+    return !victim.evicted || (!victim.evicted_dirty && !l1_.dirty(victim.evicted_line));
+}
+
+bool PrivateHierarchy::l1_prefetch_safe_victim(std::uint64_t line) const {
+    const auto victim = l1_.preview_fill_victim(line);
+    return !victim.evicted || !victim.evicted_dirty || l2_.contains(victim.evicted_line);
 }
 
 bool PrivateHierarchy::can_commit(
@@ -545,6 +608,32 @@ PrivateAccessResult PrivateHierarchy::complete_fill(
     return result;
 }
 
+PrefetchPublicationResult PrivateHierarchy::publish_prefetch_fill(
+    std::uint64_t line, std::uint64_t issue, std::uint64_t completion,
+    std::uint64_t now, bool permission_valid, CoreCounters& counters,
+    PrivateTransaction* transaction) {
+    if (completion < issue) {
+        throw std::invalid_argument("prefetch completion precedes issue");
+    }
+    if (now < completion) return {PrefetchPublicationStatus::kNotReady, {}};
+    if (!permission_valid) return {PrefetchPublicationStatus::kPermissionLost, {}};
+    return {PrefetchPublicationStatus::kPublished,
+            complete_fill(line, false, counters, transaction)};
+}
+
+PrefetchPublicationResult PrivateHierarchy::publish_prefetch_fill_l2(
+    std::uint64_t line, std::uint64_t issue, std::uint64_t completion,
+    std::uint64_t now, bool permission_valid, CacheCounters& counters,
+    PrivateTransaction* transaction) {
+    if (completion < issue) {
+        throw std::invalid_argument("prefetch completion precedes issue");
+    }
+    if (now < completion) return {PrefetchPublicationStatus::kNotReady, {}};
+    if (!permission_valid) return {PrefetchPublicationStatus::kPermissionLost, {}};
+    return {PrefetchPublicationStatus::kPublished,
+            complete_fill_l2(line, counters, transaction)};
+}
+
 PrivateAccessResult PrivateHierarchy::complete_fill_l2(
     std::uint64_t line, CacheCounters& counters,
     PrivateTransaction* transaction) {
@@ -598,6 +687,21 @@ bool PrivateHierarchy::invalidate(std::uint64_t line,
     const bool l1_found = l1_.invalidate(line, &l1_dirty, l1_txn);
     const bool l2_found = l2_.invalidate(line, &l2_dirty, l2_txn);
     return l1_found || l2_found || l1_dirty || l2_dirty;
+}
+
+bool PrivateHierarchy::mark_l1_prefetched(std::uint64_t line, PrivateTransaction* transaction) {
+    return l1_.mark_prefetched(line,transaction ? &transaction->l1 : nullptr);
+}
+bool PrivateHierarchy::consume_l1_prefetched(std::uint64_t line, PrivateTransaction* transaction) {
+    return l1_.consume_prefetched(line,transaction ? &transaction->l1 : nullptr);
+}
+
+bool PrivateHierarchy::mark_l2_prefetched(std::uint64_t line, PrivateTransaction* transaction) {
+    return l2_.mark_prefetched(line,transaction ? &transaction->l2 : nullptr);
+}
+
+bool PrivateHierarchy::consume_l2_prefetched(std::uint64_t line, PrivateTransaction* transaction) {
+    return l2_.consume_prefetched(line,transaction ? &transaction->l2 : nullptr);
 }
 
 bool PrivateHierarchy::contains(std::uint64_t line) const {

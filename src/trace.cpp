@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <future>
@@ -2166,12 +2168,115 @@ void BinaryTraceSource::read_dependency_row() {
 }
 
 std::optional<bool> BinaryTraceSource::current_ordinary_load_eligible() const {
-    const auto* row=store_facts_reader_?store_facts_reader_->current():nullptr;
+    const auto* row=current_memory_facts();
     if (!row || !(row->attributes&fst::kStoreFactsComplete) || !(row->attributes&fst::kMemoryRead))
         return std::nullopt;
     return bool(row->attributes&fst::kOrdinaryLoad);
 }
+void BinaryTraceSource::preload_validated() {
+    if (records_read_ || preloaded_)
+        throw std::logic_error("preload requires a fresh binary source");
+    // These newer lifecycle readers have not been implemented in this
+    // diagnostic cache. Refuse them rather than lose functional metadata.
+    if (core_functional_reader_ || mmu_control_reader_ ||
+        mmu_control_v2_reader_ || architectural_boundary_reader_)
+        throw std::runtime_error("preload unsupported core/MMU/boundary companions: " + path_);
+    cached_records_.reserve(static_cast<std::size_t>(record_count_));
+    if (static_uop_reader_) cached_uops_.reserve(static_cast<std::size_t>(record_count_));
+    TraceRecord record;
+    while (next(record)) {
+        CachedRecord row;
+        row.record = record;
+        if (current_frontend_macro_) {
+            if (cached_frontend_.empty() ||
+                cached_frontend_.back().begin_record != current_frontend_macro_->begin_record)
+                cached_frontend_.push_back(*current_frontend_macro_);
+            row.frontend_index = cached_frontend_.size() - 1;
+        }
+        if (const auto* uop = current_static_uop_facts()) {
+            row.uop_index = cached_uops_.size();
+            cached_uops_.push_back(*uop);  // Keep ordinal, hashes and all dynamic fields.
+        }
+        const auto& operands = current_static_uop_operands();
+        if (operands.size() > UINT32_MAX || current_dependency_extensions_.size() > UINT32_MAX)
+            throw std::runtime_error("preloaded operand/dependency count overflow: " + path_);
+        row.operand_begin = cached_operand_data_.size();
+        row.operand_count = static_cast<std::uint32_t>(operands.size());
+        cached_operand_data_.insert(cached_operand_data_.end(), operands.begin(), operands.end());
+        row.dependency_begin = cached_dependency_data_.size();
+        row.dependency_count = static_cast<std::uint32_t>(current_dependency_extensions_.size());
+        cached_dependency_data_.insert(cached_dependency_data_.end(),
+                                      current_dependency_extensions_.begin(),
+                                      current_dependency_extensions_.end());
+        const auto* memory = current_memory_facts();
+        const auto translation_ordinal = current_translation_record_ordinal();
+        const auto translation_asid = current_translation_retirement_asid();
+        if (memory || !translation_fragments_.empty() || translation_ordinal || translation_asid) {
+            CachedMemory payload;
+            if (memory) payload.memory = *memory;
+            payload.translations = translation_fragments_;
+            payload.translation_ordinal = translation_ordinal;
+            payload.translation_asid = translation_asid;
+            row.memory_index = cached_memory_.size();
+            cached_memory_.push_back(std::move(payload));
+        }
+        row.fetch = current_instruction_fetch_;
+        row.syscall = current_syscall_metadata_;
+        row.asid = current_address_space_id_;
+        row.role = current_memory_request_role_;
+        row.micro_pc = current_memory_request_micro_pc_;
+        row.hardware_entry = current_hardware_entry_;
+        row.precise_fault = current_precise_fault_abandonment_;
+        cached_records_.push_back(std::move(row));
+    }
+    if (cached_records_.size() != record_count_)
+        throw std::runtime_error("preloaded record population mismatch: " + path_);
+    // next() above reached EOF, including each companion footer check.
+    // No source file is read again during replay.
+    records_read_ = 0;
+    current_address_space_id_ = 0;
+    current_frontend_macro_ = nullptr;
+    current_instruction_fetch_.reset();
+    current_syscall_metadata_ = nullptr;
+    current_memory_request_role_.reset();
+    current_memory_request_micro_pc_ = 0;
+    current_hardware_entry_ = current_precise_fault_abandonment_ = false;
+    translation_fragments_.clear();
+    current_dependency_extensions_.clear();
+    active_instruction_page_mappings_.clear();
+    instruction_page_mapping_cursor_ = 0;
+    preloaded_ = true;
+}
 bool BinaryTraceSource::next(TraceRecord& record) {
+    if (preloaded_) {
+        cached_current_ = nullptr;
+        current_frontend_macro_ = nullptr;
+        current_instruction_fetch_.reset();
+        current_syscall_metadata_ = nullptr;
+        current_memory_request_role_.reset();
+        current_memory_request_micro_pc_ = 0;
+        current_hardware_entry_ = current_precise_fault_abandonment_ = false;
+        if (records_read_ == cached_records_.size()) return false;
+        const auto& row = cached_records_[static_cast<std::size_t>(records_read_)];
+        cached_current_ = &row;
+        record = row.record;
+        current_address_space_id_ = row.asid;
+        current_frontend_macro_ = row.frontend_index != kNoCacheIndex
+            ? &cached_frontend_[row.frontend_index] : nullptr;
+        current_instruction_fetch_ = row.fetch;
+        current_syscall_metadata_ = row.syscall;
+        current_memory_request_role_ = row.role;
+        current_memory_request_micro_pc_ = row.micro_pc;
+        current_hardware_entry_ = row.hardware_entry;
+        current_precise_fault_abandonment_ = row.precise_fault;
+        while (instruction_page_mapping_cursor_ < instruction_page_mappings_.size() &&
+               instruction_page_mappings_[instruction_page_mapping_cursor_].record_ordinal == records_read_) {
+            const auto& mapping = instruction_page_mappings_[instruction_page_mapping_cursor_++];
+            active_instruction_page_mappings_[{mapping.address_space_id, mapping.virtual_page}] = &mapping;
+        }
+        ++records_read_;
+        return true;
+    }
     if (core_functional_reader_) core_functional_reader_->clear_current();
     if (mmu_control_reader_) mmu_control_reader_->clear_current();
     if (mmu_control_v2_reader_) mmu_control_v2_reader_->clear_current();
@@ -2526,6 +2631,14 @@ ScoreRangeTraceSource::ScoreRangeTraceSource(
       begin_(begin), end_(end), execution_(execution) {
     if (begin == 0 || begin >= end || end > execution)
         throw std::invalid_argument("invalid fixed-work score range");
+    // This wrapper replays from ordinal zero. Initial events are usable only
+    // when the underlying reader will deliver their operations before row 0.
+    boundary_bundle_ready_ = source_->architectural_boundary_bundle_ready();
+    for (const auto& event : source_->initial_architectural_boundaries()) {
+        if (event.terminal.status != 1 || event.terminal.entry_begin != 0 ||
+            !event.operations.has_value())
+            boundary_bundle_ready_ = false;
+    }
 }
 
 bool ScoreRangeTraceSource::next(TraceRecord& record) {
@@ -3871,6 +3984,19 @@ std::vector<TraceManifestEntry> read_trace_manifest(
 
 std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
     const std::string& manifest_path, std::uint32_t maximum_cores) {
+    bool preload_validated = false;
+    if (const char* value = std::getenv("FASTSIM_PRELOAD_VALIDATED")) {
+        const std::string setting(value);
+        if (setting != "0" && setting != "1")
+            throw std::invalid_argument("FASTSIM_PRELOAD_VALIDATED must be 0 or 1");
+        preload_validated = setting == "1";
+    }
+    return open_trace_manifest(manifest_path, maximum_cores, preload_validated);
+}
+
+std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
+    const std::string& manifest_path, std::uint32_t maximum_cores,
+    bool preload_validated) {
     auto entries = read_trace_manifest(manifest_path);
     if (entries.empty() || entries.size() > maximum_cores) {
         throw std::runtime_error(
@@ -3882,9 +4008,23 @@ std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
               [](const auto& left, const auto& right) {
                   return left.core_id < right.core_id;
               });
-    const auto open_source = [](const TraceManifestEntry& entry,
-                                std::uint32_t core)
-        -> std::unique_ptr<TraceSource> {
+    std::size_t workers = 4;
+    if (const char* value = std::getenv("FASTSIM_TRACE_OPEN_WORKERS")) {
+        const char* end = value + std::strlen(value);
+        const auto result = std::from_chars(value, end, workers);
+        if (result.ec != std::errc{} || result.ptr != end ||
+            workers == 0 || workers > 64) {
+            throw std::invalid_argument(
+                "FASTSIM_TRACE_OPEN_WORKERS must be an integer from 1 to 64");
+        }
+    }
+    workers = std::min(workers, entries.size());
+
+    // Every source owns its readers and verification state. Do not publish a
+    // partially opened source; get() below preserves the original core order
+    // and selects the same earliest error as the sequential implementation.
+    const auto open_one = [&](std::uint32_t core) -> std::unique_ptr<TraceSource> {
+        const auto& entry = entries[core];
         if (entry.core_id != core) {
             throw std::runtime_error(
                 "trace manifest core IDs must be dense starting at zero");
@@ -3906,6 +4046,7 @@ std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
                    entry.format == "fastsim-binary-context-v1" ||
                    entry.format == "fastsim-binary-score-range-v1") {
             auto source = std::make_unique<BinaryTraceSource>(entry.path);
+            if (preload_validated) source->preload_validated();
             const auto expected_source_core =
                 entry.has_source_core_id ? entry.source_core_id : core;
             if (source->core_id() != expected_source_core) {
@@ -3953,21 +4094,23 @@ std::vector<std::unique_ptr<TraceSource>> open_trace_manifest(
     };
     std::vector<std::unique_ptr<TraceSource>> sources;
     sources.reserve(entries.size());
-    if (entries.size() == 1) {
-        sources.push_back(open_source(entries.front(), 0));
-        return sources;
+    if (workers == 1) {
+        for (std::size_t core = 0; core < entries.size(); ++core)
+            sources.push_back(open_one(static_cast<std::uint32_t>(core)));
+    } else {
+        for (std::size_t begin = 0; begin < entries.size(); begin += workers) {
+            const auto end = std::min(begin + workers, entries.size());
+            std::vector<std::future<std::unique_ptr<TraceSource>>> pending;
+            pending.reserve(end - begin);
+            for (std::size_t core = begin; core < end; ++core) {
+                pending.push_back(std::async(std::launch::async, [&, core] {
+                    return open_one(static_cast<std::uint32_t>(core));
+                }));
+            }
+            for (auto& source : pending)
+                sources.push_back(source.get());
+        }
     }
-    // A source and all of its companions are independent of the other
-    // sources. Preserve manifest order when collecting results and errors;
-    // futures join their tasks before entries or completed sources are freed.
-    std::vector<std::future<std::unique_ptr<TraceSource>>> pending;
-    pending.reserve(entries.size());
-    for (std::uint32_t core = 0; core < entries.size(); ++core) {
-        pending.push_back(std::async(std::launch::async, [&entries, core, &open_source] {
-            return open_source(entries[core], core);
-        }));
-    }
-    for (auto& result : pending) sources.push_back(result.get());
     return sources;
 }
 

@@ -373,13 +373,19 @@ def boot_script(args):
         lines.append(guest_housekeeping_script(args.housekeeping_cpu))
     if rate_copies:
         native_workers = getattr(args, 'native_workers', 0)
-        cpus = ','.join(str(c) for c in range(args.omp_threads if native_workers else rate_copies))
+        count = args.omp_threads if native_workers else rate_copies
+        selected = getattr(args, 'participant_core_ids', list(range(count)))
+        if len(selected) < count:
+            raise ValueError('participant CPU list is shorter than the rate worker count')
+        cpus = ','.join(str(c) for c in selected[:count])
         native = f' --native-workers {native_workers}' if native_workers else ''
         private = ' --private-cwd' if getattr(args, 'rate_private_cwd', False) else ''
         prefix = env_str + ' ' if env_str else ''
         lines.append(f"{prefix}/tmp/run/rate-launcher --cpus {cpus}{native}{private} -- /tmp/run/workload {args.workload_args}")
     else:
-        lines.append(f"{env_str} /tmp/run/workload {args.workload_args}")
+        selected = getattr(args, 'participant_core_ids', None)
+        affinity = ('taskset -c ' + ','.join(map(str, selected)) + ' ') if selected else ''
+        lines.append(f"{env_str} {affinity}/tmp/run/workload {args.workload_args}")
     lines.append('echo "[fastsim-fs] workload returned $?"')
     lines.append("m5 exit")
     return "\n".join(lines) + "\n"
@@ -501,7 +507,7 @@ def validate_rate_options(args):
     if getattr(args, 'native_omp_num_threads', False) and not native_workers:
         raise ValueError('native thread-count environment requires native tasks')
     housekeeping = getattr(args, 'housekeeping_cpu', None)
-    if housekeeping is not None and (not args.rate_copies or not 0 <= housekeeping < args.omp_threads + args.extra_cores):
+    if housekeeping is not None and (not 0 <= housekeeping < args.omp_threads + args.extra_cores):
         raise ValueError('housekeeping CPU must be a configured rate guest CPU')
     if args.rate_copies:
         if (not native_workers and args.rate_copies != args.omp_threads) or not args.rate_launcher:
