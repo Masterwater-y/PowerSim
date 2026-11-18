@@ -111,5 +111,68 @@ int main() {
  s.facts.clear();bool rejected=false;
  try {(void)pending.schedule(load(0x9000),false,false,0,false,&s,nullptr,0x1000);}catch(const std::runtime_error&){rejected=true;}
  assert(rejected);
+ // Functional-only STLB must work without MMU controls or native outcomes.
+ auto functional=c;functional.dtlb.functional_model=true;functional.dtlb.entries=1;
+ functional.dtlb.page_walkers=4;functional.validate();IntervalCoreModel fm(functional);
+ s.page(0x400000,0x800000,12);
+ auto cold=fm.schedule(load(0x800000),false,false,0,false,&s,nullptr,0x1000);
+ assert(cold.spr_dtlb_stlb_misses==1 && cold.functional_walk_physical==1);
+ fm.set_frontend_floor(cold.translation_ready_cycle+100);
+ s.page(0x500000,0x900000,12);s.facts[0].mapping.flags=1;s.facts[0].mapping.levels=0;
+ auto structural=fm.schedule(load(0x900000),false,false,0,false,&s,nullptr,0x1000);
+ assert(structural.functional_walk_structural==1);
+ fm.set_frontend_floor(structural.translation_ready_cycle+100);
+ auto hit=issue(fm,s,0x400000,0x800000,12);
+ assert(hit.spr_dtlb_stlb_hits==1 && hit.functional_walk_physical==0);
+ fm.set_frontend_floor(hit.translation_ready_cycle+100);
+ auto changed_mapping=issue(fm,s,0x400000,0xa00000,12);
+ assert(changed_mapping.spr_dtlb_stlb_hits==0);
+ // A finite pending budget applies backpressure rather than dropping members.
+ functional.dtlb.max_pending_translations=4;functional.dtlb.coalesce_misses=false;
+ IntervalCoreModel bounded(functional);uint64_t backpressure=0;
+ for(unsigned i=0;i<32;++i) {
+  auto t=issue(bounded,s,0x1000000+i*4096,0x2000000+i*4096,12);
+  backpressure+=t.functional_pending_wait_cycles;
+  assert(t.translation_ready_cycle>=t.dtlb_lookup_cycle);
+ }
+ assert(backpressure>0);
+ // Legacy functional VA tokens also work without any sidecar source.
+ IntervalCoreModel token_only(functional);
+ const auto token_walk=token_only.schedule(load(0x700000,17),false,false,0,false,nullptr,nullptr,0x1000);
+ assert(token_walk.functional_walk_structural==1);
+ IntervalCoreModel physical_only(functional);auto pa_only=load(0x710000);
+ pa_only.flags &= ~kVirtualPageToken;pa_only.reserved=0;
+ const auto proxy=physical_only.schedule(pa_only,false,false,0,false,nullptr,nullptr,0x1000);
+ assert(proxy.functional_walk_structural==1 && proxy.spr_dtlb_stlb_fallbacks==1);
+ assert(!proxy.dtlb_untracked);
+ IntervalCoreModel unknown_leaf(functional);s.page(0x800000,0x900000,12);
+ s.facts[0].mapping.flags=0;s.facts[0].mapping.page_bits=0;s.facts[0].mapping.levels=0;
+ const auto leaf_proxy=unknown_leaf.schedule(load(0x900000),false,false,0,false,&s,nullptr,0x1000);
+ assert(leaf_proxy.functional_walk_structural==1 && leaf_proxy.spr_dtlb_stlb_fallbacks==1);
+ // A late dependent lookup must not serialize the next independent lookup.
+ functional.dtlb.max_pending_translations=512;IntervalCoreModel overlap(functional);
+ s.page(0x1000000,0x2000000,12);
+ (void)overlap.schedule(load(0x2000000),false,false,0,false,&s,nullptr,0x1000);
+ auto dependent=load(0x3000000);dependent.n_src=1;dependent.producer_dists[0]=1;
+ s.page(0x2000000,0x3000000,12);
+ (void)overlap.schedule(dependent,false,false,0,false,&s,nullptr,0x1000);
+ s.page(0x1000000,0x2000000,12);
+ const auto independent=overlap.schedule(load(0x2000000),false,false,0,false,&s,nullptr,0x1000);
+ assert(independent.functional_pending_wait_cycles==0);
+ assert(!independent.dtlb_timing_hit && independent.spr_dtlb_stlb_hits==0);
+ // The legacy aggregate delay is not a calibration knob for this model.
+ auto short_fixed=functional;short_fixed.dtlb.page_walk_latency=1;
+ auto long_fixed=functional;long_fixed.dtlb.page_walk_latency=999;
+ IntervalCoreModel short_model(short_fixed),long_model(long_fixed);
+ assert(issue(short_model,s,0x6000000,0x7000000,12).translation_ready_cycle==
+        issue(long_model,s,0x6000000,0x7000000,12).translation_ready_cycle);
+ // Without complete MMU controls global mappings remain ASID scoped.
+ IntervalCoreModel scoped(functional);s.page(0x8000000,0x9000000,12);
+ s.facts[0].mapping.flags|=fst::kTranslationGlobal;
+ const auto global_first=scoped.schedule(load(0x9000000),false,false,0,false,&s,nullptr,0x1000);
+ scoped.set_frontend_floor(global_first.translation_ready_cycle+100);
+ s.facts[0].mapping.address_space_id=0x2000;
+ const auto global_other=scoped.schedule(load(0x9000000),false,false,0,false,&s,nullptr,0x2000);
+ assert(!global_other.dtlb_timing_hit && global_other.spr_dtlb_stlb_hits==0);
  std::cout<<"dynamic DTLB tests passed\n";
 }

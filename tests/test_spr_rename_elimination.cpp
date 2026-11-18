@@ -20,6 +20,7 @@ class RenameTrace final : public TraceSource {
     bool core_available = false;
     bool available = true;
     mutable unsigned policy_reads = 0;
+    unsigned semantics_version = 1;
     unsigned cursor = 0;
     bool next(TraceRecord& record) override {
         if (cursor == records.size()) return false;
@@ -48,6 +49,7 @@ class RenameTrace final : public TraceSource {
     }
     std::string description() const override { return "rename-functional-fixture"; }
     std::string static_uop_policy_identity() const override { ++policy_reads; return std::string(64, 'a'); }
+    unsigned static_uop_semantics_version() const override { return semantics_version; }
     const fst::StaticUopFactsRow* current_static_uop_facts() const override { return available ? &facts : nullptr; }
     const std::vector<fst::StaticUopOperand>& current_static_uop_operands() const override { return operands; }
     const fst::RetiredFrontendMacro* current_frontend_macro() const override { return &macro; }
@@ -110,10 +112,25 @@ const ResponseFrontierAuditSample& sample(const SimulationStats& s, unsigned seq
 }
 void test_spr_rename_elimination() {
     auto c = settings();
+    // A producer source update must not disable compatible input semantics.
+    c.spr_rename_policy_sha256 = std::string(64, 'b');
+    const auto decision = [](SimulatorConfig config, unsigned version) {
+        RenameTrace input; input.records = {alu(0)}; input.kinds = {1};
+        input.semantics_version = version;
+        TraceRecord record; input.next(record);
+        IntervalCoreModel model(config);
+        return model.schedule(record, false, false, 0, false, &input).rename_decision;
+    };
+    require(decision(c, 1).eliminated(), "source revision disabled compatible semantics");
+    require(!decision(c, 2).eliminated(), "unknown semantics version was accepted");
+    auto legacy_policy = c; legacy_policy.spr_rename_require_source_policy = true;
+    require(!decision(legacy_policy, 1).eliminated(), "source policy rollback ignored mismatch");
+    auto unpinned = c; unpinned.spr_rename_policy_sha256.clear(); unpinned.validate();
+    require(decision(unpinned, 1).eliminated(), "source hash still mandatory");
     RenameTrace source; source.records = {alu(0)}; source.kinds = {1};
     TraceRecord r; source.next(r);
     require(spr_rename_decision(r, &source, true, false).kind == SprRenameKind::GprAlias, "GPR MOV eligibility");
-    require(!spr_rename_decision(r, &source, false, false).eliminated(), "policy mismatch did not fall back");
+    require(!spr_rename_decision(r, &source, false, false).eliminated(), "unsupported semantics did not fall back");
     require(!spr_rename_decision(r, &source, true, true).eliminated(), "PRF mode did not fall back");
     source.macro.bytes = {0x89, 0xc8}; source.macro.instruction_size = 2;
     require(!spr_rename_decision(r, &source, true, false).eliminated(), "32-bit MOV was eliminated");

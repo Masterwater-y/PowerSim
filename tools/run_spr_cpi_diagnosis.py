@@ -210,6 +210,7 @@ def main():
         validation = dest / "validation"
         command = [
             sys.executable, str(repo / "tools/run_native_kernel_fastsim_validation.py"),
+            "--validation-mode", "strict",
             "--source-root", str(source_root), "--stats-dir", str(dest),
             "--output-dir", str(validation), "--expected-cases", str(len(args.case)),
             "--jobs", str(args.jobs), "--retired-cache-per-event",

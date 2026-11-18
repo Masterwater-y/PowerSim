@@ -516,16 +516,26 @@ bool KeyValueConfig::get_bool(const std::string& key, bool fallback) const {
 }
 
 void SimulatorConfig::validate() const {
+    if(retired_cache_service_model!="off" && retired_cache_service_model!="bounded-v1" && retired_cache_service_model!="probabilistic-v1")
+        throw std::invalid_argument("core.retired_cache_service_model supports off/bounded-v1/probabilistic-v1");
+    if(retired_cache_service_model!="off" && (core_model!="interval_weave" || !response_queue_feedback || response_event_only_approximation || retired_cache_final_admission_clock))
+        throw std::invalid_argument("core.retired_cache_service_model requires interval_weave feedback without event-only or the old final-admission experiment");
+
+    if(retired_cache_final_admission_clock &&
+       (core_model!="interval_weave" || !response_queue_feedback || response_event_only_approximation))
+        throw std::invalid_argument("core.retired_cache_final_admission_clock requires interval_weave response feedback without event-only approximation");
+
     if (spr_shared_fu_generic_latency && !spr_shared_fu)
         throw std::invalid_argument("core.spr_shared_fu_generic_latency requires core.spr_shared_fu=true");
     if (spr_shared_fu_round_robin && !spr_shared_fu)
         throw std::invalid_argument("core.spr_shared_fu_round_robin requires core.spr_shared_fu=true");
-    if (spr_rename_elimination &&
-        (core_model != "interval_weave" || !spr_shared_fu ||
-         spr_rename_policy_sha256.size() != 64 ||
-         !std::all_of(spr_rename_policy_sha256.begin(), spr_rename_policy_sha256.end(),
-            [](unsigned char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); })))
-        throw std::invalid_argument("core.spr_rename_elimination requires interval_weave, SPR ports and static policy SHA-256");
+    const bool rename_policy_valid = spr_rename_policy_sha256.size() == 64 &&
+        std::all_of(spr_rename_policy_sha256.begin(), spr_rename_policy_sha256.end(),
+            [](unsigned char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+    if ((!spr_rename_policy_sha256.empty() && !rename_policy_valid) ||
+        (spr_rename_require_source_policy && !rename_policy_valid) ||
+        (spr_rename_elimination && (core_model != "interval_weave" || !spr_shared_fu)))
+        throw std::invalid_argument("core.spr_rename_elimination requires interval_weave, SPR ports; source-policy rollback additionally requires static policy SHA-256");
     const bool family_policy_valid = spr_integer_family_policy_sha256.size()==64 &&
         std::all_of(spr_integer_family_policy_sha256.begin(),spr_integer_family_policy_sha256.end(),
             [](unsigned char c){return (c>='0' && c<='9') || (c>='a' && c<='f');});
@@ -618,6 +628,17 @@ void SimulatorConfig::validate() const {
          ruby_buffer_line_coalescing || response_causal_block_transfer ||
          !spr_store_window_lines || spr_store_window_lines > (1u << 20) || !cache_store_ports))
         throw std::invalid_argument("core.spr_store_window_feedback requires legacy single-pass buffer TSO and excludes competing service solvers");
+    if (sparse_load_pressure &&
+        (core_model != "interval_weave" || interval_scheduler != "time_epoch" ||
+         !response_queue_feedback || !response_sparse_scoreboard ||
+         !ruby_sequencer_max_outstanding || !cache_load_ports || interval_reweave_passes != 1 ||
+         ruby_sequencer_load_admission || ruby_sequencer_ifetch_admission ||
+         response_pending_fill || response_private_read_services ||
+         response_shared_service_constraints || dtlb.hierarchy_walk || software_prefetch_early_ack ||
+         spr_load_bank_feedback || spr_load_fill_feedback || response_sparse_resource_repair ||
+         interval_causal_timing || interval_response_retime || response_paired_frontier ||
+         interval_rob_head_suffix_replay || response_causal_block_transfer))
+        throw std::invalid_argument("core.sparse_load_pressure requires single-pass sparse member-slot feedback");
     if (spr_load_port_fallback_proxy && !spr_load_bank_feedback)
         throw std::invalid_argument("core.spr_load_port_fallback_proxy requires spr_load_bank_feedback");
     if (spr_load_bank_feedback &&
@@ -1170,6 +1191,9 @@ void SimulatorConfig::validate() const {
             "merge and publish require additional precommit certification");
     if (unified_parent_service_capacity == 0 || unified_parent_service_capacity > 65536)
         throw std::invalid_argument("core.unified_parent_service_capacity must be 1..65536");
+    if (unified_parent_estimated && unified_parent_service != "v2-observe" &&
+        unified_parent_service != "v2-wait")
+        throw std::invalid_argument("core.unified_parent_estimated requires parent service v2");
     if (unified_parent_service != "off") {
         if ((unified_parent_service == "v2-observe" || unified_parent_service == "v2-wait") &&
             (!legacy_prepare_timing_enabled() || !legacy_prepare_timing_supported()))
@@ -1908,6 +1932,26 @@ void SimulatorConfig::validate() const {
         "core.rename_vec_free_entries", rename_vec_free_entries);
     check_core_count(
         "core.rename_cc_free_entries", rename_cc_free_entries);
+    if (device_io.enabled &&
+        (core_model != "interval_weave" || interval_scheduler != "time_epoch" ||
+         !response_queue_feedback || !response_sparse_scoreboard || !allow_mmio_escape ||
+         response_retire_exposure != 1.0 ||
+         (!core_frequencies_hz.empty() && !std::all_of(core_frequencies_hz.begin(), core_frequencies_hz.end(),
+             [&](std::uint64_t hz) {return hz == core_frequencies_hz.front();})) ||
+         !store_commit_to_iew_delay || !needs_tso ||
+         !device_io.clock_period_ticks || !device_io.uart_latency_ticks ||
+         !device_io.apic_latency_ticks || !device_io.uart_size ||
+         device_io.uart_size > 256 ||
+         device_io.uart_address > UINT64_MAX - device_io.uart_size ||
+         device_io.uart_latency_ticks / device_io.clock_period_ticks >= UINT32_MAX ||
+         device_io.apic_latency_ticks / device_io.clock_period_ticks >= UINT32_MAX))
+        throw std::invalid_argument("device_io requires source-bound device timings, interval_weave/time_epoch, sparse response feedback, TSO and MMIO escape");
+    if (dtlb.functional_model && (!dtlb.enabled || dtlb.miss_model != "timing_walk" ||
+        dtlb.hierarchy_walk || spr_dtlb_stlb_proxy || spr_id_stlb_retired_order ||
+        dtlb.speculative_path_state || !dtlb.stlb_hit_latency || dtlb.stlb_hit_latency>(1u<<20) ||
+        !dtlb.entries || !dtlb.functional_l1_ways || (dtlb.entries % std::min(dtlb.entries,dtlb.functional_l1_ways)) ||
+        dtlb.max_pending_translations < dtlb.page_walkers || dtlb.max_pending_translations > (1u<<20)))
+        throw std::invalid_argument("functional DTLB requires timing_walk, bounded pending capacity, and separate legacy/hierarchy/speculative paths disabled");
     if (dtlb.enabled) {
         if (core_model == "scalar") {
             throw std::invalid_argument(
@@ -2424,6 +2468,8 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         "core.spr_store_sq_join_credit_proxy", config.spr_store_sq_join_credit_proxy);
     config.spr_store_window_lines = source.get_u32(
         "core.spr_store_window_lines", config.spr_store_window_lines);
+    config.sparse_load_pressure = source.get_bool(
+        "core.sparse_load_pressure", config.sparse_load_pressure);
     config.spr_load_bank_feedback = source.get_bool(
         "core.spr_load_bank_feedback", config.spr_load_bank_feedback);
     config.spr_load_port_fallback_proxy = source.get_bool(
@@ -2599,6 +2645,12 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         "core.response_pending_fill", config.response_pending_fill);
     config.unified_parent_service = source.get_string(
         "core.unified_parent_service", config.unified_parent_service);
+    config.retired_cache_service_model = source.get_string(
+        "core.retired_cache_service_model", config.retired_cache_service_model);
+    config.retired_cache_final_admission_clock = source.get_bool(
+        "core.retired_cache_final_admission_clock", config.retired_cache_final_admission_clock);
+    config.unified_parent_estimated = source.get_bool(
+        "core.unified_parent_estimated", config.unified_parent_estimated);
     config.unified_parent_service_capacity = source.get_u32(
         "core.unified_parent_service_capacity", config.unified_parent_service_capacity);
     config.response_pending_fill_wait = source.get_bool(
@@ -2663,6 +2715,8 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         "core.spr_rename_elimination", config.spr_rename_elimination);
     config.spr_rename_policy_sha256 = source.get_string(
         "core.spr_rename_policy_sha256", config.spr_rename_policy_sha256);
+    config.spr_rename_require_source_policy = source.get_bool(
+        "core.spr_rename_require_source_policy", config.spr_rename_require_source_policy);
     config.integer_alu_units = source.get_u32(
         "core.integer_alu_units", config.integer_alu_units);
     config.integer_multiply_units = source.get_u32(
@@ -3015,6 +3069,16 @@ SimulatorConfig load_simulator_config(const std::string& path) {
         "dtlb.miss_model", dtlb.miss_model);
     dtlb.page_walkers = source.get_u32(
         "dtlb.page_walkers", dtlb.page_walkers);
+    config.device_io.enabled = source.get_bool("device_io.enabled", config.device_io.enabled);
+    config.device_io.clock_period_ticks = source.get_u64("device_io.clock_period_ticks", config.device_io.clock_period_ticks);
+    config.device_io.uart_address = source.get_u64("device_io.uart_address", config.device_io.uart_address);
+    config.device_io.uart_size = source.get_u32("device_io.uart_size", config.device_io.uart_size);
+    config.device_io.uart_latency_ticks = source.get_u64("device_io.uart_latency_ticks", config.device_io.uart_latency_ticks);
+    config.device_io.apic_latency_ticks = source.get_u64("device_io.apic_latency_ticks", config.device_io.apic_latency_ticks);
+    dtlb.functional_model = source.get_bool("dtlb.functional_model", dtlb.functional_model);
+    dtlb.functional_l1_ways = source.get_u32("dtlb.functional_l1_ways", dtlb.functional_l1_ways);
+    dtlb.stlb_hit_latency = source.get_u32("dtlb.stlb_hit_latency", dtlb.stlb_hit_latency);
+    dtlb.max_pending_translations = source.get_u32("dtlb.max_pending_translations", dtlb.max_pending_translations);
     dtlb.coalesce_misses = source.get_bool(
         "dtlb.coalesce_misses", dtlb.coalesce_misses);
 

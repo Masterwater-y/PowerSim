@@ -565,6 +565,28 @@ above. Older median aliases must not replace the explicit P50 fields.
 
 ## 8. Native-FS evaluation procedure and release checklist
 
+The validator defaults to `--validation-mode quick`: it reports provisional CPI
+using saved native time accounting and inexpensive source-path/size and
+population checks. It does not freshly audit FST contents, establish native
+PMU accuracy, or produce strict passes. Missing evidence remains unavailable.
+Formal validation below requires explicit `--validation-mode strict`; quick and
+strict outputs must use separate directories. Quick mode does not support watch.
+Quick mode can be run on saved predictions as follows (replace the paths and
+case count for the actual batch):
+
+```bash
+python3 tools/run_native_kernel_fastsim_validation.py \
+  --source-root tmp/first-core-common-end-20260911/source \
+  --stats-dir tmp/baseline-40-20260916 \
+  --output-dir tmp/native-fs-evaluation/quick --expected-cases 40 --jobs 4
+```
+
+`summary.json` and `summary.md` identify quick mode, record zero formal passes,
+and mark native and retired-cache PMU unavailable. Per-case CPI requires an
+available saved native accounting audit and matching task IDs, timing policy,
+and per-core macro populations. Path and size checks cannot detect same-size
+content changes; the saved audit has not been re-established from current FST.
+
 ### 8.1 Freeze the case set and run the gates
 
 1. Record the exact case IDs, count, participant cores, split, trace/manifest,
@@ -613,6 +635,7 @@ Rescore existing `<case_id>.json` outputs without running the simulator:
 
 ```bash
 python3 tools/run_native_kernel_fastsim_validation.py \
+  --validation-mode strict \
   --source-root tmp/first-core-common-end-20260911/source \
   --stats-dir tmp/baseline-40-20260916 \
   --output-dir tmp/native-fs-evaluation/rescored \
@@ -623,6 +646,7 @@ Run a new serial replay through the same validation entrypoint:
 
 ```bash
 python3 tools/run_native_kernel_fastsim_validation.py \
+  --validation-mode strict \
   --source-root tmp/first-core-common-end-20260911/source \
   --fastsim build/fastsim --config configs/gem5-fs-native-kernel.cfg \
   --output-dir tmp/native-fs-evaluation/replay \
@@ -718,3 +742,18 @@ aggregate. Never call these differences perf accuracy or pool them with MAPE.
 Unknown event-clock request context leaves non-physical estimates unavailable;
 it is not a zero task prediction. Content identity proves functional input
 identity only, not macro completeness or actual request ROI edges.
+
+
+### Separate retired-service expectations (2026-11-17, opt-in)
+
+`--retired-service-expectations` selects the independent fractional
+`scope_metrics.retired_service_expectation` prediction and requires explicit
+`--validation-mode strict`. It preserves the legacy integer namespace, reuses
+native source, task, scope and per-core population gates, and requires current
+SPR retired-event membership policies on both sides. The default native
+unknown allowance is zero; `--retired-service-native-unknown-limit 1|2` requests
+only the explicitly allowed provisional report and retains actual unknowns.
+Larger unknown populations remain unavailable. These estimates and their
+conditional correlation bounds do not certify hardware events or confidence
+intervals. Model inputs, validation evidence and rollback are documented in
+[the default-off model record](retired-service-expectation-model-20261117.md).

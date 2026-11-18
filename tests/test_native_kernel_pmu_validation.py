@@ -390,6 +390,7 @@ class NativeKernelPmuValidationTest(unittest.TestCase):
             root = Path(directory)
             result = subprocess.run([
                 sys.executable, str(ROOT / "tools/run_native_kernel_fastsim_validation.py"),
+                "--validation-mode", "strict",
                 "--source-root", str(root), "--stats-dir", str(root),
                 "--output-dir", str(root / "report"), "--expected-cases", "1",
             ], capture_output=True, text=True)

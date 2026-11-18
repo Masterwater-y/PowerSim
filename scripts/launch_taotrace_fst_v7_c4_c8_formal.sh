@@ -579,6 +579,7 @@ case "${action}" in
     mkdir -p "${FASTSIM_VALIDATION_ROOT}"
     : >"${FASTSIM_VALIDATION_LOG}"
     nohup setsid "${PYTHON_BIN}" "${FASTSIM_VALIDATION_TOOL}" \
+      --validation-mode strict \
       --matrix "${MATRIX_BASE}" \
       --matrix "${MATRIX_STOCKFISH}" \
       --matrix "${MATRIX_SPH}" \

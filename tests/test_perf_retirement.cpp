@@ -215,6 +215,32 @@ template<class C> void cases() {
 }
 }
 int main() {
-    try { cases<fastsim::CoreCounters>(); std::cout << "perf retirement tests passed\n"; }
+    try {
+        cases<fastsim::CoreCounters>();
+        const std::vector<fastsim::TraceRecord> records{memory(fastsim::kLoad),memory(fastsim::kStore,0x8040),
+            memory(fastsim::kLoad,0x8040),memory(fastsim::kLoad,0x803c),memory(fastsim::kLoad,0x8008)};
+        for(bool warmup:{false,true}) {
+            auto cfg=config();const auto baseline=run(records,cfg,warmup);
+            require(baseline.retired_service_expectation.empty(),"off mode allocates no service model state");
+            for(const auto* mode:{"bounded-v1","probabilistic-v1"}) {
+                cfg.retired_cache_service_model=mode;const auto candidate=run(records,cfg,warmup);
+                const auto& a=baseline.cores[0];const auto& b=candidate.cores[0];
+                require(a.cycles==b.cycles && a.retired_instructions==b.retired_instructions &&
+                    a.retired_uops==b.retired_uops && a.memory_accesses==b.memory_accesses,
+                    "service observer must not alter CPU timing or request population");
+                require(a.perf_retirement.physical.estimated_l1_misses==b.perf_retirement.physical.estimated_l1_misses &&
+                    a.perf_retirement.physical.estimated_l2_misses==b.perf_retirement.physical.estimated_l2_misses &&
+                    a.perf_retirement.physical.estimated_l3_misses==b.perf_retirement.physical.estimated_l3_misses,
+                    "legacy PMU remains intact in both service modes");
+                require(candidate.retired_service_expectation.size()==1,"enabled model publishes all cores");
+                const auto& e=candidate.retired_service_expectation[0].scopes[0];
+                require(e.macro_loads==b.perf_retirement.physical.perf_retired_loads,
+                    "split/forwarded/warmup members conserve eligible macro population");
+                require(e.expected[0]<=e.macro_loads*fastsim::kServiceQ && e.expected[1]<=e.expected[0] && e.expected[2]<=e.expected[1],
+                    "macro expectation remains nested and bounded");
+            }
+        }
+        std::cout << "perf retirement tests passed\n";
+    }
     catch(const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

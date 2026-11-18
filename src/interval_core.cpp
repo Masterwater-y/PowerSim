@@ -129,7 +129,9 @@ IntervalCoreModel::IntervalCoreModel(const SimulatorConfig& config)
     if (config_.dtlb.enabled) {
         architectural_dtlb_lru_.reserve(config_.dtlb.entries * 2u);
     }
-    if (config_.spr_dtlb_stlb_proxy) spr_dtlb_stlb_ = std::make_unique<SprStlb>();
+    if (config_.spr_dtlb_stlb_proxy || config_.dtlb.functional_model)
+        spr_dtlb_stlb_ = std::make_unique<SprStlb>();
+    if (config_.dtlb.functional_model) functional_walk_ = std::make_unique<FunctionalPageWalk>(config_);
     if (config_.dtlb.enabled &&
         config_.dtlb.miss_model == "timing_walk") {
         dtlb_lru_.reserve(config_.dtlb.entries * 2u);
@@ -1217,7 +1219,7 @@ std::uint64_t IntervalCoreModel::next_iq_release_cycle() const {
 }
 
 void IntervalCoreModel::fill_dtlb(
-    const DtlbKey& key, std::uint64_t generation) {
+    const DtlbKey& key, std::uint64_t generation,std::uint64_t ready_cycle) {
     const auto found = dtlb_lru_.find(key);
     if (found != dtlb_lru_.end()) {
         // A duplicate same-page walk does not replace the provenance of an
@@ -1225,7 +1227,23 @@ void IntervalCoreModel::fill_dtlb(
         // translation visible; retaining its generation lets response repair
         // compare later hits with that exact cache-visible completion.
         found->second.lru_sequence = ++dtlb_sequence_;
+        if(config_.dtlb.functional_model && ready_cycle<found->second.ready_cycle) {
+            found->second.ready_cycle=ready_cycle;found->second.fill_generation=generation;
+        }
         return;
+    }
+    if(config_.dtlb.functional_model && key.page_bits==12) {
+        const auto ways=std::min(config_.dtlb.entries,config_.dtlb.functional_l1_ways);
+        const auto sets=config_.dtlb.entries/ways;
+        auto victim=dtlb_lru_.end();unsigned count=0;
+        for(auto it=dtlb_lru_.begin();it!=dtlb_lru_.end();++it)
+            if(it->first.page_bits==12 && it->first.token%sets==key.token%sets) {
+                ++count;if(victim==dtlb_lru_.end() || it->second.lru_sequence<victim->second.lru_sequence)victim=it;
+            }
+        if(count>=ways) {
+            if(dynamic_translation_mode_)translation_reclaim_candidates_.push_back(victim->first);
+            dtlb_lru_.erase(victim);
+        }
     }
     if (dtlb_lru_.size() == config_.dtlb.entries) {
         const auto victim = std::min_element(
@@ -1242,7 +1260,7 @@ void IntervalCoreModel::fill_dtlb(
         dtlb_lru_.erase(victim);
     }
     dtlb_lru_.emplace(
-        key, DtlbEntry{++dtlb_sequence_, generation});
+        key, DtlbEntry{++dtlb_sequence_, generation,ready_cycle});
 }
 
 void IntervalCoreModel::fill_architectural_dtlb(const DtlbKey& key) {
@@ -1250,6 +1268,19 @@ void IntervalCoreModel::fill_architectural_dtlb(const DtlbKey& key) {
     if (found != architectural_dtlb_lru_.end()) {
         found->second = ++architectural_dtlb_sequence_;
         return;
+    }
+    if(config_.dtlb.functional_model && key.page_bits==12) {
+        const auto ways=std::min(config_.dtlb.entries,config_.dtlb.functional_l1_ways);
+        const auto sets=config_.dtlb.entries/ways;
+        auto victim=architectural_dtlb_lru_.end();unsigned count=0;
+        for(auto it=architectural_dtlb_lru_.begin();it!=architectural_dtlb_lru_.end();++it)
+            if(it->first.page_bits==12 && it->first.token%sets==key.token%sets) {
+                ++count;if(victim==architectural_dtlb_lru_.end() || it->second<victim->second)victim=it;
+            }
+        if(count>=ways) {
+            if(dynamic_translation_mode_)translation_reclaim_candidates_.push_back(victim->first);
+            architectural_dtlb_lru_.erase(victim);
+        }
     }
     if (architectural_dtlb_lru_.size() == config_.dtlb.entries) {
         const auto victim = std::min_element(
@@ -1278,6 +1309,7 @@ void IntervalCoreModel::activate_address_space(
         return;
     }
     if (active_address_space_id_ == address_space_id) return;
+    if (config_.dtlb.functional_model && spr_dtlb_stlb_) spr_dtlb_stlb_->flush_all();
 
     // The target gem5 x86 ISA calls flushNonGlobal() on every CR3 write.
     // Dynamic facts preserve global translations; legacy tokens have no
@@ -1356,7 +1388,14 @@ void IntervalCoreModel::retire_page_walks_through(std::uint64_t cycle) {
             }
             pending_page_walks_.erase(pending);
         }
-        fill_dtlb(walk.key, walk.fill_generation);
+        fill_dtlb(walk.key, walk.fill_generation,walk.ready_cycle);
+        if (config_.dtlb.functional_model) {
+            const auto mapping=dynamic_dtlb_mappings_.find(walk.key);
+            spr_dtlb_stlb_->insert(walk.key.address_space_id,walk.key.pcid,walk.key.token<<walk.key.page_bits,
+                walk.key.page_bits,false,mapping==dynamic_dtlb_mappings_.end()?std::nullopt:
+                std::optional<std::pair<std::uint64_t,std::uint64_t>>{
+                    {mapping->second.physical_base,mapping->second.walk_root}},walk.ready_cycle);
+        }
     }
     reclaim_translation_metadata();
 }
@@ -1381,12 +1420,12 @@ void IntervalCoreModel::clear_retired_itlb() {
 
 void IntervalCoreModel::observe_translation_mapping(
     const DtlbKey& key, const fst::TranslationMapping& mapping) {
-    if (config_.spr_id_stlb_retired_order && spr_dtlb_stlb_ &&
-        (key.page_bits==12 || (config_.spr_id_stlb_allow_large &&
+    if ((config_.dtlb.functional_model || config_.spr_id_stlb_retired_order) && spr_dtlb_stlb_ &&
+        (key.page_bits==12 || ((config_.dtlb.functional_model || config_.spr_id_stlb_allow_large) &&
          (key.page_bits==21 || key.page_bits==22 || key.page_bits==30))) &&
-        (!key.global || config_.spr_id_stlb_allow_global)) {
+        (!key.global || config_.spr_id_stlb_allow_global || config_.dtlb.functional_model)) {
         const auto proxy_asid=key.global ? mapping.address_space_id : key.address_space_id;
-        const auto existing=spr_dtlb_stlb_->lookup(proxy_asid,0,key.token<<key.page_bits,false);
+        const auto existing=spr_dtlb_stlb_->lookup(proxy_asid,key.pcid,key.token<<key.page_bits,false);
         if (existing && (!existing->mapping_known || existing->physical_base!=mapping.physical_base ||
                          existing->walk_root!=mapping.walk_root || existing->global!=key.global ||
                          (config_.spr_id_stlb_allow_large && existing->page_bits!=key.page_bits))) {
@@ -1436,7 +1475,19 @@ std::uint64_t IntervalCoreModel::translate(
         std::vector<DtlbKey> seen;
         auto ready=earliest;
         for (const auto& fragment:fragments) {
-            const auto& mapping=fragment.mapping;
+            fst::TranslationMapping approximation;
+            const auto* selected=&fragment.mapping;
+            if(config_.dtlb.functional_model && !(selected->flags & fst::kTranslationLeafKnown) &&
+                selected->kind==fst::TranslationKind::kPaged) {
+                approximation=*selected;
+                approximation.address_space_id=selected->address_space_id?selected->address_space_id:address_space_id;
+                approximation.virtual_base=fragment.virtual_address & ~std::uint64_t{4095};
+                approximation.physical_base=fragment.physical_address & ~std::uint64_t{4095};
+                approximation.page_bits=12;approximation.levels=0;
+                approximation.flags=fst::kTranslationLeafKnown;
+                selected=&approximation;++timing.spr_dtlb_stlb_fallbacks;
+            }
+            const auto& mapping=*selected;
             if (!(mapping.flags & fst::kTranslationLeafKnown)) {
                 if (mapping.kind!=fst::TranslationKind::kPaged && static_cast<unsigned>(mapping.kind)<=6 &&
                     !mapping.flags && !mapping.page_bits && !mapping.levels && !mapping.walk_root) continue;
@@ -1447,8 +1498,10 @@ std::uint64_t IntervalCoreModel::translate(
             if (config_.dtlb.hierarchy_walk && (!(mapping.flags & fst::kTranslationPathKnown) || !mapping.levels))
                 throw std::runtime_error("dynamic translation has unknown PTE path");
             const bool global=(mapping.flags & fst::kTranslationGlobal)!=0;
-            const DtlbKey key{global ? 0 : mapping.address_space_id, fragment.virtual_address >> mapping.page_bits,
-                              mapping.page_bits, global};
+            const DtlbKey key{global && !config_.dtlb.functional_model ? 0 : mapping.address_space_id,
+                              fragment.virtual_address >> mapping.page_bits,
+                              mapping.page_bits, global && !config_.dtlb.functional_model,
+                              static_cast<std::uint16_t>(config_.dtlb.functional_model?mapping.pcid:0)};
             if (std::find(seen.begin(),seen.end(),key)!=seen.end()) continue;
             seen.push_back(key); observe_translation_mapping(key,mapping);
             IntervalTiming part;part.dtlb_access=true;part.dtlb_timing_access=true;
@@ -1465,6 +1518,9 @@ std::uint64_t IntervalCoreModel::translate(
             timing.spr_dtlb_stlb_misses += part.spr_dtlb_stlb_misses;
             timing.spr_dtlb_stlb_fallbacks += part.spr_dtlb_stlb_fallbacks;
             timing.spr_dtlb_stlb_flushes += part.spr_dtlb_stlb_flushes;
+            timing.functional_walk_physical += part.functional_walk_physical;
+            timing.functional_walk_structural += part.functional_walk_structural;
+            timing.functional_pending_wait_cycles += part.functional_pending_wait_cycles;
             timing.dtlb_access=true;timing.dtlb_timing_access=true;
             timing.dtlb_hit|=part.dtlb_hit;timing.dtlb_miss|=part.dtlb_miss;
             timing.dtlb_timing_hit|=part.dtlb_timing_hit;timing.dtlb_timing_miss|=part.dtlb_timing_miss;
@@ -1481,13 +1537,22 @@ std::uint64_t IntervalCoreModel::translate(
     }
     timing.dtlb_access=true;timing.dtlb_timing_access=true;
     if (!has_flag(record.flags,kVirtualPageToken) || !record.virtual_page_token()) {
+        if(config_.dtlb.functional_model) {
+            // Functional streams containing PA only use a conservative 4K
+            // identity proxy. This does not claim VA alias/PCID fidelity.
+            ++timing.spr_dtlb_stlb_fallbacks;
+            return translate_key(DtlbKey{address_space_id,record.address>>12,12},
+                earliest,timing,page_walk_latency_override);
+        }
         timing.dtlb_untracked=true;timing.dtlb_timing_untracked=true;return earliest;
     }
-    return translate_key(DtlbKey{address_space_id,record.virtual_page_token()},earliest,timing,page_walk_latency_override);
+    return translate_key(DtlbKey{address_space_id,record.virtual_page_token(),
+        static_cast<std::uint8_t>(config_.dtlb.functional_model?12:0)},earliest,timing,page_walk_latency_override);
 }
 
 std::uint64_t IntervalCoreModel::translate_key(const DtlbKey& key,std::uint64_t earliest,
     IntervalTiming& timing,std::optional<std::uint32_t> page_walk_latency_override) {
+    const auto query_origin=earliest;
     const auto architectural_resident =
         architectural_dtlb_lru_.find(key);
     if (architectural_resident != architectural_dtlb_lru_.end()) {
@@ -1514,18 +1579,27 @@ std::uint64_t IntervalCoreModel::translate_key(const DtlbKey& key,std::uint64_t 
 
     retire_page_walks_through(earliest);
     const auto resident = dtlb_lru_.find(key);
-    if (resident != dtlb_lru_.end()) {
+    if (resident != dtlb_lru_.end() &&
+        (!config_.dtlb.functional_model || resident->second.ready_cycle<=earliest)) {
         resident->second.lru_sequence = ++dtlb_sequence_;
         timing.dtlb_timing_hit = true;
         timing.dtlb_fill_generation =
             resident->second.fill_generation;
         timing.translation_ready_cycle =
             earliest + config_.dtlb.hit_latency;
-        timing.translation_delay_cycles = config_.dtlb.hit_latency;
+        timing.translation_delay_cycles = config_.dtlb.hit_latency +
+            (config_.dtlb.functional_model?earliest-query_origin:0);
         return timing.translation_ready_cycle;
     }
 
     timing.dtlb_timing_miss = true;
+    if (config_.dtlb.functional_model) {
+        while(page_walk_completions_.size()>=config_.dtlb.max_pending_translations) {
+            earliest=std::max(earliest,page_walk_completions_.top().ready_cycle);
+            retire_page_walks_through(earliest);
+        }
+        timing.functional_pending_wait_cycles=earliest-query_origin;
+    }
     if (config_.dtlb.coalesce_misses) {
         const auto pending = pending_page_walks_.find(key);
         if (pending != pending_page_walks_.end()) {
@@ -1543,7 +1617,10 @@ std::uint64_t IntervalCoreModel::translate_key(const DtlbKey& key,std::uint64_t 
     }
 
     bool stlb_hit = false;
-    if (spr_dtlb_stlb_) {
+    if (config_.dtlb.functional_model) {
+        stlb_hit=spr_dtlb_stlb_->lookup(key.address_space_id,key.pcid,key.token<<key.page_bits,true,earliest).has_value();
+        if(stlb_hit)++timing.spr_dtlb_stlb_hits;else ++timing.spr_dtlb_stlb_misses;
+    } else if (spr_dtlb_stlb_) {
         const auto mapping = dynamic_dtlb_mappings_.find(key);
         const auto proxy_asid = key.global && mapping!=dynamic_dtlb_mappings_.end()
             ? mapping->second.address_space_id : key.address_space_id;
@@ -1583,9 +1660,18 @@ std::uint64_t IntervalCoreModel::translate_key(const DtlbKey& key,std::uint64_t 
         throw std::logic_error("enabled DTLB has no page walker");
     }
     const auto start = stlb_hit ? earliest : std::max(earliest, *walker);
-    const auto walk_latency = stlb_hit ? 6u : page_walk_latency_override.value_or(
+    const auto walk_latency = stlb_hit ? (config_.dtlb.functional_model?config_.dtlb.stlb_hit_latency:6u) : page_walk_latency_override.value_or(
         config_.dtlb.page_walk_latency);
-    const auto ready = start + walk_latency;
+    auto ready = start + walk_latency;
+    if(config_.dtlb.functional_model && !stlb_hit) {
+        const auto found=dynamic_dtlb_mappings_.find(key);
+        fst::TranslationMapping mapping;
+        if(found!=dynamic_dtlb_mappings_.end())mapping=found->second;
+        else {mapping.address_space_id=key.address_space_id;mapping.walk_root=key.address_space_id;mapping.page_bits=key.page_bits?key.page_bits:12;}
+        const auto result=functional_walk_->walk(mapping,key.token<<mapping.page_bits,start);
+        ready=result.ready;
+        if(result.structural)++timing.functional_walk_structural;else ++timing.functional_walk_physical;
+    }
     if (dtlb_fill_generation_sequence_ ==
         std::numeric_limits<std::uint64_t>::max()) {
         throw std::overflow_error("DTLB fill generation exhausted");
@@ -1602,7 +1688,7 @@ std::uint64_t IntervalCoreModel::translate_key(const DtlbKey& key,std::uint64_t 
     page_walk_completions_.push(PageWalk{ready, key, generation, mapping_version});
     if (dynamic_translation_mode_) ++outstanding_dynamic_walks_[key];
     timing.translation_ready_cycle = ready;
-    timing.translation_delay_cycles = ready - earliest;
+    timing.translation_delay_cycles = ready - query_origin;
     return ready;
 }
 
@@ -1698,7 +1784,7 @@ IntervalTiming IntervalCoreModel::schedule(
             const auto ordinal = trace_source->current_source_record_ordinal();
             boundary = ordinal && !trace_source->boundaries_before(*ordinal).empty();
         }
-        if (spr_address_space_change || !spr_dtlb_stlb_source_usable_ || boundary || !control->operations.empty()) {
+        if (spr_address_space_change || (!config_.dtlb.functional_model && !spr_dtlb_stlb_source_usable_) || boundary || (control && !control->operations.empty())) {
             if (config_.spr_id_stlb_retired_order) { clear_retired_itlb(); spr_fetch_buffer_mapping_={}; fetch_buffer_valid_=false; }
             if (spr_dtlb_stlb_has_entries_) {
                 spr_dtlb_stlb_->flush_all();
@@ -2321,7 +2407,9 @@ IntervalTiming IntervalCoreModel::schedule(
             auto found = spr_rename_policy_cache_.find(trace_source);
             if (found == spr_rename_policy_cache_.end())
                 found = spr_rename_policy_cache_.emplace(trace_source,
-                    trace_source->static_uop_policy_identity() == config_.spr_rename_policy_sha256).first;
+                    trace_source->static_uop_semantics_version() == 1 &&
+                    (!config_.spr_rename_require_source_policy ||
+                     trace_source->static_uop_policy_identity() == config_.spr_rename_policy_sha256)).first;
             matching = found->second;
         }
         timing.rename_decision = spr_rename_decision(record, trace_source, matching,

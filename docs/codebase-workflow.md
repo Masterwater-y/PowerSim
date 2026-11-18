@@ -1,5 +1,51 @@
 # FastSim Codebase repository and workflow
 
+User directive (2026-11-18): use one qualified, distinct high-frequency
+physical host core per simulated target core. CPU 48–63 on socket/NUMA 1
+is the newly qualified 16-core pool. Select N with
+`python3 scripts/run_high_frequency.py --cores N -- COMMAND ARGS...` and
+verify actual affinity; the former 52–63 pool is historical. Do not use
+SMT siblings to satisfy this physical-core requirement. Historical 12-host
+C16 data remains separately labeled; frequency and placement still require
+per-run checks.
+
+User directive (2026-11-17): select **SPR-M5 — Private Preview Clock Repair**
+as the current SPR default. `configs/spr-evaluation-default.cfg` selects
+`configs/spr-m5-private-preview-clocks.cfg`; `configs/gem5-spr-retired.cfg`
+uses the same alias. Install the measured retained-clock ELF with SHA-256
+`b869c0041b7ca6cf625e8aebdd6392e7c4a52be95ad1466052dc3d39e7d5f1b8`.
+Estimated source/tests remain present, with `core.unified_parent_estimated=false`.
+Functional translation and device I/O remain enabled; M1-M4 profiles stay
+immutable. The old M4 ELF is retained at
+`tmp/spr-m5-default-20261117/frozen-m4/fastsim`. The
+[default record](spr-m5-private-preview-clocks-default-20261117.md) binds
+configuration/source/ELF identities, rollback and current 12-case CPI/PMU/host
+results. The user permits ignoring 1-2 native unknown members per event for
+this provisional report; raw counts remain intact. Default selection is
+separate from strict native PMU, hardware equivalence or throughput acceptance.
+
+User directive (2026-11-16, subsequent decision): UART/APIC service is now
+enabled by default through `configs/spr-m4-device-io.cfg`. M1/M2/M3 remain
+frozen. Device address, service delay and CPU tick period are shared target
+platform parameters, verified across all ten current sources; they are not
+per-trace hash or gem5-revision eligibility gates. Device-only rollback is
+`device_io.enabled=false`. The executable is unchanged (d6f5bae9...e9c5f9).
+
+User directive (2026-11-16): the SPR working default now selects
+`configs/spr-m3-functional-translation.cfg`, retaining functional STLB and bounded
+page-walk service even where the old model's errors compensated other gaps.
+SPR-M1/M2 remain immutable. Device UART/APIC service is an independent opt-in
+source-configured path; see `spr-device-io-service-20261116.md` for executable
+identity, supported inputs, rollback and validation limits.
+
+User directive (2026-11-13): retire the old C4/C8/C16 matrix FST, including its
+successful C16 recaptures and failed remnants, plus the reviewed failed and
+historical source groups. These historical sources are now not replayable;
+their metadata, logs, reports, checkpoints and workload binaries remain.
+Current SPR-M1/M2 inputs and `spr-members-v2` remain preserved. See
+[`trace-storage-policy-20261015.md`](trace-storage-policy-20261015.md) and
+`tmp/fst-retirement-20261113/receipt.json` for the completed file/hash receipt.
+
 User directive (2026-11-12): primary host throughput excludes input
 initialization/preprocessing/source checks/integrity and validation work;
 report those costs and full-process wall time separately. The existing

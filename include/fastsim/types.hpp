@@ -5,6 +5,7 @@
 
 #include "fastsim/private_read_services.hpp"
 #include "fastsim/perf_retirement.hpp"
+#include "fastsim/retired_service_counts.hpp"
 #include "fastsim/perf_cache.hpp"
 #include "fastsim/store_demand_observer.hpp"
 #include "fastsim/legacy_prepare_timing.hpp"
@@ -888,6 +889,9 @@ struct LineGenerationAdmissionAuditCounters {
 };
 
 struct O3QueueCounters {
+    std::uint64_t sparse_load_pressure_events = 0, sparse_load_pressure_cohorts = 0;
+    std::uint64_t sparse_load_pressure_repairs = 0, sparse_load_pressure_cycles = 0;
+    std::uint64_t sparse_load_pressure_max_batch = 0;
     std::uint64_t spr_store_budget_waits = 0, spr_store_budget_wait_cycles = 0;
     std::uint64_t spr_store_budget_frontier_clamps = 0;
     std::uint64_t spr_bank_packets = 0, spr_bank_waits = 0, spr_load_port_bank_wait_cycles = 0, spr_bank_fallbacks = 0;
@@ -936,6 +940,12 @@ struct O3QueueCounters {
         spr_bank_packets += other.spr_bank_packets;
         spr_bank_waits += other.spr_bank_waits;
         spr_load_port_bank_wait_cycles += other.spr_load_port_bank_wait_cycles;
+        sparse_load_pressure_events += other.sparse_load_pressure_events;
+        sparse_load_pressure_cohorts += other.sparse_load_pressure_cohorts;
+        sparse_load_pressure_repairs += other.sparse_load_pressure_repairs;
+        sparse_load_pressure_cycles += other.sparse_load_pressure_cycles;
+        sparse_load_pressure_max_batch = std::max(sparse_load_pressure_max_batch,
+                                                 other.sparse_load_pressure_max_batch);
         spr_bank_fallbacks += other.spr_bank_fallbacks;
         spr_store_window_admitted += other.spr_store_window_admitted;
         spr_store_window_fallbacks += other.spr_store_window_fallbacks;
@@ -2387,9 +2397,13 @@ struct TaskPmuCounters {
 };
 
 struct CoreCounters {
+    std::uint64_t device_io_uart_requests = 0, device_io_apic_requests = 0;
+    std::uint64_t device_io_unmodeled_requests = 0, device_io_service_cycles = 0;
     std::uint64_t spr_dtlb_stlb_hits = 0, spr_dtlb_stlb_misses = 0;
     std::uint64_t spr_dtlb_stlb_fallbacks = 0, spr_dtlb_stlb_flushes = 0;
     std::uint64_t spr_dtlb_stlb_missing_controls = 0;
+    std::uint64_t functional_walk_physical = 0, functional_walk_structural = 0;
+    std::uint64_t functional_pending_wait_cycles = 0;
     std::uint64_t spr_itlb_hits = 0, spr_itlb_stlb_hits = 0, spr_itlb_stlb_misses = 0, spr_itlb_unknown = 0;
     // Scored retired-path supply only; excludes speculative and context UOPs.
     std::uint64_t spr_frontend_uops = 0, spr_frontend_macros = 0;
@@ -2739,6 +2753,9 @@ struct CoreCounters {
         spr_dtlb_stlb_fallbacks += other.spr_dtlb_stlb_fallbacks;
         spr_dtlb_stlb_flushes += other.spr_dtlb_stlb_flushes;
         spr_dtlb_stlb_missing_controls += other.spr_dtlb_stlb_missing_controls;
+        functional_walk_physical += other.functional_walk_physical;
+        functional_walk_structural += other.functional_walk_structural;
+        functional_pending_wait_cycles += other.functional_pending_wait_cycles;
         spr_itlb_hits += other.spr_itlb_hits;
         spr_itlb_stlb_hits += other.spr_itlb_stlb_hits;
         spr_itlb_stlb_misses += other.spr_itlb_stlb_misses;
@@ -2811,6 +2828,10 @@ struct CoreCounters {
             other.perf_deferred_install_timing_events;
         forwarded_loads += other.forwarded_loads;
         mmio_escape_accesses += other.mmio_escape_accesses;
+        device_io_uart_requests += other.device_io_uart_requests;
+        device_io_apic_requests += other.device_io_apic_requests;
+        device_io_unmodeled_requests += other.device_io_unmodeled_requests;
+        device_io_service_cycles += other.device_io_service_cycles;
         unknown_addresses += other.unknown_addresses;
         branches_without_outcome += other.branches_without_outcome;
         serializing_uops += other.serializing_uops;
@@ -3214,6 +3235,7 @@ struct FunctionalSyncAudit {
 };
 
 struct SimulationStats {
+    std::vector<ServiceExpectationCore> retired_service_expectation;
     std::uint64_t spr_store_group_candidates = 0, spr_store_group_committed = 0;
     std::uint64_t spr_store_group_committed_members = 0;
     std::uint64_t spr_store_group_size2 = 0, spr_store_group_size3 = 0, spr_store_group_size4 = 0;

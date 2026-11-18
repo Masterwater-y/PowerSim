@@ -57,6 +57,9 @@ class TraceSource {
     virtual const fst::StaticUopFactsRow* current_static_uop_facts() const { return nullptr; }
     virtual const std::vector<fst::StaticUopOperand>& current_static_uop_operands() const { static const std::vector<fst::StaticUopOperand> empty; return empty; }
     virtual std::string static_uop_policy_identity() const { return {}; }
+    // Functional descriptor semantics, independent of producer source revision.
+    // Version 1 defines the StaticUopFactsRow/Operand field meanings.
+    virtual unsigned static_uop_semantics_version() const { return 0; }
     virtual const fst::CoreFunctionalRow* current_core_functional_facts() const { return nullptr; }
     virtual const std::vector<fst::CoreFunctionalOperand>& current_core_functional_operands() const { static const std::vector<fst::CoreFunctionalOperand> empty; return empty; }
     virtual const fst::CoreFunctionalHeader* core_functional_header() const { return nullptr; }
@@ -279,6 +282,7 @@ class BinaryTraceSource final : public TraceSource {
         return static_uop_reader_?static_uop_reader_->operands():TraceSource::current_static_uop_operands();
     }
     std::string static_uop_policy_identity() const override { return static_uop_reader_?static_uop_reader_->policy_identity():std::string{}; }
+    unsigned static_uop_semantics_version() const override { return static_uop_reader_?1:0; }
     const fst::CoreFunctionalRow* current_core_functional_facts() const override { return core_functional_reader_?core_functional_reader_->current():nullptr; }
     const std::vector<fst::CoreFunctionalOperand>& current_core_functional_operands() const override { return core_functional_reader_?core_functional_reader_->operands():TraceSource::current_core_functional_operands(); }
     const fst::CoreFunctionalHeader* core_functional_header() const override { return core_functional_reader_?&core_functional_reader_->header():nullptr; }
@@ -527,6 +531,7 @@ class InstructionSliceTraceSource : public TraceSource {
     const fst::StaticUopFactsRow* current_static_uop_facts() const override { return source_->current_static_uop_facts(); }
     const std::vector<fst::StaticUopOperand>& current_static_uop_operands() const override { return source_->current_static_uop_operands(); }
     std::string static_uop_policy_identity() const override { return source_->static_uop_policy_identity(); }
+    unsigned static_uop_semantics_version() const override { return source_->static_uop_semantics_version(); }
     const fst::CoreFunctionalRow* current_core_functional_facts() const override { return core_functional_current_visible_?source_->current_core_functional_facts():nullptr; }
     const std::vector<fst::CoreFunctionalOperand>& current_core_functional_operands() const override { return core_functional_current_visible_?source_->current_core_functional_operands():TraceSource::current_core_functional_operands(); }
     const fst::CoreFunctionalHeader* core_functional_header() const override { return source_->core_functional_header(); }
@@ -690,6 +695,7 @@ class WarmupInstructionTraceSource final : public TraceSource {
     const fst::StaticUopFactsRow* current_static_uop_facts() const override { return source_->current_static_uop_facts(); }
     const std::vector<fst::StaticUopOperand>& current_static_uop_operands() const override { return source_->current_static_uop_operands(); }
     std::string static_uop_policy_identity() const override { return source_->static_uop_policy_identity(); }
+    unsigned static_uop_semantics_version() const override { return source_->static_uop_semantics_version(); }
     const fst::CoreFunctionalRow* current_core_functional_facts() const override { return core_functional_current_visible_?source_->current_core_functional_facts():nullptr; }
     const std::vector<fst::CoreFunctionalOperand>& current_core_functional_operands() const override { return core_functional_current_visible_?source_->current_core_functional_operands():TraceSource::current_core_functional_operands(); }
     const fst::CoreFunctionalHeader* core_functional_header() const override { return source_->core_functional_header(); }

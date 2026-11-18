@@ -17,9 +17,9 @@ struct SprRenameDecision {
 // alias; response replay propagates their corrected ready edges normally.
 inline SprRenameDecision spr_rename_decision(
     const TraceRecord& record, const TraceSource* source,
-    bool matching_policy, bool unsupported_resources) {
+    bool compatible_semantics, bool unsupported_resources) {
     using Reason = SprRenameDecision::Reason;
-    if (!source || !matching_policy) return {SprRenameKind::Execute, Reason::Missing};
+    if (!source || !compatible_semantics) return {SprRenameKind::Execute, Reason::Missing};
     const auto* row = source->current_static_uop_facts();
     if (!row || !(row->flags & fst::kStaticExecutionKnown) ||
         !(row->flags & fst::kStaticOperandRolesKnown))

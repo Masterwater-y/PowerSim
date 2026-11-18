@@ -6,10 +6,10 @@ to retirement in kernel_events.json.  Cache-miss truth comes only from the
 drained native Ruby/SLICC sideband.  The legacy retirement-time DynInst branch
 comparison and TaoTrace path-class cache fields are deliberately never scored.
 
-Use --source-root with --stats-dir to rescore archived <case_id>.json outputs
-without rerunning FastSim. Archived outputs are hashed, but their original
-binary/configuration provenance is not certified by the currently installed
-binary. Both modes use the same native-source and conservation gates.
+The default quick mode gives provisional CPI from saved audit evidence, without
+re-auditing source contents or native PMU. Use --validation-mode strict for the
+complete independent source and conservation gates. --stats-dir rescoring does
+not certify the original binary/configuration provenance.
 """
 
 import argparse
@@ -33,7 +33,7 @@ from audit_perf_retirement import (
     compare_perf_retirement, load_event_dictionary as load_retirement_dictionary,
 )
 from audit_perf_cache import audit_perf_cache, compare_report as compare_perf_cache_report, aggregate_report_accuracy as aggregate_perf_cache_accuracy, aggregate_report_estimates
-from retired_cache_contract import audit_retired_cache, compare_retired_cache, write_retired_cache_summary
+from retired_cache_contract import audit_retired_cache, compare_retired_cache, compare_retired_cache_expectations, write_retired_cache_summary
 from perf_cache_contract import DICTIONARY as PERF_CACHE_DICTIONARY, load_dictionary as load_perf_cache_dictionary
 from validate_kernel_events_oracle import BRANCH_MISS_SOURCE
 from time_accounting import (
@@ -323,6 +323,8 @@ def validation_fingerprint(case, args):
         "perf_retirement_requested": retirement_requested,
         "perf_cache_requested": cache_requested,
         "retired_cache_requested": retired_cache_requested,
+        "retired_service_expectations_requested": getattr(args,'retired_service_expectations',False),
+        "retired_service_native_unknown_limit": getattr(args,'retired_service_native_unknown_limit',0),
         "retired_cache_misses_only": getattr(args,'retired_cache_misses',False),
         "retired_cache_per_event": getattr(args,'retired_cache_per_event',False),
         "llc_fill_audit_requested": bool(os.environ.get("FASTSIM_LLC_AUDIT")),
@@ -874,6 +876,10 @@ def run_case(case, args):
                     allow_incomplete_events=getattr(args,'retired_cache_per_event',False))
             else:
                 report['retired_cache_validation']=compare_retired_cache(prediction,fingerprint['current_retired_cache_evidence'])
+            if getattr(args,'retired_service_expectations',False):
+                report['retired_service_expectation_validation']=compare_retired_cache_expectations(
+                    prediction,scope.get('retired_service_expectation',{}),fingerprint['current_retired_cache_evidence'],
+                    small_native_unknown_limit=getattr(args,'retired_service_native_unknown_limit',0))
             checks['retired_cache_source_population_match']=True
         if task_mode:
             task_audit = audit_task_pmu(result_dir / "tao_trace")
@@ -1036,7 +1042,7 @@ def write_summary(args, discovered):
         ),
         "pmu_scope": pmu_scopes[0] if len(pmu_scopes) == 1 else "mixed" if pmu_scopes else "unavailable",
         "pmu_accuracy_by_scope": pmu_accuracy_by_scope,
-        "primary_pmu_namespace": "retired_cache" if getattr(args,"retired_cache",False) else None,
+        "primary_pmu_namespace": "retired_service_expectation" if getattr(args,"retired_service_expectations",False) else "retired_cache" if getattr(args,"retired_cache",False) else None,
         "primary_pmu_status": "requested" if getattr(args,"retired_cache",False) else "not-requested",
         "native_tag_miss_namespace": "diagnostic",
         "primary_retired_cache_events": ['retired_l1_load_misses','retired_l2_load_misses','retired_l3_load_misses']
@@ -1118,6 +1124,7 @@ def write_summary(args, discovered):
                 "pmu": row.get("pmu", {}),
                 "perf_retirement_validation": row.get("perf_retirement_validation"),
                 "retired_cache_validation": row.get("retired_cache_validation"),
+                "retired_service_expectation_validation": row.get("retired_service_expectation_validation"),
                 "errors": row.get("errors", []),
                 "result_dir": row["result_dir"],
             }
@@ -1260,6 +1267,9 @@ def write_summary(args, discovered):
             lines += ["Per-event mode scores only events with complete native membership; unavailable events are not included in error aggregates. It does not certify all three events."]
     else:
         lines += ["", "Retired-load cache PMU was not requested; native tag misses above are diagnostics, not MEM_LOAD_RETIRED miss accuracy."]
+    if getattr(args,'retired_service_expectations',False):
+        lines += ["", "Primary selected prediction: conditional retired-service expectation; legacy integer classifications above remain separate.",
+                  "See [expectation comparison](retired-service-expectations/retired-cache-summary.md). These are model expectations, not observed counts or hardware certification."]
     (args.output_dir / "summary.md").write_text("\n".join(lines) + "\n")
     if getattr(args, "perf_retirement", False):
         perf_lines = ["# Retirement-event diagnostics", "", "Hardware perf equivalence: unverified. Each scope/event and raw/rate population is separate.", "",
@@ -1336,6 +1346,12 @@ def write_summary(args, discovered):
                             lines.append(f"| {report['case_id']} / {scope} / {name} | {unit} | {predicted} | {reference} | {percent_text(None if relative is None else relative*100)} | {percent_text(errors['absolute_percentage_error'])} | {errors['absolute_error']} | {row.get('reference_unknown_qualification_count')} | {request_unknown} | {missing} |")
         (args.output_dir/'perf-cache-estimates.md').write_text('\n'.join(lines)+'\n')
     if getattr(args,'retired_cache',False):write_retired_cache_summary(args.output_dir,reports)
+    if getattr(args,'retired_service_expectations',False):
+        folder=args.output_dir/'retired-service-expectations';folder.mkdir(exist_ok=True)
+        selected=[dict(case_id=r['case_id'],retired_cache_validation=r.get('retired_service_expectation_validation',{})) for r in reports]
+        write_retired_cache_summary(folder,selected)
+        (folder/'comparisons.json').write_text(json.dumps(selected,indent=2)+'\n')
+
     return summary
 
 
@@ -1346,6 +1362,108 @@ def collection_finished(path):
         return int(path.read_text().strip())
     except ValueError:
         return 1
+
+
+def quick_check_source_identity(identity, trace_dir, cores):
+    """Check stored source locations and sizes, without claiming content verification."""
+    if (not isinstance(identity, dict) or identity.get('status') != 'complete'
+            or not str(identity.get('source_identity', '')).startswith('sha256:')
+            or identity.get('participants') != list(range(cores))):
+        raise ValueError('missing or mismatched functional source identity')
+    root = trace_dir.resolve()
+    sources = identity.get('sources')
+    if not isinstance(sources, list) or {s.get('core_id') for s in sources} != set(range(cores)):
+        raise ValueError('functional source core coverage mismatch')
+    for source in sources:
+        artifacts = source.get('artifacts', [])
+        if not any(a.get('role') == 'fst' for a in artifacts):
+            raise ValueError('missing FST identity')
+        for artifact in artifacts:
+            path = Path(artifact['path']).resolve()
+            if (root not in path.parents or not path.is_file()
+                    or path.stat().st_size != artifact.get('size_bytes')):
+                raise ValueError('functional source path or size mismatch')
+
+
+def quick_summary(reports, expected):
+    scored = [r['cpi'] for r in reports if r.get('cpi', {}).get('status') == 'scored-active']
+    policies = {(c.get('active_start_policy'), c.get('active_end_policy'), c.get('active_scope')) for c in scored}
+    aggregate = scored if len(policies) <= 1 else []
+    relative = [c['absolute_relative_error'] for c in aggregate if c.get('absolute_relative_error') is not None]
+    return {'schema': 'fastsim-native-quick-summary-v1', 'validation_mode': 'quick',
+            'formal_validation': False, 'passed_cases': 0, 'expected_cases': expected,
+            'completed_cases': len(reports), 'failed_cases': sum(bool(r.get('errors')) for r in reports),
+            'pending_cases': max(0, expected - len(reports)), 'cpi_scored_cases': len(scored),
+            'cpi_mae': sum(c['absolute_error'] for c in aggregate) / len(aggregate) if aggregate else None,
+            'cpi_mape_percent': sum(relative) * 100 / len(relative) if relative else None,
+            'cpi_mape_cases': len(relative),
+            'cpi_aggregate_status': 'available' if aggregate else 'unavailable-empty-or-mixed-policy',
+            'pmu_status': 'unavailable-no-current-native-audit', 'cases': reports}
+
+
+def run_quick_case(case, args):
+    report = {**case, 'validation_mode': 'quick', 'formal_validation': False,
+              'status': 'diagnostic-unavailable', 'errors': [],
+              'pmu_validation': {'status': 'unavailable-no-current-native-audit'}}
+    try:
+        _, manifest = validate_input(case)
+        source = Path(case['result_dir'])
+        if args.stats_dir is None:
+            output = args.output_dir / 'stats' / (case['case_id'] + '.json')
+            output.parent.mkdir(parents=True, exist_ok=True)
+            command = [str(args.fastsim), 'simulate', '--config', str(args.config),
+                       '--manifest', str(manifest), '--measurement-scope', 'user-plus-kernel',
+                       '--cores', str(case['cores']), '--native-kernel-trace', 'true',
+                       '--perf-cache-input-identity', 'true', '--output', str(output)]
+            subprocess.run(command, cwd=args.repo_root, check=True, stdout=subprocess.DEVNULL)
+        else:
+            output = args.stats_dir / (case['case_id'] + '.json')
+        simulation = load_json(output)
+        if simulation.get('measurement_scope') != 'user-plus-kernel' or simulation.get('configuration', {}).get('cores') != case['cores']:
+            raise ValueError('measurement scope or core count mismatch')
+        quick_check_source_identity(simulation.get('functional_source_identity'), source / 'tao_trace', case['cores'])
+        saved = load_json(source / 'oracle/thread-state-accounting.json')
+        if saved.get('valid') is not True or saved.get('oracle_only') is not True:
+            raise ValueError('missing valid saved native time audit')
+        oracle = load_json(source / 'oracle/kernel_events.json')
+        comparison = build_time_comparison(simulation, oracle, saved)
+        report.update(comparison)
+        if report['cpi']['status'] != 'scored-active':
+            raise ValueError('CPI unavailable: ' + ', '.join(report['cpi']['reasons']))
+        report['status'] = 'diagnostic-scored'
+        report['fastsim_output'] = str(output.resolve())
+        report['limitations'] = ['saved native audit reused without fresh FST or source hash audit',
+                                 'native and retired-cache PMU not scored',
+                                 'target identity and binary/config provenance require separate verification']
+    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as exc:
+        report['errors'].append(str(exc))
+    return report
+
+
+def run_quick(args):
+    cases = discover_cases(args.matrix, args.source_root)
+    if args.retired_cache or args.perf_cache or args.perf_retirement:
+        print('quick mode: requested native PMU metrics are unavailable without strict audit', flush=True)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    old = args.output_dir / 'summary.json'
+    if ((old.exists() and load_json(old).get('validation_mode') != 'quick')
+            or (args.output_dir / 'cases').exists()):
+        raise ValueError('quick output directory contains a non-quick summary')
+    with ThreadPoolExecutor(max_workers=args.jobs) as executor:
+        reports = list(executor.map(lambda case: run_quick_case(case, args), cases))
+    summary = quick_summary(reports, args.expected_cases)
+    atomic_json(old, summary)
+    lines = ['# Quick CPI diagnostics', '',
+             'Provisional: saved audits reused; source contents and native PMU are not freshly audited. Formal passes: 0.', '',
+             '| case | gem5 CPI | FastSim CPI | absolute error cycles/macro | relative error | status |',
+             '|---|---:|---:|---:|---:|---|']
+    for r in reports:
+        c = r.get('cpi', {})
+        lines.append(f"| {r['case_id']} | {c.get('gem5')} | {c.get('fastsim')} | {c.get('absolute_error')} | {c.get('relative_error')} | {r['status']} |")
+    lines.append(f"\nCPI MAE: {summary['cpi_mae']} cycles/macro; MAPE: {summary['cpi_mape_percent']}%.")
+    (args.output_dir / 'summary.md').write_text('\n'.join(lines) + '\n')
+    print(f"quick diagnostics: {summary['cpi_scored_cases']}/{args.expected_cases} scored; strict passes=0", flush=True)
+    return 0 if len(reports) == args.expected_cases and not summary['failed_cases'] else 1
 
 
 def parse_args():
@@ -1359,6 +1477,12 @@ def parse_args():
     parser.add_argument("--config", type=Path)
     parser.add_argument("--stats-dir", type=Path,
                         help="Rescore existing <case_id>.json files; do not run FastSim")
+    parser.add_argument('--validation-mode', choices=('quick', 'strict'), default='quick',
+                        help='quick diagnostic (default) or complete strict source audit')
+    parser.add_argument('--retired-service-expectations',action='store_true',
+        help='Compare separate fractional retired-service estimates; requires strict source audit and implies --retired-cache')
+    parser.add_argument('--retired-service-native-unknown-limit',type=int,choices=range(3),default=0,
+        help='Explicit provisional allowance of 0..2 native unknowns; never clears unknown counts')
     parser.add_argument("--retired-cache",action="store_true",help="Compare retired load L1/L2/L3 cache events using native service facts; provisional errors retain unknown membership")
     parser.add_argument('--retired-cache-misses',action='store_true',
         help='Compare only three retired load miss point estimates; implies --retired-cache; no FB-hit accuracy gate')
@@ -1383,6 +1507,13 @@ def parse_args():
     parser.add_argument("--poll-seconds", type=int, default=30)
     parser.add_argument("--collection-exit-file", type=Path)
     args = parser.parse_args()
+    if args.validation_mode == 'quick' and args.watch:
+        parser.error('--watch requires --validation-mode strict')
+    if args.retired_service_expectations:
+        if args.validation_mode!='strict':parser.error('--retired-service-expectations requires --validation-mode strict')
+        args.retired_cache=True
+    if args.retired_service_native_unknown_limit and not args.retired_service_expectations:
+        parser.error('--retired-service-native-unknown-limit requires --retired-service-expectations')
     if args.retired_cache_per_event:args.retired_cache_misses=True
     if args.retired_cache_misses:args.retired_cache=True
     if args.perf_cache_estimates and not args.perf_cache:parser.error('--perf-cache-estimates requires --perf-cache')
@@ -1407,6 +1538,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.validation_mode == 'quick':
+        return run_quick(args)
+    existing = args.output_dir / 'summary.json'
+    if existing.exists() and load_json(existing).get('validation_mode') == 'quick':
+        raise ValueError('strict output directory contains a quick summary')
     args.output_dir.mkdir(parents=True, exist_ok=True)
     while True:
         discovered = discover_cases(args.matrix, args.source_root)

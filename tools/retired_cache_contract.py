@@ -216,6 +216,96 @@ def compare_retired_cache(model,reference,*,misses_only=False,allow_incomplete_e
     return result
 
 
+def compare_retired_cache_expectations(model,expectation,reference,*,small_native_unknown_limit=0):
+    """Score separate fractional estimates after the existing source gates.
+
+    Never changes the legacy report, the native reference or an unknown count.
+    The optional <=2 native unknown allowance is explicit/provisional only.
+    """
+    import math
+    if type(small_native_unknown_limit) is not int or not 0<=small_native_unknown_limit<=2:
+        raise ValueError('small native unknown allowance must be 0..2')
+    if (reference.get('membership_policy')!=SPR_MISS_POLICY or
+            expectation.get('semantic_policy')!=SPR_MISS_POLICY):
+        raise ValueError('service expectation requires current native SPR miss semantic policy')
+    validate_miss_estimates(model)
+    if any(row['events'][name]['estimate_policy']!=SPR_MISS_POLICY
+           for block in (model,*model['per_core']) for row in block['scopes'].values() for name in MISS_EVENTS):
+        raise ValueError('service expectation legacy input semantic policy mismatch')
+    base=compare_retired_cache(model,reference,misses_only=False)
+    if (expectation.get('schema')!='retired-service-expectation-v1' or expectation.get('available') is not True
+            or expectation.get('model') not in ('bounded-v1','probabilistic-v1')
+            or expectation.get('unit')!='architectural-retired-macro-instruction'
+            or expectation.get('hardware_equivalence')!='unverified' or expectation.get('scale')!=65536
+            or expectation.get('timing_feedback') is not False or expectation.get('synthetic_requests') is not False
+            or expectation.get('owner_coverage')!='complete'
+            or expectation.get('input_identity')!=model['input_identity']
+            or expectation.get('task_ids')!=model.get('task_ids')):
+        raise ValueError('service expectation identity/policy/coverage mismatch')
+    if reference.get('evidence_gaps'):raise ValueError('native retired-cache coverage incomplete')
+    cores=expectation.get('per_core',[]);ids=[c.get('core_id') for c in cores]
+    if len(ids)!=len(set(ids)) or set(ids)!={c['core_id'] for c in model['per_core']}:
+        raise ValueError('service expectation core mismatch')
+    ecores={c['core_id']:c for c in cores};mcores={c['core_id']:c for c in model['per_core']}
+    rcores={c['core_id']:c for c in reference['per_core']}
+    counters=('eligible_loads','unknown_source_loads','clock_unavailable_loads','correlation_uncertain_loads','fallback_loads')
+    for block,legacy in [(expectation,model),*((ecores[k],mcores[k]) for k in ids)]:
+        if set(block.get('scopes',{}))!=set(SCOPES):raise ValueError('service expectation scopes missing')
+        for scope,row in block['scopes'].items():
+            old=legacy['scopes'][scope];bound=old['events']['retired_loads']['count']
+            if any(row.get(k)!=old[k] for k in POP) or row.get('eligible_loads')!=bound:
+                raise ValueError('service expectation functional/eligible population mismatch')
+            for k in counters:
+                if integer(row.get(k),k)>bound:raise ValueError('service expectation coverage exceeds population')
+            if set(row.get('events',{}))!=set(MISS_EVENTS):raise ValueError('service expectation event mismatch')
+            previous=bound*65536
+            for name in MISS_EVENTS:
+                e=row['events'][name];q=integer(e.get('expected_q16'),'expected_q16')
+                lo=integer(e.get('lower_q16'),'lower_q16');hi=integer(e.get('upper_q16'),'upper_q16')
+                value=e.get('expected_count')
+                if (not lo<=q<=hi<=bound*65536 or q>previous or type(value) not in (int,float)
+                        or not math.isfinite(value) or not math.isclose(value,q/65536,rel_tol=1e-13,abs_tol=1e-9)):
+                    raise ValueError('invalid/nonfinite/non-nested service expectation')
+                previous=q
+    for scope,total in expectation['scopes'].items():
+        for k in (*POP,*counters):
+            if total[k]!=sum(c['scopes'][scope][k] for c in cores):raise ValueError('service expectation per-core population sum mismatch')
+        for name in MISS_EVENTS:
+            for k in ('expected_q16','lower_q16','upper_q16'):
+                if total['events'][name][k]!=sum(c['scopes'][scope]['events'][name][k] for c in cores):
+                    raise ValueError('service expectation per-core probability sum mismatch')
+    for core in ids:
+        for scope,row in rcores[core]['scopes'].items():
+            if ecores[core]['scopes'][scope]['eligible_loads']!=row['events']['retired_loads']['count']:
+                raise ValueError('service expectation native eligible population mismatch')
+            if row['events']['retired_loads']['unknown']:
+                raise ValueError('native eligible load population unknown')
+    if any(reference['scopes']['workload_task']['events'][k]['unknown']>small_native_unknown_limit for k in MISS_EVENTS):
+        raise ValueError('native retired-cache unknown membership exceeds explicit allowance')
+    result=dict(schema='retired-service-expectation-comparison-v1',hardware_equivalence='unverified',
+                prediction_kind='conditional expectation; not observed event counts',primary_events=list(MISS_EVENTS),prediction_policy=expectation['model'],
+                input_identity=model['input_identity'],task_ids=model['task_ids'],model=expectation['model'],
+                small_native_unknown_limit=small_native_unknown_limit,scopes={})
+    for scope,row in expectation['scopes'].items():
+        result['scopes'][scope]={'retired_macro_instructions':row['retired_macro_instructions'],'events':{}}
+        for name in MISS_EVENTS:
+            pred=row['events'][name]['expected_count'];native=reference['scopes'][scope]['events'][name]
+            ref=native['count'];unknown=native['unknown']
+            allowed=unknown<=small_native_unknown_limit
+            relative=(pred-ref)/ref if ref and allowed else None
+            info=dict(base['scopes'][scope]['events'][name])
+            info.update(predicted=pred,reference=ref,reference_unknown=unknown,model_unknown=row['unknown_source_loads'],
+                absolute_error=abs(pred-ref) if allowed else None,signed_error=pred-ref if allowed else None,
+                relative_error=relative,ape_percent=abs(relative)*100 if relative is not None else None,
+                status='small-unknown-provisional' if unknown and allowed else 'unavailable-native-unknown' if unknown else 'provisional-expectation',
+                estimate_policy=expectation['model'],prediction_domain='full eligible macro population conditional expectation')
+            denominator=row['retired_macro_instructions']
+            info['predicted_per_1k_inst']=pred*1000/denominator if denominator else None
+            info['relative_error_if_all_unknown_miss']=(pred-(ref+unknown))/(ref+unknown) if ref+unknown and allowed else None
+            result['scopes'][scope]['events'][name]=info
+    return result
+
+
 def audit_retired_cache(trace_dir):
     # Reuse the maintained auditor: FST/owner identities, exact ordinal bounds,
     # common endpoint, native source and primitive conservation remain required.

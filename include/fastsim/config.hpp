@@ -241,6 +241,10 @@ struct DramConfig {
 // FS/timing studies can select an explicit fixed-latency walker because page
 // table memory references are absent from the functional trace.
 struct TlbConfig {
+    bool functional_model = false;
+    std::uint32_t functional_l1_ways = 6;
+    std::uint32_t stlb_hit_latency = 6;
+    std::uint32_t max_pending_translations = 512;
     bool enabled = false;
     // Optional state-only replay of predictor-selected static memory PCs.
     // It reuses instruction-path reconstruction but does not require or mutate
@@ -317,7 +321,18 @@ struct KernelEventProfile {
 
 using SyscallKernelEventProfile = KernelEventProfile;
 
+struct DeviceIoConfig {
+    bool enabled = false;
+    // Static platform facts, never measured request/response timestamps.
+    std::uint64_t clock_period_ticks = 0;
+    std::uint64_t uart_address = 0x80000000000003f8ull;
+    std::uint32_t uart_size = 8;
+    std::uint64_t uart_latency_ticks = 0;
+    std::uint64_t apic_latency_ticks = 0;
+};
+
 struct SimulatorConfig {
+    DeviceIoConfig device_io;
     MeasurementScope measurement_scope = MeasurementScope::kUnspecified;
     // The functional input itself contains privilege-tagged CPL0 records.
     // This exact input mode is intentionally exclusive with every synthetic
@@ -523,6 +538,8 @@ struct SimulatorConfig {
     std::uint32_t spr_store_window_lines = 4;
     bool spr_load_fill_feedback = false;
     bool spr_load_bank_feedback = false;
+    // Sparse successful-load cohort bound; no per-UOP issue calendar.
+    bool sparse_load_pressure = false;
     // Count each uncertified ordinary load fragment once in the generic port calendar.
     bool spr_load_port_fallback_proxy = false;
     std::uint32_t spr_l1d_fill_entries = 16;
@@ -693,6 +710,8 @@ struct SimulatorConfig {
     // Isolated migration: off, observe (neutral structure), wait (certified
     // ordinary-read availability). Old line/pending-fill experiments excluded.
     std::string unified_parent_service = "off";
+    // Optional estimated read timing within the existing v2 parent pool.
+    bool unified_parent_estimated = false;
     std::uint32_t unified_parent_service_capacity = 16384;
     // Explicit mechanism ablations. The admission/store combination failed
     // the phase-one P99 gate and must not be enabled implicitly. All three
@@ -898,6 +917,7 @@ struct SimulatorConfig {
     // Bounded functional-producer approximation; OFF preserves legacy timing.
     bool spr_rename_elimination = false;
     std::string spr_rename_policy_sha256;
+    bool spr_rename_require_source_policy = false; // Explicit historical rollback only.
     std::uint32_t integer_alu_units = 6;
     std::uint32_t integer_multiply_units = 2;
     std::uint32_t float_simple_units = 4;
@@ -1091,6 +1111,9 @@ struct SimulatorConfig {
     // admission edge.  This is a shadow path: it must not change cache,
     // response, retirement, or CPI state.
     bool ruby_line_generation_admission_audit = false;
+    // Observer-only experiment; does not modify cache or CPU timing.
+    bool retired_cache_final_admission_clock = false;
+    std::string retired_cache_service_model = "off";
     // Use the interval core's OoO producer issue for ordinary loads and
     // place the Ruby admission one core cycle later, at execute/address
     // generation. The monotone memory timestamp remains only a checkpoint

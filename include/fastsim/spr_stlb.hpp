@@ -1,8 +1,10 @@
 #pragma once
 #include <array>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -21,6 +23,7 @@ class SprStlb {
         bool global=false, valid=false;
         std::uint64_t physical_base=0, walk_root=0;
         bool mapping_known=false;
+        std::uint64_t ready_cycle=0;
     };
     static unsigned domain(std::uint64_t virtual_address,unsigned bits) {
         check_page_bits(bits);
@@ -32,7 +35,7 @@ class SprStlb {
         return unsigned((virtual_address>>bits)&127u);
     }
     std::optional<Entry> lookup(std::uint64_t asid,unsigned pcid,std::uint64_t virtual_address,
-                                bool update_lru=true) {
+                                bool update_lru=true,std::uint64_t now=std::numeric_limits<std::uint64_t>::max()) {
         check_pcid(pcid);
         // gem5 Trie::lookupHandle returns the first matching prefix: broadest first.
         for (const auto bits : {30u,22u,21u,12u}) {
@@ -40,7 +43,7 @@ class SprStlb {
             const auto base=virtual_address & ~((std::uint64_t{1}<<bits)-1);
             for (std::size_t i=0;i<group.size();++i) {
                 if (!group[i].valid || group[i].asid!=asid || group[i].pcid!=pcid ||
-                    group[i].page_bits!=bits || group[i].virtual_base!=base) continue;
+                    group[i].page_bits!=bits || group[i].virtual_base!=base || group[i].ready_cycle>now) continue;
                 const auto found=group[i];
                 if (update_lru) {for (auto j=i;j>0;--j) group[j]=group[j-1];group[0]=found;}
                 return found;
@@ -51,14 +54,22 @@ class SprStlb {
     // A duplicate matching trie entry is retained and does not update LRU,
     // matching TLB::insert's early return. Returns true for a new entry.
     bool insert(std::uint64_t asid,unsigned pcid,std::uint64_t virtual_address,unsigned bits,bool global,
-                std::optional<std::pair<std::uint64_t,std::uint64_t>> mapping = std::nullopt) {
+                std::optional<std::pair<std::uint64_t,std::uint64_t>> mapping = std::nullopt,
+                std::uint64_t ready_cycle=0) {
         check_page_bits(bits);
-        if (lookup(asid,pcid,virtual_address,false)) return false;
+        if (const auto existing=lookup(asid,pcid,virtual_address,false)) {
+            auto& group=groups_[domain(existing->virtual_base,existing->page_bits)][set(existing->virtual_base,existing->page_bits)];
+            for(auto& entry:group)if(entry.valid && entry.asid==asid && entry.pcid==pcid &&
+                entry.virtual_base==existing->virtual_base && entry.page_bits==existing->page_bits)
+                entry.ready_cycle=std::min(entry.ready_cycle,ready_cycle);
+            return false;
+        }
         auto& group=groups_[domain(virtual_address,bits)][set(virtual_address,bits)];
         for (auto i=group.size()-1;i>0;--i) group[i]=group[i-1];
         group[0]=Entry{asid,virtual_address & ~((std::uint64_t{1}<<bits)-1),
                        static_cast<std::uint16_t>(pcid),static_cast<std::uint8_t>(bits),global,true};
         if (mapping) { group[0].physical_base=mapping->first; group[0].walk_root=mapping->second; group[0].mapping_known=true; }
+        group[0].ready_cycle=ready_cycle;
         return true;
     }
     void flush_all() {

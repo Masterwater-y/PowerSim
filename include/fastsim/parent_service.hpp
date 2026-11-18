@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <queue>
 #include <stdexcept>
 #include <unordered_map>
@@ -20,7 +21,7 @@ class ParentServicePool {
  public:
   using Id = std::uint64_t;
   static constexpr Id none = 0;
-  enum class Time : std::uint8_t { kUnknown, kFinalLocal, kSelectedFixed, kLegacyCoupled };
+  enum class Time : std::uint8_t { kUnknown, kFinalLocal, kSelectedFixed, kLegacyCoupled, kEstimated };
   enum class State : std::uint8_t { kUnknown, kInvalid, kShared, kExclusive, kModified };
   enum class Action : std::uint8_t { kUnknown, kNone, kFetchShared, kFetchExclusive, kUpgrade };
   enum class Role : std::uint8_t { kLoad, kPrepare, kStore };
@@ -78,6 +79,8 @@ class ParentServicePool {
     bool has_data_fill = false;
     Time controller_time = Time::kUnknown;
     std::uint64_t request_callback = 0;
+    // Functional lower-fill identity; zero means no unique lower owner.
+    std::uint64_t lower_generation = 0;
     struct OwnedLease {
       std::uint64_t begin = 0;
       Edge release_edge = Edge::kController;
@@ -89,6 +92,34 @@ class ParentServicePool {
     Outcome outcome = Outcome::kAbsent;
     Id id = none;
   };
+
+  static std::optional<std::uint64_t> estimate_read_data(
+      std::uint64_t admission, std::uint64_t selected_issue,
+      std::uint64_t selected_response, std::uint64_t selected_queue) {
+    if (admission < selected_issue || selected_response <= selected_issue)
+      return std::nullopt;
+    const auto span = selected_response - selected_issue;
+    if (selected_queue >= span) return std::nullopt;
+    const auto service = span - selected_queue;
+    if (service > std::numeric_limits<std::uint64_t>::max() - admission)
+      return std::nullopt;
+    return std::max(selected_response, admission + service);
+  }
+  void set_lower_generation(Id id, std::uint64_t generation) {
+    record(id).lower_generation = generation;
+  }
+  Id estimated_owner(std::uint64_t line, std::uint64_t admission,
+                     std::uint64_t generation, bool private_l2) const {
+    const auto id = lines_.get(line);
+    if (!id) return none;
+    const auto& r = record(id);
+    return r.data_time == Time::kEstimated &&
+        r.origin == Role::kLoad && r.consumer == Role::kLoad &&
+        r.action == Action::kFetchShared && r.admission <= admission &&
+        r.data_ready > admission &&
+        (private_l2 || (generation && generation == r.lower_generation))
+        ? id : none;
+  }
 
   void configure(std::size_t capacity) {
     if (capacity == 0 || capacity > 65536)
@@ -235,6 +266,10 @@ class ParentServicePool {
   void set_service(Id id, Action action, Role origin, std::uint64_t data,
                    std::uint64_t permission, std::uint64_t controller, Time quality) {
     auto& r = record(id);
+    // create() retains the unchanged CPU callback as the initial ready edge.
+    // An estimated read-data edge cannot shorten permission fallback or the
+    // indexed identity lifetime of that still-outstanding transaction.
+    if (quality == Time::kEstimated) r.request_callback = r.data_ready;
     r.action = action; r.origin = r.consumer = origin;
     r.has_data_fill = action == Action::kFetchShared || action == Action::kFetchExclusive;
     r.data_ready = data; r.permission_ready = permission; r.controller_ready = controller;
@@ -406,7 +441,8 @@ class ParentServicePool {
   }
   static std::uint64_t completion(const Record& r) {
     return std::max({r.data_ready,r.controller_ready,
-        r.consumer == Role::kStore ? r.write_ready : 0});
+        r.consumer == Role::kStore ? r.write_ready : 0,
+        r.data_time == Time::kEstimated ? r.request_callback : 0});
   }
   std::uint64_t release(Id id,std::size_t level) const {
     return id ? record(id).leases[level].release : 0;
@@ -447,6 +483,10 @@ struct UnifiedParentCounters {
   std::uint64_t legacy_coupled_services=0, credit_releases=0, copied_record_blocks=0;
   std::uint64_t split_services=0, resource_source_fallbacks=0;
   std::uint64_t tbe_allocations=0, fill_allocations=0;
+  std::uint64_t estimated_sources=0, estimated_local_sources=0, estimated_lower_sources=0;
+  std::uint64_t estimated_rejected=0, estimated_reused_fills=0, estimated_followers=0;
+  std::uint64_t estimated_waits=0, estimated_wait_cycles=0;
+  std::uint64_t estimated_excluded_queue_cycles=0;
   static constexpr std::size_t source_decisions =
       static_cast<std::size_t>(ParentServicePool::SourceDecision::kCount);
   using SourceLedger = std::array<std::array<std::array<std::uint64_t,source_decisions>,6>,3>;
@@ -478,6 +518,15 @@ struct UnifiedParentCounters {
     copied_record_blocks+=b.copied_record_blocks;
     split_services+=b.split_services; resource_source_fallbacks+=b.resource_source_fallbacks;
     tbe_allocations+=b.tbe_allocations; fill_allocations+=b.fill_allocations;
+    estimated_sources+=b.estimated_sources;
+    estimated_local_sources+=b.estimated_local_sources;
+    estimated_lower_sources+=b.estimated_lower_sources;
+    estimated_rejected+=b.estimated_rejected;
+    estimated_reused_fills+=b.estimated_reused_fills;
+    estimated_followers+=b.estimated_followers;
+    estimated_waits+=b.estimated_waits;
+    estimated_wait_cycles+=b.estimated_wait_cycles;
+    estimated_excluded_queue_cycles+=b.estimated_excluded_queue_cycles;
     copied_index_pages+=b.copied_index_pages;
     copied_index_directories+=b.copied_index_directories;
     copied_index_bytes+=b.copied_index_bytes;

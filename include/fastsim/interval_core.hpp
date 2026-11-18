@@ -23,6 +23,7 @@
 #include "fastsim/spr_rename_elimination.hpp"
 #include "fastsim/fst_translation_facts.hpp"
 #include "fastsim/spr_stlb.hpp"
+#include "fastsim/functional_page_walk.hpp"
 
 namespace fastsim {
 
@@ -34,6 +35,8 @@ struct IntervalTiming {
     std::uint32_t spr_dtlb_stlb_hits = 0, spr_dtlb_stlb_misses = 0;
     std::uint32_t spr_dtlb_stlb_fallbacks = 0, spr_dtlb_stlb_flushes = 0;
     std::uint32_t spr_dtlb_stlb_missing_controls = 0;
+    std::uint32_t functional_walk_physical = 0, functional_walk_structural = 0;
+    std::uint64_t functional_pending_wait_cycles = 0;
     std::uint32_t spr_itlb_hits = 0, spr_itlb_stlb_hits = 0, spr_itlb_stlb_misses = 0, spr_itlb_unknown = 0;
     enum class IntegerRoute : std::uint8_t {Disabled,Managed,Generic,Unknown,
                                             StaticZeroFallback,MoveFallback,FusionFallback};
@@ -302,14 +305,15 @@ class IntervalCoreModel {
         std::uint64_t token = 0;
         std::uint8_t page_bits = 0;
         bool global = false;
+        std::uint16_t pcid = 0;
 
         bool operator==(const DtlbKey& other) const {
             return address_space_id == other.address_space_id &&
-                token == other.token && page_bits == other.page_bits && global == other.global;
+                token == other.token && page_bits == other.page_bits && global == other.global && pcid == other.pcid;
         }
         bool operator<(const DtlbKey& other) const {
-            return std::tie(address_space_id, token, page_bits, global) <
-                std::tie(other.address_space_id, other.token, other.page_bits, other.global);
+            return std::tie(address_space_id, token, page_bits, global, pcid) <
+                std::tie(other.address_space_id, other.token, other.page_bits, other.global, other.pcid);
         }
     };
     struct DtlbKeyHash {
@@ -370,7 +374,7 @@ class IntervalCoreModel {
     void activate_address_space(std::uint64_t address_space_id);
     void retire_page_walks_through(std::uint64_t cycle);
     void reclaim_translation_metadata();
-    void fill_dtlb(const DtlbKey& key, std::uint64_t generation);
+    void fill_dtlb(const DtlbKey& key, std::uint64_t generation, std::uint64_t ready_cycle=0);
     void fill_architectural_dtlb(const DtlbKey& key);
     void access_speculative_dtlb(std::uint64_t pc,
                                  IntervalTiming& timing);
@@ -592,6 +596,7 @@ class IntervalCoreModel {
     struct DtlbEntry {
         std::uint64_t lru_sequence = 0;
         std::uint64_t fill_generation = 0;
+        std::uint64_t ready_cycle = 0;
     };
     struct PendingPageWalk {
         std::uint64_t ready_cycle = 0;
@@ -619,6 +624,7 @@ class IntervalCoreModel {
     std::priority_queue<PageWalk, std::vector<PageWalk>,
                         std::greater<PageWalk>> page_walk_completions_;
     std::vector<std::uint64_t> page_walker_ready_;
+    std::unique_ptr<FunctionalPageWalk> functional_walk_;
     std::unordered_map<DtlbKey, fst::TranslationMapping, DtlbKeyHash> dynamic_dtlb_mappings_;
     std::unordered_map<DtlbKey, std::uint64_t, DtlbKeyHash> dynamic_dtlb_versions_;
     std::unordered_map<DtlbKey, std::uint64_t, DtlbKeyHash> outstanding_dynamic_walks_;

@@ -157,8 +157,12 @@ public:
         }
         // Immediate functional E/M after an unknown outstanding transaction
         // cannot certify that permission is already available.
+        const auto permission_fallback = transient
+            ? std::max(transient->controller_ready,
+                transient->data_time == P::Time::kEstimated ? transient->request_callback : 0)
+            : 0;
         const bool no_transaction = facts.action == P::Action::kNone &&
-            !(transient && transient->controller_ready > eligible);
+            permission_fallback <= eligible;
         counters.prepare_no_transaction += no_transaction;
         counters.prepare_unknown += facts.action == P::Action::kUnknown;
         auto permission = std::max(replay_permission,add(eligible,service));

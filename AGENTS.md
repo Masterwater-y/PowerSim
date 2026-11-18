@@ -49,11 +49,44 @@ In managed agent sessions, `/data00/yinhaolang/FastSim/.git` may appear as an em
 
 ## Current SPR milestone and evaluation default
 
+- User directive (2026-11-17): select **SPR-M5 — Private Preview Clock Repair**
+  as the SPR default through `configs/spr-evaluation-default.cfg`, selecting
+  immutable `configs/spr-m5-private-preview-clocks.cfg`. `build/fastsim` is the
+  measured retained-clock ELF, SHA-256
+  `b869c0041b7ca6cf625e8aebdd6392e7c4a52be95ad1466052dc3d39e7d5f1b8`.
+  Retain Estimated source/tests but explicitly set
+  `core.unified_parent_estimated=false`; its active flag and numeric counters
+  must remain false/zero. Keep inherited functional STLB/page walk, UART/APIC,
+  rename elimination, retired-store prepare and `v2-wait` enabled. Preserve
+  immutable M1-M4; the previous M4 ELF is backed up at
+  `tmp/spr-m5-default-20261117/frozen-m4/fastsim`. See
+  `docs/spr-m5-private-preview-clocks-default-20261117.md` for identity,
+  rollback and the 12-case results. User permits ignoring the 1-2 native unknown
+  members per affected event for this provisional PMU report; preserve their
+  actual counts and sensitivity bounds. This default decision does not certify
+  strict native PMU, hardware equivalence or throughput acceptance.
+
+- User directive (2026-11-16): enable UART/APIC service by default as
+  `configs/spr-m4-device-io.cfg` through the SPR evaluation alias. The ten
+  current C4/C8 sources share the same target-platform device parameters;
+  these are platform presets, not per-trace identity/version requirements.
+  Use `device_io.enabled=false` for a device-only control. Preserve M1/M2/M3.
+  The model ELF remains d6f5bae930dfad9782a938080f1de5e647dc44a6fc967c89dbc6f44e4eb9c5f9;
+  default selection does not certify CPI thresholds, PMU or throughput.
+
+- User directive (2026-11-16): the working SPR default advances to
+  `configs/spr-m3-functional-translation.cfg`, with functional STLB/page-walk
+  service enabled. Preserve immutable M1/M2. Current ELF identity and the
+  independent opt-in UART/APIC device service are documented in
+  `docs/spr-device-io-service-20261116.md`; device timing parameters must bind
+  the actual source. This default decision is separate from CPI/PMU/throughput
+  qualification. Historical M2 default statements below describe that milestone.
+
 - User directive (2026-11-11): **SPR-M1 — Retired Prepare baseline** names the
   frozen R0/R1 `v2-wait` executable, SHA-256
   `dad62e0d67bea89cd9c69a946a2bd5e1eac89b7e9f3edf54704c0f81f13dc905`.
-- Subsequent SPR CPI/PMU/throughput evaluations default to
-  `configs/spr-evaluation-default.cfg`, currently selecting the immutable
+- Historical 2026-11-12 selection: SPR evaluations used
+  `configs/spr-evaluation-default.cfg`, then selecting the immutable
   `configs/spr-m2-rename-elimination.cfg`. `configs/gem5-spr-retired.cfg` uses the
   same alias. Historical generic/versioned profiles are explicit controls.
 - User directive (2026-11-12): enable bounded MOV / zero-idiom elimination
@@ -92,6 +125,32 @@ In managed agent sessions, `/data00/yinhaolang/FastSim/.git` may appear as an em
 
 ## Host evaluation and throughput
 
+- User directive (2026-11-18): subsequent simulations use one distinct,
+  qualified high-frequency physical host core per simulated core. On this
+  host the qualified pool is CPU **48–63**, socket/NUMA node 1; use
+  `python3 scripts/run_high_frequency.py --cores N -- COMMAND ARGS...` with
+  N equal to the target core count. Verify actual affinity and avoid nested
+  `taskset` masks that reduce the selected core count. C16 results measured
+  with 12 host cores remain historical and must be labeled separately.
+
+
+- User directive (2026-11-16, latest): subsequent zsim throughput reports use
+  the file-parallel preparation implementation as the primary baseline.
+  Default to `TRACEBENCH_PREPARE_JOBS=auto`; preparation remains inside
+  end-to-end wall time and extra validation remains outside. The measured
+  frozen ELF is `tmp/e2e-throughput-20261116/campaign-zsim-parallel/zsim-frozen`.
+  Serial preparation is an explicitly labeled historical control only; never
+  silently fall back to it. See `zsim-parallel-input-preparation-20261116.md`.
+
+- User directive (2026-11-16): for the FastSim/Sniper/zsim C4/C8 comparison,
+  primary throughput is end-to-end, including input preprocessing,
+  initialization, functional warmup, simulation and required drain. Extra
+  integrity/content/projection audits run separately. Simulation-only rates
+  remain auxiliary; the older preprocessing-excluded primary policy below is
+  historical for this comparison. Follow
+  `docs/trace-comparison-throughput-contract-20261116.md` and use actual global
+  monotonic wall spans, never subtract worker CPU time.
+
 - User directive (2026-11-12): exclude input initialization, preprocessing,
   source/integrity checks and input-validation work from the primary
   throughput denominator. Report their costs separately; keep full process
@@ -106,14 +165,9 @@ In managed agent sessions, `/data00/yinhaolang/FastSim/.git` may appear as an em
   before `Simulator::run()` and permits validation-excluded measurement;
   confirm `HOST_VALIDATED_PRELOAD=true` and keep preparation, integrity,
   initialization, warmup and full-process costs separately.
-- User directive (2026-11-12): bind subsequent host evaluations to verified
-  high-frequency cores. On the current host, use CPU **52–63**, socket/NUMA
-  node **1**, with the existing `performance` policy. Use
-  `python3 scripts/run_high_frequency.py -- COMMAND ARGS...`; it sources the
-  project temporary-path convention and rejects unavailable/low-frequency
-  cores before execution. Record actual working frequency for comparisons.
-  Requalify placement explicitly if the host changes. Do not change global
-  CPU governors or silently fall back to CPU 24–35.
+- Historical 2026-11-12 host placement used CPU 52–63 on socket/NUMA 1.
+  That 12-CPU pool is superseded for new runs by the 2026-11-18 rule above;
+  retain its identity when describing historical measurements.
 
 ## Default validation
 

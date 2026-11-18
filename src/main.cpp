@@ -1,3 +1,4 @@
+#include "fastsim/task_pmu_coverage.hpp"
 #include "fastsim/llc_audit_writer.hpp"
 #include <algorithm>
 #include <chrono>
@@ -16,6 +17,7 @@
 #include "fastsim/config.hpp"
 #include "fastsim/perf_cache_report.hpp"
 #include "fastsim/retired_cache_report.hpp"
+#include "fastsim/retired_service_report.hpp"
 #include "fastsim/perf_cache_source.hpp"
 #include "fastsim/simulator.hpp"
 #include "fastsim/trace.hpp"
@@ -1596,6 +1598,16 @@ std::string stats_json(
         << ",\"mite_uops\":" << total.spr_frontend_mite_uops
         << ",\"dsb_uops\":" << total.spr_frontend_dsb_uops
         << ",\"microcode_uops\":" << total.spr_frontend_ms_uops << "},\n";
+    const auto rename_eliminated = committed_pipeline_audit.spr_rename_gpr_alias +
+        committed_pipeline_audit.spr_rename_xmm_alias + committed_pipeline_audit.spr_rename_zero;
+    out << "  \"spr_rename_elimination\": {\"enabled\":" << (config.spr_rename_elimination ? "true" : "false")
+        << ",\"compatibility\":\"static-uop-semantics-v1-and-per-record-eligibility\""
+        << ",\"requires_source_policy\":" << (config.spr_rename_require_source_policy ? "true" : "false")
+        << ",\"eliminated_uops\":" << rename_eliminated
+        << ",\"missing_input_uops\":" << committed_pipeline_audit.spr_rename_missing
+        << ",\"status\":\"" << (!config.spr_rename_elimination ? "disabled" :
+            rename_eliminated ? (committed_pipeline_audit.spr_rename_missing ? "active-with-input-gaps" : "active") : committed_pipeline_audit.spr_rename_missing ?
+            "no-elimination-input-unavailable" : "no-eligible-instructions") << "\"},\n";
     if (stats.fixed_work_enabled) {
         out << "  \"fixed_work\": {\"schema\":\"fastsim-fixed-work-v1\","
             << "\"scope\":\"physical-core\",\"task_active_available\":false,"
@@ -1623,6 +1635,12 @@ std::string stats_json(
         const auto artifact=fastsim::perf_cache_source_artifact(path,"model_llc_audit");
         out << "  \"llc_fill_audit\": ";artifact.write_json(out);out << ",\n";
     }
+    if(const auto path=std::getenv("FASTSIM_RETIRED_FILL_AUDIT")) {
+        const auto artifact=fastsim::perf_cache_source_artifact(path,"retired_fill_decisions");
+        const auto summary=fastsim::perf_cache_source_artifact(std::string(path)+".summary.json","retired_fill_summary");
+        out << "  \"retired_fill_audit\": ";artifact.write_json(out);out << ",\n";
+        out << "  \"retired_fill_summary\": ";summary.write_json(out);out << ",\n";
+    }
     out << "  \"measurement_scope\": \""
         << fastsim::measurement_scope_name(config.measurement_scope)
         << "\",\n";
@@ -1634,6 +1652,8 @@ std::string stats_json(
     fastsim::write_perf_cache_report(out,stats,config);
     out << ", \"retired_cache\": ";
     fastsim::write_retired_cache_report(out,stats,config);
+    out << ",\n    \"retired_service_expectation\": ";
+    fastsim::write_retired_service_report(out,stats,config,input_identity?input_identity->source_identity:std::string{});
     out << ",\n";
     out << "    \"user_trace_uops\": " << user_trace_uops << ",\n";
     out << "    \"user_trace_instructions\": "
@@ -1666,13 +1686,7 @@ std::string stats_json(
     const bool task_active_available=stats.task_clock_enabled && stats.task_clock_complete &&
         stats.task_clock_contract=="task-lifecycle-basecpu-active-v1" &&
         stats.task_clock_macro_instructions>0 && task_unknown_cycles==0;
-    bool task_pmu_available=stats.thread_state_enabled && stats.thread_state_accounting_complete &&
-        stats.thread_state_accounting_contract=="task-oncpu-switch-entry-v1";
-    for(const auto& core:stats.cores) {
-        auto conserved=core.task_pmu; conserved+=core.other_task_pmu;
-        task_pmu_available=task_pmu_available &&
-            core.task_pmu.retired_instructions>0 && conserved==core.full_task_pmu;
-    }
+    const bool task_pmu_available=fastsim::task_pmu_coverage_available(stats);
     const auto perf_like_denominator = total.retired_instructions +
         (user_plus_kernel && !native_kernel_trace
              ? synthetic_kernel_total.retired_instructions
@@ -2222,6 +2236,8 @@ std::string stats_json(
     out << "    \"spr_store_sq_join_credit_proxy\": "
         << (config.spr_store_sq_join_credit_proxy ? "true" : "false") << ",\n";
     out << "    \"spr_store_window_lines\": " << config.spr_store_window_lines << ",\n";
+    out << "    \"sparse_load_pressure\": "
+        << (config.sparse_load_pressure ? "true" : "false") << ",\n";
     out << "    \"spr_load_bank_feedback\": "
         << (config.spr_load_bank_feedback ? "true" : "false") << ",\n";
     out << "    \"spr_load_port_fallback_proxy\": "
@@ -2336,6 +2352,11 @@ std::string stats_json(
     out << "    \"response_pending_fill\": "
         << (config.response_pending_fill ? "true" : "false") << ",\n";
     out << "    \"unified_parent_service\": \"" << config.unified_parent_service << "\",\n";
+    out << "    \"unified_parent_estimated\": "
+        << (config.unified_parent_estimated ? "true" : "false") << ",\n";
+    out << "    \"retired_cache_service_model\": \"" << config.retired_cache_service_model << "\",\n";
+    out << "    \"retired_cache_final_admission_clock\": "
+        << (config.retired_cache_final_admission_clock ? "true" : "false") << ",\n";
     out << "    \"unified_parent_service_capacity\": " << config.unified_parent_service_capacity << ",\n";
     out << "    \"response_pending_fill_wait\": "
         << (config.response_pending_fill_wait ? "true" : "false") << ",\n";
@@ -2433,6 +2454,8 @@ std::string stats_json(
         << (config.spr_integer_family_enabled ? "true" : "false") << ",\n";
     out << "    \"spr_rename_elimination\": "
         << (config.spr_rename_elimination ? "true" : "false") << ",\n"
+        << "    \"spr_rename_require_source_policy\": "
+        << (config.spr_rename_require_source_policy ? "true" : "false") << ",\n"
         << "    \"spr_rename_policy_sha256\": \"" << config.spr_rename_policy_sha256 << "\",\n";
     out << "    \"spr_integer_family_resources_verified\": "
         << (config.spr_integer_family_resources_verified ? "true" : "false") << ",\n";
@@ -2586,11 +2609,24 @@ std::string stats_json(
         << ",\n";
     out << "    \"allow_mmio_escape\": "
         << (config.allow_mmio_escape ? "true" : "false") << ",\n";
+    out << "    \"device_io\": {\"enabled\": " << (config.device_io.enabled ? "true" : "false")
+        << ", \"clock_period_ticks\": " << config.device_io.clock_period_ticks
+        << ", \"uart_address\": " << config.device_io.uart_address
+        << ", \"uart_size\": " << config.device_io.uart_size
+        << ", \"uart_latency_ticks\": " << config.device_io.uart_latency_ticks
+        << ", \"apic_latency_ticks\": " << config.device_io.apic_latency_ticks
+        << ", \"policy\": \"strict-functional-device-service-v1\", \"bus_contention\": \"unmodeled\"},\n";
     out << "    \"dtlb\": {\"enabled\": "
         << (config.dtlb.enabled ? "true" : "false")
         << ", \"speculative_path_state\": "
         << (config.dtlb.speculative_path_state ? "true" : "false")
         << ", \"entries\": " << config.dtlb.entries
+        << ", \"functional_model\": " << (config.dtlb.functional_model ? "true" : "false")
+        << ", \"functional_l1_ways\": " << config.dtlb.functional_l1_ways
+        << ", \"stlb_hit_latency\": " << config.dtlb.stlb_hit_latency
+        << ", \"max_pending_translations\": " << config.dtlb.max_pending_translations
+        << ", \"walk_service\": \"" << (config.dtlb.functional_model ? "bounded-PTE-cache-shadow-physical-or-structural" : "legacy") << "\""
+        << ", \"invalidation_policy\": \"" << (config.dtlb.functional_model ? "functional-observed-boundaries-and-mapping-changes-MMU-gaps-approximate" : "legacy") << "\""
         << ", \"hit_latency\": " << config.dtlb.hit_latency
         << ", \"miss_model\": \"" << config.dtlb.miss_model << "\""
         << ", \"page_walk_latency\": "
@@ -2899,6 +2935,10 @@ std::string stats_json(
     out << "    \"forwarded_loads\": " << total.forwarded_loads << ",\n";
     out << "    \"mmio_escape_accesses\": "
         << total.mmio_escape_accesses << ",\n";
+    out << "    \"device_io_uart_requests\": " << total.device_io_uart_requests << ",\n";
+    out << "    \"device_io_apic_requests\": " << total.device_io_apic_requests << ",\n";
+    out << "    \"device_io_unmodeled_requests\": " << total.device_io_unmodeled_requests << ",\n";
+    out << "    \"device_io_service_cycles\": " << total.device_io_service_cycles << ",\n";
     out << "    \"unknown_addresses\": " << total.unknown_addresses << ",\n";
     out << "    \"branches_without_outcome\": "
         << total.branches_without_outcome << ",\n";
@@ -3794,6 +3834,9 @@ std::string stats_json(
     out << "    \"spr_dtlb_stlb_fallbacks\": " << total.spr_dtlb_stlb_fallbacks << ",\n";
     out << "    \"spr_dtlb_stlb_flushes\": " << total.spr_dtlb_stlb_flushes << ",\n";
     out << "    \"spr_dtlb_stlb_missing_controls\": " << total.spr_dtlb_stlb_missing_controls << ",\n";
+    out << "    \"functional_walk_physical\": " << total.functional_walk_physical << ",\n";
+    out << "    \"functional_walk_structural\": " << total.functional_walk_structural << ",\n";
+    out << "    \"functional_pending_wait_cycles\": " << total.functional_pending_wait_cycles << ",\n";
     out << "    \"spr_itlb_hits\": " << total.spr_itlb_hits << ",\n";
     out << "    \"spr_itlb_stlb_hits\": " << total.spr_itlb_stlb_hits << ",\n";
     out << "    \"spr_itlb_stlb_misses\": " << total.spr_itlb_stlb_misses << ",\n";
@@ -3866,6 +3909,11 @@ std::string stats_json(
     out << "    \"o3_iq_full_events\": "
         << o3.iq_full_events << ",\n";
     out << "    \"spr_load_port_fallbacks\": " << o3.spr_load_port_fallbacks << ",\n";
+    out << "    \"sparse_load_pressure_events\": " << o3.sparse_load_pressure_events << ",\n";
+    out << "    \"sparse_load_pressure_cohorts\": " << o3.sparse_load_pressure_cohorts << ",\n";
+    out << "    \"sparse_load_pressure_repairs\": " << o3.sparse_load_pressure_repairs << ",\n";
+    out << "    \"sparse_load_pressure_cycles\": " << o3.sparse_load_pressure_cycles << ",\n";
+    out << "    \"sparse_load_pressure_max_batch\": " << o3.sparse_load_pressure_max_batch << ",\n";
     out << "    \"spr_load_port_packets\": " << o3.spr_load_port_packets << ",\n";
     out << "    \"spr_load_port_waits\": " << o3.spr_load_port_waits << ",\n";
     out << "    \"spr_load_port_proxy_fragments\": " << o3.spr_load_port_proxy_fragments << ",\n";
@@ -4122,7 +4170,9 @@ std::string stats_json(
         << ", \"max_entries\": " << pending_fill.max_entries << "},\n";
     out << "  \"unified_parent_service\": {"
         << "\"schema\": \"fastsim-parent-service-private-v2-r01\""
-        << ", \"scope\": \"certified-local-read-and-selected-prepare-service\""
+        << ", \"scope\": \"" << (config.unified_parent_estimated
+            ? "certified-and-estimated-read-selected-prepare-service"
+            : "certified-local-read-and-selected-prepare-service") << "\""
         << ", \"lease_policy\": \"legacy-checkpoint-and-certified-service-owned-tbe-fill\""
         << ", \"transaction_policy\": \"bounded-index-page-copy-on-write-record-block-copy-on-write\""
         << ", \"record_bytes\": " << sizeof(fastsim::ParentServicePool::Record)
@@ -4160,6 +4210,15 @@ std::string stats_json(
         << ", \"resource_source_fallbacks\": " << unified_parent.resource_source_fallbacks
         << ", \"tbe_allocations\": " << unified_parent.tbe_allocations
         << ", \"fill_allocations\": " << unified_parent.fill_allocations
+        << ", \"estimated_sources\": " << unified_parent.estimated_sources
+        << ", \"estimated_local_sources\": " << unified_parent.estimated_local_sources
+        << ", \"estimated_lower_sources\": " << unified_parent.estimated_lower_sources
+        << ", \"estimated_rejected\": " << unified_parent.estimated_rejected
+        << ", \"estimated_reused_fills\": " << unified_parent.estimated_reused_fills
+        << ", \"estimated_followers\": " << unified_parent.estimated_followers
+        << ", \"estimated_waits\": " << unified_parent.estimated_waits
+        << ", \"estimated_wait_cycles\": " << unified_parent.estimated_wait_cycles
+        << ", \"estimated_excluded_queue_cycles\": " << unified_parent.estimated_excluded_queue_cycles
         << ", \"credit_releases\": " << unified_parent.credit_releases
         << ", \"copied_record_blocks\": " << unified_parent.copied_record_blocks
         << ", \"copied_index_pages\": " << unified_parent.copied_index_pages
@@ -4168,7 +4227,9 @@ std::string stats_json(
         << ", \"line_index_rebuilds\": " << unified_parent.line_index_rebuilds
         << ", \"hit_fast_returns\": " << unified_parent.hit_fast_returns
         << ", \"index_copy_scope\": \"committed-feedback-branch-only\""
-        << ", \"estimated_time_edges_active\": false"
+        << ", \"estimated_time_edges_active\": "
+        << (config.unified_parent_estimated ? "true" : "false")
+        << ", \"estimated_time_policy\": \"max-selected-completion-and-unqueued-service-floor-v1\""
         << ", \"source_ledger\": {\"scope\": \"new-service-source-candidates-excludes-existing-attachments\""
         << ", \"roles\": [\"load\", \"prepare\", \"store\"]"
         << ", \"actions\": [\"unknown\", \"none\", \"fetch_shared\", \"fetch_exclusive\", \"upgrade\", \"reserved\"]"
@@ -4933,6 +4994,10 @@ std::string stats_json(
             << c.perf_deferred_install_timing_events
             << ", \"mmio_escape_accesses\": "
             << c.mmio_escape_accesses
+            << ", \"device_io_uart_requests\": " << c.device_io_uart_requests
+            << ", \"device_io_apic_requests\": " << c.device_io_apic_requests
+            << ", \"device_io_unmodeled_requests\": " << c.device_io_unmodeled_requests
+            << ", \"device_io_service_cycles\": " << c.device_io_service_cycles
             << ", \"branches_without_outcome\": "
             << c.branches_without_outcome
             << ", \"serializing_uops\": " << c.serializing_uops
@@ -5528,6 +5593,9 @@ std::string stats_json(
             << ", \"spr_dtlb_stlb_fallbacks\": " << c.spr_dtlb_stlb_fallbacks
             << ", \"spr_dtlb_stlb_flushes\": " << c.spr_dtlb_stlb_flushes
             << ", \"spr_dtlb_stlb_missing_controls\": " << c.spr_dtlb_stlb_missing_controls
+            << ", \"functional_walk_physical\": " << c.functional_walk_physical
+            << ", \"functional_walk_structural\": " << c.functional_walk_structural
+            << ", \"functional_pending_wait_cycles\": " << c.functional_pending_wait_cycles
             << ", \"spr_itlb_hits\": " << c.spr_itlb_hits
             << ", \"spr_itlb_stlb_hits\": " << c.spr_itlb_stlb_hits
             << ", \"spr_itlb_stlb_misses\": " << c.spr_itlb_stlb_misses
@@ -5577,6 +5645,11 @@ std::string stats_json(
             << c.dtlb_timing.walk_delay_cycles
             << ", \"o3_iq_full_events\": " << q.iq_full_events
             << ", \"spr_load_port_fallbacks\": " << q.spr_load_port_fallbacks
+            << ", \"sparse_load_pressure_events\": " << q.sparse_load_pressure_events
+            << ", \"sparse_load_pressure_cohorts\": " << q.sparse_load_pressure_cohorts
+            << ", \"sparse_load_pressure_repairs\": " << q.sparse_load_pressure_repairs
+            << ", \"sparse_load_pressure_cycles\": " << q.sparse_load_pressure_cycles
+            << ", \"sparse_load_pressure_max_batch\": " << q.sparse_load_pressure_max_batch
             << ", \"spr_load_port_packets\": " << q.spr_load_port_packets
             << ", \"spr_load_port_waits\": " << q.spr_load_port_waits
             << ", \"spr_load_port_proxy_fragments\": " << q.spr_load_port_proxy_fragments
@@ -5941,6 +6014,7 @@ int simulate(const Args& args) {
     auto config = fastsim::load_simulator_config(config_path);
     config.measurement_scope = measurement_scope_option(
         args, config.measurement_scope);
+    config.sparse_load_pressure = boolean(args, "sparse-load-pressure", config.sparse_load_pressure);
     config.native_kernel_trace = boolean(
         args, "native-kernel-trace", config.native_kernel_trace);
     config.cores = u32(args, "cores", config.cores);
@@ -6236,7 +6310,7 @@ int simulate(const Args& args) {
         input_identity=fastsim::collect_perf_cache_source_identity(manifest_path,config.thread_state_plan);
         input_identity_seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
     }
-    if(std::getenv("FASTSIM_LLC_AUDIT")) {
+    if(std::getenv("FASTSIM_LLC_AUDIT") || std::getenv("FASTSIM_RETIRED_FILL_AUDIT")) {
         if(!input_identity)throw std::runtime_error("LLC audit requires --perf-cache-input-identity true");
         fastsim::llcaudit::source_identity()=input_identity->source_identity;
     }
@@ -6281,6 +6355,7 @@ int benchmark(const Args& args) {
     }
     config.measurement_scope = measurement_scope_option(
         args, config.measurement_scope);
+    config.sparse_load_pressure = boolean(args, "sparse-load-pressure", config.sparse_load_pressure);
     config.native_kernel_trace = boolean(
         args, "native-kernel-trace", config.native_kernel_trace);
     config.cores = u32(args, "cores", config.cores);

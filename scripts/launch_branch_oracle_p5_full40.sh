@@ -98,6 +98,7 @@ watch_main() {
   done
 
   "${PYTHON_BIN}" "${VALIDATOR}" \
+    --validation-mode strict \
     --matrix "${C4_C8_ROOT}/matrix-base" \
     --matrix "${C4_C8_ROOT}/matrix-stockfish" \
     --matrix "${C4_C8_ROOT}/matrix-sph" \

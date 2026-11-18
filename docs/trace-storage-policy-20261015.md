@@ -1,5 +1,26 @@
 # FST 容量与旧采集清理
 
+2026-11-13 用户授权“包括这个矩阵，删除失效的FST”。本批退役范围为旧
+C4/C8/C16 矩阵（包括成功 C16 补采及原目录的失败残留）、SPR observer
+容量耗尽失败源、prepare 失败探针、Marian 被拒绝首轮，以及此前列出的旧
+native-members、early-prepare 对照、预取对照和逐 load 诊断输入。
+删除清单为224个FST及1,512个专属旁表，FST共209,007,512,752 bytes，
+全部文件共235,143,651,130 bytes。正式矩阵12案112个FST共
+167,156,217,984 bytes，仍是v7/64字节热记录，但缺少当前默认SPR前端必需的
+`.ffe.gz`，也缺少`.uops.gz`、`.sreq`和`.xlat.gz`；其历史回放价值不等于
+当前SPR-M1/M2输入资格。
+
+本批已完成；`tmp/fst-retirement-20261113/receipt.json`的
+`status=complete`，确认其余9,934个FST及全部25,464项受保护文件属性未变。
+剩余FST为166,360,986,578 bytes，磁盘空闲为422,962,450,432 bytes。
+`review.json`记录显式范围及文件属性，
+`plan.json`记录逐文件SHA256，`deletion-journal.jsonl`记录实际unlink。
+保留当前M1/M2五负载源、`spr-members-v2`、冻结M1/M2 ELF及生产ELF，
+并核对其余输入与邻接配置/统计/日志文件属性。原manifest、oracle、报告、
+checkpoint、工作负载二进制和历史链接保留；各退役trace目录写入
+`fst-retirement.json`，旧报告及链接不再证明对应来源目前可原样回放。
+400GB总上限、395GB停止线、30GB空闲底线不变。
+
 2026-11-10 用户授权执行此前列出的两批失败残留和四批历史输入退役。
 已删除84个FST及676个专属旁表，共61,678,851,607 bytes，其中FST
 43,140,109,344 bytes。其余7,140个FST的size/inode/mtime属性核对未变；

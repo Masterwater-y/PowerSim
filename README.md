@@ -1,19 +1,25 @@
 # FastSim
 
-Current SPR evaluation milestone: **SPR-M2 — Retired Prepare + Rename Elimination**
-(2026-11-12), validated executable SHA-256 `0b5aacd5…`, installed as `build/fastsim`.
+Current SPR evaluation milestone: **SPR-M5 — Private Preview Clock Repair**
+(2026-11-17), measured executable SHA-256 `b869c004…`, installed as `build/fastsim`.
 Use [`configs/spr-evaluation-default.cfg`](configs/spr-evaluation-default.cfg);
 the maintained [`SPR profile`](configs/gem5-spr-retired.cfg) selects the same
-immutable [`milestone configuration`](configs/spr-m2-rename-elimination.cfg).
-Bounded MOV / zero-idiom elimination is enabled by default for SPR;
-set `core.spr_rename_elimination=false` to disable it. Frozen
-[SPR-M1](configs/spr-m1-retired-prepare.cfg) remains an explicit control, with
-its executable at `tmp/spr-m1-20261111/fastsim` (SHA-256 `dad62e0d…`).
+immutable [`milestone configuration`](configs/spr-m5-private-preview-clocks.cfg).
+The selected private-preview service clock repair is retained. Estimated code
+and tests remain present, but `core.unified_parent_estimated=false` disables
+that timing path. Functional STLB/page walk, UART/APIC service and bounded
+MOV / zero-idiom elimination remain enabled. Frozen M1-M4 remain explicit
+controls; the previous M4 ELF is at
+`tmp/spr-m5-default-20261117/frozen-m4/fastsim` (SHA-256 `d6f5bae9…`).
 Retired-store prepare stays enabled; native hardware prefetch and pre-retirement
 early prepare are disabled. Functional software-prefetch instructions remain.
 Each source must supply matching geometry/timings and its thread-state plan.
-The [SPR-M2 default record](docs/spr-m2-rename-elimination-default-20261112.md)
-binds the executable, configuration and existing accuracy/throughput evidence.
+The [SPR-M5 default record](docs/spr-m5-private-preview-clocks-default-20261117.md)
+binds the executable, configuration, rollback and current C4/C8/C16 results.
+The 12-case CPI MAE is 0.041505 cycles/macro and MAPE is 5.14%; retired-load-miss
+PMU errors are provisional diagnostics, retaining the few native unknowns.
+Each host rate has one sample; default selection is separate from strict PMU,
+hardware equivalence or throughput acceptance.
 The [SPR-M1 user guide and four-workload CPI / PMU report](fastsim-spr-m1-user-guide-and-accuracy-20261111.md)
 provides runnable commands, raw miss counts, error definitions and evidence status.
 

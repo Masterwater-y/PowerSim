@@ -30,7 +30,7 @@ class ReadSource final : public TraceSource {
 
 static SimulationStats run(const std::string& mode,bool certified=true,
                            bool boundary=false,bool buffer=true,bool reversed_source=false,
-                           unsigned conflict=0) {
+                           unsigned conflict=0,bool estimated=false,bool siblings=false) {
   SimulatorConfig c;
   c.cores=conflict==2 ? 2 : 1;
   c.core_model="interval_weave"; c.interval_scheduler="time_epoch";
@@ -39,10 +39,12 @@ static SimulationStats run(const std::string& mode,bool certified=true,
   c.response_block_summary=true; c.response_memory_descriptor=true;
   c.response_frontier_audit_stride_uops=1; c.cpi_attribution=true;
   c.ruby_sequencer_max_outstanding=64;
+  if (siblings) {c.ruby_sequencer_max_outstanding=2;c.iq_entries=2;}
   c.l1d.hit_latency=2; c.l1d.size_bytes=4096; c.l2.size_bytes=16384;
   c.llc.size_bytes=65536; c.cha_count=1; c.dram.channels=1; c.dram.banks_per_channel=1;
   c.llc_fill_response_latency=boundary?2048:100;
   c.unified_parent_service=mode;
+  c.unified_parent_estimated=estimated;
   if (mode=="v2-observe" || mode=="v2-wait") {
     c.store_commit_to_iew_delay=1;
     c.legacy_prepare_timing=true;
@@ -52,7 +54,7 @@ static SimulationStats run(const std::string& mode,bool certified=true,
   c.l1d_mshrs=1; c.l2_mshrs=1;
   c.validate();
   const std::size_t follower=boundary?1200:4;
-  std::vector<TraceRecord> records(follower+2);
+  std::vector<TraceRecord> records(follower+(siblings?4:2));
   for (std::size_t i=0;i<records.size();++i) {
     records[i].pc=0x1000+i*4;
     records[i].flags=kRetires|kPhysicalAddress;
@@ -65,6 +67,7 @@ static SimulationStats run(const std::string& mode,bool certified=true,
     records[0].address=0x9000;
     records[1].flags|=kLoad; records[1].address=0x8000; records[1].size=8;
     records[1].producer_dists[0]=1;
+    if (siblings) records[follower].producer_dists[0]=static_cast<std::uint8_t>(follower);
   }
   if (conflict==1) {
     records[2].flags|=kStore;
@@ -72,6 +75,13 @@ static SimulationStats run(const std::string& mode,bool certified=true,
     records[2].size=8;
   }
   records[follower+1].producer_dists[0]=1;
+  if (siblings) {
+    records[follower+2].flags|=kLoad;
+    // Revisit the already completed first line: no MSHR wait may hide the
+    // request-slot and IQ lifetime being checked below.
+    records[follower+2].address=0x9000;records[follower+2].size=8;
+    records[follower+2].producer_dists[0]=static_cast<std::uint8_t>(follower+2);
+  }
   std::vector<std::unique_ptr<TraceSource>> sources;
   sources.push_back(std::make_unique<ReadSource>(std::move(records),certified));
   if (conflict==2) {
@@ -84,9 +94,166 @@ static SimulationStats run(const std::string& mode,bool certified=true,
   return Simulator(c,std::move(sources)).run();
 }
 
+static const ResponseFrontierAuditSample& sample(const SimulationStats&,std::uint64_t);
+
+// Both same-line loads depend on the first, different-line miss. Its
+// response feedback displaces their final admission together, leaving an
+// outstanding owner rather than a future owner or a dependent-after-return.
+static void estimated_runtime_test() {
+  const auto off=run("v2-wait",true,false,true,true,0,false,true);
+  const auto on=run("v2-wait",true,false,true,true,0,true,true);
+  require(sample(off,4).selected_memory_response_cycle <
+              sample(off,1).selected_memory_response_cycle,
+          "estimated fixture has no displaced-owner early follower");
+  require(sample(on,4).selected_memory_response_cycle >
+              sample(off,4).selected_memory_response_cycle,
+          "estimated displaced-owner follower still returned early");
+  require(sample(on,5).actual_issue_cycle >= sample(on,4).actual_completion_cycle,
+          "estimated response did not reach the dependent consumer");
+  for (auto seq : {1u,4u,6u})
+    std::cout<<"resource fixture "<<seq<<" dispatch "<<sample(off,seq).actual_dispatch_cycle
+             <<" -> "<<sample(on,seq).actual_dispatch_cycle<<" issue "
+             <<sample(off,seq).actual_issue_cycle<<" -> "<<sample(on,seq).actual_issue_cycle
+             <<" memory issue "<<sample(off,seq).selected_memory_corrected_issue_cycle
+             <<" -> "<<sample(on,seq).selected_memory_corrected_issue_cycle
+             <<" response "<<sample(off,seq).selected_memory_response_cycle<<" -> "
+             <<sample(on,seq).selected_memory_response_cycle<<'\n';
+  require(sample(on,6).actual_dispatch_cycle > sample(off,6).actual_dispatch_cycle,
+          "estimated response did not retain IQ capacity");
+  require(sample(on,6).actual_issue_cycle > sample(off,6).actual_issue_cycle,
+          "estimated callback did not delay the next memory request");
+  require(sample(on,6).sequencer_min_release_cycle >
+              sample(off,6).sequencer_min_release_cycle,
+          "estimated response did not retain the Sequencer calendar");
+  require(on.unified_parent[0].estimated_sources>0 &&
+              on.unified_parent[0].estimated_waits>0,
+          "estimated runtime fixture did not exercise estimated timing");
+  require(on.total_core().retired_uops==off.total_core().retired_uops &&
+              on.total_core().l1d.misses==off.total_core().l1d.misses,
+          "estimated timing changed the functional population");
+  std::cout<<"estimated fixture follower response "
+           <<sample(off,4).selected_memory_response_cycle<<" -> "
+           <<sample(on,4).selected_memory_response_cycle
+           <<", next dispatch "<<sample(off,6).actual_dispatch_cycle<<" -> "
+           <<sample(on,6).actual_dispatch_cycle<<", next issue "
+           <<sample(off,6).actual_issue_cycle<<" -> "<<sample(on,6).actual_issue_cycle<<'\n';
+  const auto missing=run("v2-wait",false,false,true,true,0,true,true);
+  require(missing.unified_parent[0].estimated_sources==0,
+          "estimated timing guessed absent functional eligibility");
+  const auto future_off=run("v2-wait",true,false,true,true);
+  const auto future_on=run("v2-wait",true,false,true,true,0,true);
+  require(sample(future_on,4).selected_memory_response_cycle==
+              sample(future_off,4).selected_memory_response_cycle,
+          "estimated timing attached a future owner");
+  for (unsigned conflict : {1u,2u}) {
+    const auto hazard=run("v2-wait",true,false,true,false,conflict,true);
+    require(hazard.unified_parent[0].estimated_sources==0,
+            "estimated timing ignored a same-line writer");
+  }
+  auto invalid=SimulatorConfig{};invalid.unified_parent_estimated=true;
+  bool rejected=false;
+  try {invalid.validate();} catch(const std::invalid_argument&) {rejected=true;}
+  require(rejected,"estimated timing accepted a non-v2 owner");
+}
+
 static const ResponseFrontierAuditSample& sample(const SimulationStats& s,std::uint64_t seq) {
   for (const auto& r:s.response_frontier_audit.at(0)) if (r.sequence==seq) return r;
   throw std::runtime_error("missing parent-service runtime audit sample");
+}
+
+static SimulationStats reuse_fixture(const std::string& mode,bool estimated) {
+  SimulatorConfig c;
+  c.cores=1;c.core_model="interval_weave";c.interval_scheduler="time_epoch";
+  c.interval_max_cycles=1024;c.chunk_instructions=64;c.interval_target_uops=64;
+  c.lookahead_chunks=2;c.interval_private_preview=true;c.domain_min_events=1;
+  c.response_queue_feedback=true;c.response_sparse_scoreboard=true;
+  c.response_block_summary=true;c.response_memory_descriptor=true;
+  c.response_frontier_audit_stride_uops=1;c.cpi_attribution=true;
+  c.unified_parent_service=mode;c.unified_parent_estimated=estimated;
+  c.legacy_prepare_timing=true;c.store_commit_to_iew_delay=1;c.tso_store=TsoStoreMode::kBuffer;
+  c.ruby_sequencer_max_outstanding=64;c.l1d_mshrs=4;c.l2_mshrs=4;
+  c.l1d.size_bytes=64;c.l1d.associativity=1;c.l1d.hit_latency=2;
+  c.l2.size_bytes=4096;c.l2.associativity=1;c.l2.hit_latency=13;
+  c.llc.size_bytes=65536;c.cha_count=1;c.dram.channels=1;c.dram.banks_per_channel=1;
+  c.validate();
+  std::vector<TraceRecord> records(16);
+  for (std::size_t i=0;i<records.size();++i) {
+    records[i].pc=0x1000+i*4;records[i].flags=kRetires|kPhysicalAddress|kLoad;
+    records[i].size=8;records[i].address=i==0?0x9000:i==3?0x8000:0x8000+(i-1)*64;
+    if (i) records[i].producer_dists[0]=static_cast<std::uint8_t>(i);
+  }
+  std::vector<std::unique_ptr<TraceSource>> sources;
+  sources.push_back(std::make_unique<ReadSource>(std::move(records),true));
+  return Simulator(c,std::move(sources)).run();
+}
+
+static void estimated_observe_test() {
+  const auto wait=reuse_fixture("v2-wait",true);
+  require(wait.unified_parent[0].estimated_reused_fills>0,
+          "reuse fixture did not continue an estimated private-L2 owner");
+  const auto off=reuse_fixture("v2-observe",false);
+  const auto on=reuse_fixture("v2-observe",true);
+  require(on.total_core().cycles==off.total_core().cycles,
+          "estimated observe changed MSHR capacity timing");
+  for (std::uint64_t i=0;i<16;++i) {
+    require(sample(on,i).selected_memory_corrected_issue_cycle==
+                sample(off,i).selected_memory_corrected_issue_cycle &&
+            sample(on,i).selected_memory_response_cycle==
+                sample(off,i).selected_memory_response_cycle,
+            "estimated observe changed request admission or response");
+  }
+}
+
+static void private_preview_clock_test() {
+  SimulatorConfig c;
+  c.cores=1; c.core_model="interval_weave";
+  c.interval_scheduler="time_epoch"; c.interval_max_cycles=1024;
+  c.chunk_instructions=64; c.interval_target_uops=64;
+  c.lookahead_chunks=2; c.interval_private_preview=true;
+  c.domain_min_events=1;
+  c.response_queue_feedback=true; c.response_sparse_scoreboard=true;
+  c.response_block_summary=true; c.response_memory_descriptor=true;
+  c.response_frontier_audit_stride_uops=1; c.cpi_attribution=true;
+  c.unified_parent_service="v2-wait"; c.legacy_prepare_timing=true;
+  c.store_commit_to_iew_delay=1; c.tso_store=TsoStoreMode::kBuffer;
+  c.ruby_sequencer_max_outstanding=64;
+  c.l1d.size_bytes=64; c.l1d.associativity=1; c.l1d.hit_latency=2;
+  c.l2.size_bytes=4096; c.l2.associativity=1; c.l2.hit_latency=13;
+  c.llc.size_bytes=65536; c.cha_count=1;
+  c.dram.channels=1; c.dram.banks_per_channel=1;
+  c.validate();
+  std::vector<TraceRecord> records(32);
+  for (std::size_t i=0;i<records.size();++i) {
+    records[i].pc=0x1000+i*4;
+    records[i].flags=kRetires|kPhysicalAddress;
+    if (i) records[i].producer_dists[0]=1;
+  }
+  for (std::size_t i : {std::size_t(0),std::size_t(8),std::size_t(16)}) {
+    records[i].flags|=kLoad; records[i].size=8;
+    records[i].address=i==8 ? 0x8040 : 0x8000;
+  }
+  std::vector<std::unique_ptr<TraceSource>> sources;
+  sources.push_back(std::make_unique<ReadSource>(records,true));
+  const auto stats=Simulator(c,std::move(sources)).run();
+  const auto& reaccess=sample(stats,16);
+  require(stats.private_preview_events>0,
+          "private-preview clock fixture bypassed the preview path");
+  require(stats.cores.at(0).l2.hits==1,
+          "private-preview clock fixture did not exercise an L2 hit");
+  require(reaccess.selected_memory_shared_stage_issue_cycle>0,
+          "private-preview L2 hit lost its selected service issue clock");
+  require(reaccess.selected_memory_shared_response_cycle==
+              reaccess.selected_memory_shared_stage_issue_cycle+c.l2.hit_latency,
+          "private-preview L2 hit lost or changed its selected service interval");
+  c.interval_private_preview=false;
+  sources.push_back(std::make_unique<ReadSource>(std::move(records),true));
+  const auto canonical=Simulator(c,std::move(sources)).run();
+  const auto& expected=sample(canonical,16);
+  require(reaccess.selected_memory_shared_stage_issue_cycle==
+              expected.selected_memory_shared_stage_issue_cycle &&
+          reaccess.selected_memory_shared_response_cycle==
+              expected.selected_memory_shared_response_cycle,
+          "private-preview clocks differ from canonical reference clocks");
 }
 
 static void pool_tests() {
@@ -341,6 +508,9 @@ static void boundary_resource_tests() {
 
 int main() {
   try {
+    estimated_observe_test();
+    estimated_runtime_test();
+    private_preview_clock_test();
     pool_tests();
     snapshot_tests();
     source_ledger_tests();
